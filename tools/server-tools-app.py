@@ -932,7 +932,8 @@ def capability_record(item):
     return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission != "read", "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "search_text": " ".join(words)}}
 
 def _search_tokens(value: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 1}
+    stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can"}
+    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 1 and token not in stop}
 
 def discover_capabilities(query: str, max_results: int = 8) -> list[dict]:
     q = _search_tokens(query)
