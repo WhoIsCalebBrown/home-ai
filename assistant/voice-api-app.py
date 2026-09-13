@@ -32,6 +32,7 @@ MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
 SAMPLES_DIR = Path(os.getenv("TTS_SAMPLES_DIR", "/app/tts-tests/kokoro-comparison")).resolve()
+COMPARISON_DIR = Path(os.getenv("TTS_COMPARISON_DIR", "/app/tts-tests/chatterbox-comparison")).resolve()
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
@@ -583,6 +584,19 @@ async def tts_sample(file_path: str):
     candidate = (SAMPLES_DIR / file_path).resolve()
     if SAMPLES_DIR not in candidate.parents or candidate.suffix.lower() != ".wav" or not candidate.is_file():
         raise HTTPException(404, "sample not found")
+    return FileResponse(candidate, media_type="audio/wav")
+
+
+@app.get("/tts-comparison")
+async def tts_comparison():
+    return HTMLResponse(Path("/app/tts-comparison.html").read_text())
+
+
+@app.get("/tts-comparison-samples/{file_path:path}")
+async def tts_comparison_sample(file_path: str):
+    candidate = (COMPARISON_DIR / file_path).resolve()
+    if COMPARISON_DIR not in candidate.parents or candidate.suffix.lower() != ".wav" or not candidate.is_file():
+        raise HTTPException(404, "comparison sample not found")
     return FileResponse(candidate, media_type="audio/wav")
 
 

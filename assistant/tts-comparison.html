@@ -1,0 +1,24 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TTS comparison</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;background:#101216;color:#eee}
+.card{background:#1b1f27;padding:18px;border-radius:14px;margin:18px 0}.muted{color:#aab2c0}select,audio{width:100%;margin-top:10px}audio{display:block}
+</style>
+<h1>TTS comparison</h1>
+<p class="muted">Identical phrases. This page does not change the production assistant voice.</p>
+<label>Phrase<select id="phrase"></select></label>
+<div class="card"><strong>Kokoro — am_puck @ 1.18</strong><audio id="kokoro" controls preload="none"></audio><div id="kokoroMeta" class="muted"></div></div>
+<div class="card"><strong>Chatterbox-Turbo</strong><audio id="chatterbox" controls preload="none"></audio><div id="chatterboxMeta" class="muted"></div></div>
+<script>
+const phrases=[
+ ['server','Hey, I checked your server. Everything looks good right now.','2.77'],
+ ['downloads','You still have a few downloads waiting, but nothing appears stuck.','3.12'],
+ ['check',"Alright, give me a second and I'll check that for you.",'2.27'],
+ ['chuckle','Okay, that was unexpected. [chuckle] Let me take another look.','3.29']
+];
+const phrase=document.querySelector('#phrase'),kokoro=document.querySelector('#kokoro'),chatterbox=document.querySelector('#chatterbox');
+for(const [id,text] of phrases)phrase.add(new Option(text,id));
+function update(){const id=phrase.value;kokoro.src=`/tts-comparison-samples/kokoro-${id}.wav`;chatterbox.src=`/tts-comparison-samples/chatterbox-${id}.wav`;document.querySelector('#kokoroMeta').textContent='am_puck · speed 1.18 · direct API sample';document.querySelector('#chatterboxMeta').textContent='350M English Turbo · neutral local reference clip · direct batch sample'}
+phrase.onchange=update;update();
+</script>
