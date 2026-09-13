@@ -49,6 +49,7 @@ def speech(request: SpeechRequest):
     if not REFERENCE.is_file():
         raise HTTPException(503, "reference voice is missing")
     started = time.perf_counter()
+    print(f"CHATTERBOX_TIMING event=generation_start t={time.time():.6f} text={request.text.strip()!r}", flush=True)
     with torch.inference_mode():
         audio = model.generate(request.text.strip(), audio_prompt_path=str(REFERENCE))
     if torch.cuda.is_available():
@@ -57,4 +58,5 @@ def speech(request: SpeechRequest):
     output = io.BytesIO()
     sf.write(output, pcm, 24000, format="WAV", subtype="PCM_16")
     elapsed = time.perf_counter() - started
+    print(f"CHATTERBOX_TIMING event=generation_complete t={time.time():.6f} elapsed={elapsed:.4f} text={request.text.strip()!r}", flush=True)
     return Response(content=output.getvalue(), media_type="audio/wav", headers={"X-TTS-Elapsed": f"{elapsed:.4f}", "X-TTS-Provider": "chatterbox-turbo"})

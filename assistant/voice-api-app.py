@@ -109,6 +109,7 @@ async def transcribe(wav_bytes: bytes) -> str:
 
 
 async def send_wav(ws: WebSocket, request_id: str, wav: bytes) -> None:
+    print(f"TTS_TIMING request={request_id} event=first_audio_sent t={time.time():.6f}", flush=True)
     await ws.send_json({"type": "audio_start", "request_id": request_id})
     await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(wav).decode()})
     await ws.send_json({"type": "audio_end", "request_id": request_id})
@@ -132,6 +133,7 @@ async def synthesize_kokoro(text: str) -> bytes:
 
 
 async def synthesize_chatterbox(text: str) -> bytes:
+    print(f"TTS_TIMING event=chatterbox_request t={time.time():.6f} text={json.dumps(text, ensure_ascii=False)}", flush=True)
     async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
         response = await http.post(
             CHATTERBOX_API_URL,
@@ -456,9 +458,10 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
 
     async def emit_sentence(value: str) -> None:
         if value.strip():
-            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or []) if guard_user_text else value.strip()
             nonlocal full
+            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or []) if guard_user_text else value.strip()
             full += safe
+            print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
             await ws.send_json({"type": "text", "text": safe, "request_id": request_id})
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
             value = safe
@@ -477,6 +480,8 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
                     token = visible_model_text(data.get("message", {}).get("content", ""))
                     if not token:
                         continue
+                    if not full and not sentence:
+                        print(f"TTS_TIMING request={request_id} event=first_qwen_token t={time.time():.6f}", flush=True)
                     sentence += token
                     if re.search(r"[.!?](?:['\"])?\s*$", sentence) and len(sentence.strip()) >= 12:
                         await emit_sentence(sentence)
@@ -588,6 +593,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
+        if live_results and re.search(r"\b(how many|count|storage|space|free|left)\b", user_text, re.I):
+            if any(item.get("tool") in {"list_containers", "get_storage_status"} and item.get("status") == "ok" for item in live_results):
+                store_provenance(client_id, live_results)
+                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                full = evidence_supported_answer("", user_text, live_results)
+                await emit_answer(ws, request_id, full)
+                history.append({"role": "assistant", "content": full})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
         for result in live_results:
             if result.get("status") == "confirmation_required":
                 requested = next((args for name, args in preflight_plan(user_text) if name == result.get("tool")), {})
@@ -750,6 +764,8 @@ async def websocket(ws: WebSocket):
                 except asyncio.CancelledError:
                     await ws.send_json({"type": "cancelled", "request_id": request_id})
                 audio.clear()
+            elif typ == "playback_start":
+                print(f"TTS_TIMING request={data.get('request_id', request_id)} event=browser_playback_start t={time.time():.6f}", flush=True)
     except (WebSocketDisconnect, RuntimeError):
         old = active.pop(client_id, None)
         if old:

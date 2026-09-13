@@ -56,7 +56,7 @@ async function drainSentences(){
       const merged=audioContext.createBuffer(channels,total,sampleRate);let offset=0;
       for(const buffer of buffers){for(let c=0;c<channels;c++)merged.getChannelData(c).set(buffer.getChannelData(Math.min(c,buffer.numberOfChannels-1)),offset);offset+=buffer.length}
       const source=audioContext.createBufferSource();source.buffer=merged;source.connect(audioContext.destination);
-      nextAudioTime=Math.max(nextAudioTime,audioContext.currentTime+0.08);source.start(nextAudioTime);nextAudioTime+=merged.duration;
+      nextAudioTime=Math.max(nextAudioTime,audioContext.currentTime+0.08);source.start(nextAudioTime);ws?.send(JSON.stringify({type:'playback_start',request_id:requestId}));nextAudioTime+=merged.duration;
       audioSources.push(source);playing=true;source.onended=()=>{audioSources=audioSources.filter(s=>s!==source);if(!audioSources.length&&!sentenceQueue.length)playing=false};
     }
   }catch(e){logMic(`Audio playback error: ${e.message||e}`,true)}finally{drainingSentences=false;if(sentenceQueue.length)drainSentences()}
