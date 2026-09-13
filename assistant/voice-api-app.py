@@ -304,6 +304,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
+        for result in live_results:
+            if result.get("status") == "confirmation_required":
+                pending[client_id] = {
+                    "name": result.get("tool"),
+                    "arguments": next((args for name, args in preflight_plan(user_text) if name == result.get("tool")), {}),
+                    "expires": time.time() + 60,
+                }
         if live_results:
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
