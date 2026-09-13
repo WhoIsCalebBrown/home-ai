@@ -23,6 +23,8 @@ WHISPER_URI = os.getenv("WHISPER_URI", "tcp://voice-whisper:10300")
 PIPER_URI = os.getenv("PIPER_URI", "tcp://voice-piper:10200")
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "piper").lower()
 KOKORO_URL = os.getenv("KOKORO_URL", "http://voice-kokoro:10400")
+KOKORO_API_URL = os.getenv("KOKORO_API_URL", f"{KOKORO_URL}/synthesize")
+KOKORO_API_FORMAT = os.getenv("KOKORO_API_FORMAT", "legacy").lower()
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "am_adam")
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.92"))
 MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
@@ -93,7 +95,17 @@ async def speak(ws: WebSocket, request_id: str, text: str) -> None:
     text = spoken_text(text)
     if TTS_PROVIDER == "kokoro":
         async with httpx.AsyncClient(timeout=None) as http:
-            response = await http.post(f"{KOKORO_URL}/synthesize", json={"text": text, "voice": KOKORO_VOICE, "speed": KOKORO_SPEED})
+            if KOKORO_API_FORMAT == "openai":
+                payload = {
+                    "model": "kokoro",
+                    "input": text,
+                    "voice": KOKORO_VOICE,
+                    "response_format": "wav",
+                    "speed": KOKORO_SPEED,
+                }
+            else:
+                payload = {"text": text, "voice": KOKORO_VOICE, "speed": KOKORO_SPEED}
+            response = await http.post(KOKORO_API_URL, json=payload)
             response.raise_for_status()
         await ws.send_json({"type": "audio_start", "request_id": request_id})
         await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(response.content).decode()})
