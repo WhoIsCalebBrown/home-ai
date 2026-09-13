@@ -23,11 +23,15 @@ OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
 WHISPER_URI = os.getenv("WHISPER_URI", "tcp://voice-whisper:10300")
 PIPER_URI = os.getenv("PIPER_URI", "tcp://voice-piper:10200")
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "piper").lower()
+TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "kokoro").lower()
 KOKORO_URL = os.getenv("KOKORO_URL", "http://voice-kokoro:10400")
 KOKORO_API_URL = os.getenv("KOKORO_API_URL", f"{KOKORO_URL}/synthesize")
 KOKORO_API_FORMAT = os.getenv("KOKORO_API_FORMAT", "legacy").lower()
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "am_adam")
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.92"))
+CHATTERBOX_URL = os.getenv("CHATTERBOX_URL", "http://Chatterbox-Turbo:8088")
+CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", f"{CHATTERBOX_URL}/v1/audio/speech")
+CHATTERBOX_TIMEOUT = float(os.getenv("CHATTERBOX_TIMEOUT", "30"))
 MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
@@ -37,6 +41,7 @@ sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
+tts_lock = asyncio.Lock()
 
 SYSTEM = """You are a local home voice assistant. Reply as natural spoken conversation.
 Use contractions, concise sentences, and plain text. Do not use Markdown, bullets, headings,
@@ -103,26 +108,40 @@ async def transcribe(wav_bytes: bytes) -> str:
                 return Transcript.from_event(event).text.strip()
 
 
-async def speak(ws: WebSocket, request_id: str, text: str) -> None:
-    text = spoken_text(text)
-    if TTS_PROVIDER == "kokoro":
-        async with httpx.AsyncClient(timeout=None) as http:
-            if KOKORO_API_FORMAT == "openai":
-                payload = {
-                    "model": "kokoro",
-                    "input": text,
-                    "voice": KOKORO_VOICE,
-                    "response_format": "wav",
-                    "speed": KOKORO_SPEED,
-                }
-            else:
-                payload = {"text": text, "voice": KOKORO_VOICE, "speed": KOKORO_SPEED}
-            response = await http.post(KOKORO_API_URL, json=payload)
-            response.raise_for_status()
-        await ws.send_json({"type": "audio_start", "request_id": request_id})
-        await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(response.content).decode()})
-        await ws.send_json({"type": "audio_end", "request_id": request_id})
-        return
+async def send_wav(ws: WebSocket, request_id: str, wav: bytes) -> None:
+    await ws.send_json({"type": "audio_start", "request_id": request_id})
+    await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(wav).decode()})
+    await ws.send_json({"type": "audio_end", "request_id": request_id})
+
+
+async def synthesize_kokoro(text: str) -> bytes:
+    async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
+        if KOKORO_API_FORMAT == "openai":
+            payload = {
+                "model": "kokoro",
+                "input": text,
+                "voice": KOKORO_VOICE,
+                "response_format": "wav",
+                "speed": KOKORO_SPEED,
+            }
+        else:
+            payload = {"text": text, "voice": KOKORO_VOICE, "speed": KOKORO_SPEED}
+        response = await http.post(KOKORO_API_URL, json=payload)
+        response.raise_for_status()
+        return response.content
+
+
+async def synthesize_chatterbox(text: str) -> bytes:
+    async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
+        response = await http.post(
+            CHATTERBOX_API_URL,
+            json={"text": text, "response_format": "wav"},
+        )
+        response.raise_for_status()
+        return response.content
+
+
+async def synthesize_piper(text: str) -> bytes:
     async with AsyncClient.from_uri(PIPER_URI) as client:
         await client.write_event(Synthesize(text=text).event())
         rate = width = channels = None
@@ -140,10 +159,43 @@ async def speak(ws: WebSocket, request_id: str, text: str) -> None:
                     pcm.extend(event.payload)
             elif event.type == "audio-stop":
                 if rate is not None and pcm:
-                    payload = base64.b64encode(wav_wrap(bytes(pcm), rate, width, channels)).decode()
-                    await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": payload})
-                await ws.send_json({"type": "audio_end", "request_id": request_id})
-                return
+                    return wav_wrap(bytes(pcm), rate, width, channels)
+                return b""
+
+
+async def speak(ws: WebSocket, request_id: str, text: str) -> None:
+    text = spoken_text(text)
+    primary = TTS_PROVIDER
+    async with tts_lock:
+        try:
+            if primary == "chatterbox":
+                wav = await synthesize_chatterbox(text)
+            elif primary == "kokoro":
+                wav = await synthesize_kokoro(text)
+            else:
+                wav = await synthesize_piper(text)
+            if wav:
+                await send_wav(ws, request_id, wav)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if primary == TTS_FALLBACK_PROVIDER:
+                raise
+            print(f"TTS fallback: provider={primary} fallback={TTS_FALLBACK_PROVIDER} error={type(exc).__name__}", flush=True)
+            try:
+                if TTS_FALLBACK_PROVIDER == "kokoro":
+                    wav = await synthesize_kokoro(text)
+                elif TTS_FALLBACK_PROVIDER == "chatterbox":
+                    wav = await synthesize_chatterbox(text)
+                else:
+                    wav = await synthesize_piper(text)
+                if wav:
+                    await send_wav(ws, request_id, wav)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fallback_exc:
+                print(f"TTS fallback failed: provider={TTS_FALLBACK_PROVIDER} error={type(fallback_exc).__name__}", flush=True)
 
 
 def spoken_text(text: str) -> str:
