@@ -319,6 +319,17 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) 
         expected = next((item.get("result", {}).get("count") for item in results if item.get("tool") == "list_containers" and isinstance(item.get("result"), dict)), None)
         if expected is not None and (not match or int(match.group(1)) != int(expected)):
             return f"Your server currently has {expected} containers."
+    if any(item.get("tool") == "get_storage_status" and item.get("status") == "ok" for item in results):
+        result = next(item.get("result", {}) for item in results if item.get("tool") == "get_storage_status")
+        user_share = result.get("user_share", {})
+        cache = result.get("cache", {})
+        if user_share.get("free_bytes") is not None:
+            free_tb = user_share["free_bytes"] / 1_000_000_000_000
+            cache_gb = cache.get("free_bytes", 0) / 1_000_000_000
+            return f"You have {free_tb:.1f} terabytes free on your main storage and {cache_gb:.1f} gigabytes free in cache."
+    if re.search(r"\bweather\b", user_text, re.I) and any(item.get("tool") == "web_search" and item.get("status") == "ok" for item in results):
+        if any(number not in evidence for number in re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", answer)):
+            return "I found current weather search results, but I can't safely verify an exact condition or temperature from them."
     return answer
 
 
@@ -438,13 +449,19 @@ def synthesis_violation(text: str, user_text: str = "") -> str | None:
     return None
 
 
-async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "") -> str:
+async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None) -> str:
     sentence = ""
     full = full_seed
     tts_tasks: list[asyncio.Task] = []
 
-    def queue_sentence(value: str) -> None:
+    async def emit_sentence(value: str) -> None:
         if value.strip():
+            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or []) if guard_user_text else value.strip()
+            nonlocal full
+            full += safe
+            await ws.send_json({"type": "text", "text": safe, "request_id": request_id})
+            await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
+            value = safe
             tts_tasks.append(asyncio.create_task(speak(ws, request_id, value.strip())))
 
     try:
@@ -460,18 +477,14 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
                     token = visible_model_text(data.get("message", {}).get("content", ""))
                     if not token:
                         continue
-                    full += token
                     sentence += token
-                    await ws.send_json({"type": "text", "text": token, "request_id": request_id})
                     if re.search(r"[.!?](?:['\"])?\s*$", sentence) and len(sentence.strip()) >= 12:
-                        await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-                        queue_sentence(sentence)
+                        await emit_sentence(sentence)
                         sentence = ""
                     if data.get("done"):
                         break
         if sentence.strip():
-            await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-        queue_sentence(sentence)
+            await emit_sentence(sentence)
         if tts_tasks:
             await asyncio.gather(*tts_tasks)
     except asyncio.CancelledError:
@@ -633,9 +646,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             messages.extend(evidence_messages)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await generate_final(messages)
-        full = evidence_supported_answer(full, user_text, live_results)
-        await emit_answer(ws, request_id, full)
+        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results)
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})
 
