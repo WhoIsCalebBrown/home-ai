@@ -383,6 +383,8 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
         return [("web_search", {"query": "current weather today"})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
+    if re.search(r"\b(summary|overview)\b", t) and re.search(r"\b(server|media server)\b", t):
+        return [("get_server_overview", {}), ("list_containers", {})]
     artist = artist_from_speech(text)
     if artist:
         plex_library_inventory = bool(re.search(r"\bplex(?: library| collection)\b|\bin (?:my )?(?:plex )?library\b|\balready downloaded\b|\bwhat(?:'s| is) there\b", t)) and bool(re.search(r"\bwhat|available|already|there|only care|don't care|dont care", t))
@@ -460,9 +462,10 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
         if value.strip():
             nonlocal full
             safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or []) if guard_user_text else value.strip()
-            full += safe
+            separator = "" if not full or full.endswith((" ", "\n")) else " "
+            full += separator + safe
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
-            await ws.send_json({"type": "text", "text": safe, "request_id": request_id})
+            await ws.send_json({"type": "text", "text": separator + safe, "request_id": request_id})
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
             value = safe
             tts_tasks.append(asyncio.create_task(speak(ws, request_id, value.strip())))
