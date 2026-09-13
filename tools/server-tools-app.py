@@ -471,7 +471,8 @@ async def arr_get(service: str, path: str, args: dict[str, Any] | None = None) -
 
 
 async def arr_health(service: str, _: dict[str, Any]) -> dict[str, Any]:
-    rows = await arr_get(service, "/api/v3/health")
+    api_version = "v1" if service == "lidarr" else "v3"
+    rows = await arr_get(service, f"/api/{api_version}/health")
     return {"service": service, "issues": [{"level": x.get("level"), "message": x.get("message")} for x in rows[:20]], "healthy": not any(x.get("level") == "error" for x in rows)}
 
 

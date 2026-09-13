@@ -286,6 +286,18 @@ def front_door_presence_question(text: str) -> bool:
     return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|person|people|anything|there|now|motion)\b", text, re.I))
 
 
+def dynamic_fact_question(text: str) -> bool:
+    return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline)\b", text, re.I))
+
+
+def unavailable_live_answer(text: str) -> str:
+    if re.search(r"\bweather\b", text, re.I):
+        return "I can't verify the current weather right now because no live weather result was available."
+    if re.search(r"\b(lidarr|lidar)\b", text, re.I):
+        return "I couldn't verify Lidarr's current status because its live status check was unavailable."
+    return "I couldn't verify that current server information because the required live tool result was unavailable."
+
+
 def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
@@ -294,12 +306,19 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) 
         for item in results
     ):
         return "I can't actually see the current camera image with the tools I have right now."
+    if dynamic_fact_question(user_text) and not any(item.get("status") == "ok" for item in results):
+        return unavailable_live_answer(user_text)
     if any(item.get("tool") in {"investigate_downloads", "investigate_media_pipeline"} for item in results):
         dynamic_words = ("failed", "failure", "expired", "certificate", "ssl", "quarantined", "completed", "downloading", "successfully", "stalled", "missing")
         unsupported = [word for word in dynamic_words if re.search(rf"\b{word}\b", answer.casefold()) and word not in evidence]
         numeric_claims = re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", answer)
         if unsupported or any(number not in evidence for number in numeric_claims):
             return "I found the live investigation results, but I can't safely state that specific detail because it isn't explicitly supported by the current service results."
+    if any(item.get("tool") == "list_containers" and item.get("status") == "ok" for item in results):
+        match = re.search(r"\b(\d+)\b", answer)
+        expected = next((item.get("result", {}).get("count") for item in results if item.get("tool") == "list_containers" and isinstance(item.get("result"), dict)), None)
+        if expected is not None and (not match or int(match.group(1)) != int(expected)):
+            return f"Your server currently has {expected} containers."
     return answer
 
 
@@ -347,6 +366,10 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
         if re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t):
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
+    if re.search(r"\bweather\b", t):
+        return [("web_search", {"query": "current weather today"})]
+    if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
+        return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
     artist = artist_from_speech(text)
     if artist:
         plex_library_inventory = bool(re.search(r"\bplex(?: library| collection)\b|\bin (?:my )?(?:plex )?library\b|\balready downloaded\b|\bwhat(?:'s| is) there\b", t)) and bool(re.search(r"\bwhat|available|already|there|only care|don't care|dont care", t))
@@ -573,7 +596,6 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if live_results:
             store_provenance(client_id, live_results)
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
             evidence_messages = evidence_message(live_results)
             evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
             messages.extend(evidence_messages)
@@ -595,6 +617,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
                 result = await invoke_tool(name, arguments, client_id, request_id)
+                live_results.append(result)
                 if result.get("status") == "confirmation_required":
                     pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": request_id, "expires": time.time() + 60}
                     messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
@@ -602,6 +625,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
+        if live_results:
+            store_provenance(client_id, live_results)
+            instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
+            evidence_messages = evidence_message(live_results)
+            evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
+            messages.extend(evidence_messages)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
         full = await generate_final(messages)
         full = evidence_supported_answer(full, user_text, live_results)
