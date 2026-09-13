@@ -1,16 +1,20 @@
 import asyncio
 import contextvars
+import html
+import ipaddress
 import json
 import os
 import re
 import shutil
 import sqlite3
+import socket
 import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -20,6 +24,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
 
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 PROTECTED = {x.strip().lower() for x in os.getenv(
@@ -251,6 +256,53 @@ async def restart_container(args: dict[str, Any]) -> dict[str, Any]:
         r = await client.post(f"http://docker/containers/{name}/restart", params={"t": 10})
         r.raise_for_status()
     return {"ok": True, "name": name, "action": "restarted"}
+
+
+def public_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("only public http(s) URLs are allowed")
+    host = parsed.hostname.rstrip(".").lower()
+    blocked_names = {"localhost", "unraid", "tower", "host.docker.internal", "metadata.google.internal"}
+    if host in blocked_names or host.endswith((".local", ".lan", ".internal", ".docker", ".home")):
+        raise ValueError("internal hostnames are not allowed")
+    try:
+        addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)]
+    except socket.gaierror as exc:
+        raise ValueError("hostname could not be resolved") from exc
+    if not addresses or any(address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified for address in addresses):
+        raise ValueError("private or link-local targets are not allowed")
+    return value
+
+
+async def web_search(args: dict[str, Any]) -> dict[str, Any]:
+    query = args["query"].strip()
+    async with httpx.AsyncClient(timeout=12) as client:
+        response = await client.get(f"{SEARXNG_URL}/search", params={"q": query, "format": "json"})
+        response.raise_for_status()
+    results = []
+    for item in response.json().get("results", [])[:8]:
+        if item.get("url"):
+            results.append({"title": item.get("title", ""), "url": item["url"], "snippet": item.get("content", "")})
+    return {"query": query, "results": results, "source": "SearXNG", "untrusted": True}
+
+
+async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
+    target = public_url(args["url"])
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers={"User-Agent": "Home-AI-Tools/1.0"}) as client:
+        for _ in range(4):
+            response = await client.get(target)
+            if response.status_code in {301, 302, 303, 307, 308} and response.headers.get("location"):
+                target = public_url(urljoin(target, response.headers["location"]))
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not any(kind in content_type for kind in ("text/", "application/json", "application/xml")):
+                raise ValueError("only text web pages can be fetched")
+            text = response.text[:200000]
+            text = html.unescape(re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>|<[^>]+>", " ", text, flags=re.I))
+            return {"url": target, "content": re.sub(r"\s+", " ", text).strip(), "untrusted": True}
+    raise ValueError("too many redirects")
 
 
 async def plex_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -692,11 +744,24 @@ REGISTRY = [
     ("torbox_status", "Get sanitized Torbox client state.", "read", "torbox", {}, torbox_status),
     ("overseerr_status", "Get Overseerr service status.", "read", "overseerr", {}, overseerr_status),
     ("overseerr_recent_requests", "Get recent Overseerr request records without exposing credentials.", "read", "overseerr", {}, overseerr_recent_requests),
+    ("web_search", "Search the public internet through the private SearXNG backend.", "read", "internet", {"query": {"type": "string", "required": True}}, web_search),
+    ("web_fetch", "Fetch a public webpage as untrusted reference text; internal and private targets are blocked.", "read", "internet", {"url": {"type": "string", "required": True}}, web_fetch),
     ("investigate_downloads", "Correlate qBittorrent, Sonarr, Radarr, Lidarr, Slskd, and Torbox download state.", "read", "media_pipeline", {}, investigate_downloads),
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
+GROUP_SERVICES = {
+    "server": {"server", "storage", "gpu", "docker", "netdata"},
+    "plex": {"plex"},
+    "tv": {"sonarr"},
+    "movies": {"radarr"},
+    "music": {"lidarr", "slskd", "music_enricher", "beets"},
+    "downloads": {"qbittorrent", "torbox", "media_pipeline"},
+    "cameras": {"frigate"},
+    "requests": {"overseerr"},
+    "internet": {"internet"},
+}
 
 
 class Invoke(BaseModel):
@@ -720,8 +785,11 @@ async def health():
 
 
 @app.get("/registry")
-async def registry():
-    return {"tools": [public_schema(x) for x in REGISTRY]}
+async def registry(groups: str = ""):
+    requested = {item.strip() for item in groups.split(",") if item.strip()}
+    services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
+    items = REGISTRY if not requested else [item for item in REGISTRY if item[3] in services]
+    return {"tools": [public_schema(x) for x in items], "groups": sorted(requested)}
 
 
 @app.post("/invoke")
