@@ -179,6 +179,12 @@ def artist_from_speech(text: str) -> str | None:
 
 def preflight_plan(text: str) -> list[tuple[str, dict]]:
     t = text.lower()
+    if re.search(r"\b(restart|reboot|reload)\b", t):
+        if re.search(r"\b(lidarr|lidar)\b", t):
+            return [("restart_container", {"name": "lidarr"})]
+        if re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t):
+            service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
+            return [("restart_container", {"name": service})]
     artist = artist_from_speech(text)
     if artist:
         plex_library_inventory = bool(re.search(r"\bplex(?: library| collection)\b|\bin (?:my )?(?:plex )?library\b|\balready downloaded\b|\bwhat(?:'s| is) there\b", t)) and bool(re.search(r"\bwhat|available|already|there|only care|don't care|dont care", t))
