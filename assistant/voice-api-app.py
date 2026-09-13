@@ -694,7 +694,7 @@ async def websocket(ws: WebSocket):
                 except asyncio.CancelledError:
                     await ws.send_json({"type": "cancelled", "request_id": request_id})
                 audio.clear()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         old = active.pop(client_id, None)
         if old:
             old.cancel()
