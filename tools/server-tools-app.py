@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextvars
 import html
 import ipaddress
@@ -59,6 +60,18 @@ def now() -> str:
 
 def safe_args(args: dict[str, Any]) -> dict[str, Any]:
     return {k: ("[redacted]" if any(s in k.lower() for s in ("key", "token", "password", "secret")) else v) for k, v in args.items()}
+
+
+def audit_result(value: Any, limit: int = 1200) -> Any:
+    """Keep bounded, non-secret result evidence in the local audit trail."""
+    if isinstance(value, dict):
+        return {str(k): audit_result(v, limit) for k, v in list(value.items())[:40]
+                if not any(secret in str(k).lower() for secret in ("key", "token", "password", "secret"))}
+    if isinstance(value, list):
+        return [audit_result(item, limit) for item in value[:20]]
+    if isinstance(value, str):
+        return value[:limit]
+    return value
 
 
 def audit(entry: dict[str, Any]) -> None:
@@ -174,6 +187,14 @@ async def docker_get(path: str, params: dict[str, Any] | None = None) -> Any:
         return r.json()
 
 
+async def service_bytes(service: str, path: str, params: dict[str, Any] | None = None) -> tuple[bytes, str]:
+    base, _ = SERVICES[service]
+    async with httpx.AsyncClient(timeout=8) as client:
+        response = await client.get(base + path, params=params)
+        response.raise_for_status()
+        return response.content, response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
+
+
 def normalize_container(row: dict[str, Any]) -> dict[str, Any]:
     names = [n.lstrip("/") for n in row.get("Names", [])]
     return {"name": names[0] if names else row.get("Id", "")[:12], "id": row.get("Id", "")[:12],
@@ -251,11 +272,21 @@ async def restart_container(args: dict[str, Any]) -> dict[str, Any]:
     name = args["name"].lower()
     if name in PROTECTED:
         return {"blocked": True, "reason": "protected infrastructure requires elevated confirmation", "name": name}
+    before = await docker_get(f"/containers/{name}/json")
+    before_started = before.get("State", {}).get("StartedAt")
     transport = httpx.AsyncHTTPTransport(uds=DOCKER_SOCKET)
     async with httpx.AsyncClient(transport=transport, timeout=10) as client:
         r = await client.post(f"http://docker/containers/{name}/restart", params={"t": 10})
         r.raise_for_status()
-    return {"ok": True, "name": name, "action": "restarted"}
+    after = await docker_get(f"/containers/{name}/json")
+    state = after.get("State", {})
+    after_started = state.get("StartedAt")
+    health = state.get("Health", {}).get("Status") if isinstance(state.get("Health"), dict) else None
+    verified = bool(state.get("Running")) and bool(after_started) and after_started != before_started
+    return {"ok": verified, "name": name, "action": "restarted" if verified else "restart_unverified",
+            "before_started_at": before_started, "after_started_at": after_started,
+            "started_at_changed": after_started != before_started, "running": bool(state.get("Running")),
+            "health": health, "verified": verified}
 
 
 def public_url(value: str) -> str:
@@ -497,6 +528,19 @@ async def frigate_stats(_: dict[str, Any]) -> dict[str, Any]:
     return {"cameras": {name: {"camera_fps": value.get("camera_fps"), "detection_fps": value.get("detection_fps"), "process_fps": value.get("process_fps"), "detection_enabled": value.get("detection_enabled")} for name, value in cameras.items()}, "detector": data.get("detectors", {}) if isinstance(data, dict) else {}}
 
 
+async def frigate_snapshot(args: dict[str, Any]) -> dict[str, Any]:
+    camera = str(args.get("camera", "")).strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]+", camera):
+        return {"ok": False, "error": "camera name is required"}
+    image, content_type = await service_bytes("frigate", f"/api/{camera}/latest.jpg")
+    if content_type not in {"image/jpeg", "image/png"}:
+        raise RuntimeError("Frigate snapshot was not an image")
+    if len(image) > 8_000_000:
+        raise RuntimeError("Frigate snapshot is too large")
+    return {"ok": True, "camera": camera, "content_type": content_type,
+            "image_base64": base64.b64encode(image).decode("ascii"), "vision_ready": True}
+
+
 async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
     params = {"limit": min(int(args.get("limit", 10)), 50)}
     if args.get("camera"): params["camera"] = args["camera"]
@@ -622,7 +666,9 @@ async def overseerr_recent_requests(_: dict[str, Any]) -> dict[str, Any]:
 
 async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
     result = {}
+    sources_checked = []
     for name, fn in (("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)):
+        sources_checked.append(name)
         try:
             value = await fn({})
             if name == "qbittorrent":
@@ -640,7 +686,7 @@ async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
                 result[name] = value
         except Exception as exc:
             result[name] = {"error": f"{name} unavailable", "detail": type(exc).__name__}
-    return {"investigation": "downloads", "sources": result}
+    return {"investigation": "downloads", "sources_checked": sources_checked, "sources": result}
 
 
 async def investigation_step(parent: str, name: str, fn, args: dict[str, Any]):
@@ -729,8 +775,9 @@ REGISTRY = [
     ("lidarr_health", "Get Lidarr health issues.", "read", "lidarr", {}, lambda a: arr_health("lidarr", a)),
     ("lidarr_missing_tracks", "Get Lidarr missing tracks.", "read", "lidarr", {}, lambda a: arr_missing("lidarr", a)),
     ("frigate_status", "Check Frigate reachability and version.", "read", "frigate", {}, frigate_status),
-    ("frigate_stats", "Get current Frigate camera and detector stats.", "read", "frigate", {}, frigate_stats),
+    ("frigate_stats", "Get current Frigate camera and detector stats; this does not contain visual content.", "read", "frigate", {}, frigate_stats),
     ("frigate_recent_events", "Get recent Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}}, frigate_events),
+    ("frigate_snapshot", "Get one current Frigate camera frame for an explicitly requested vision analysis.", "read", "frigate", {"camera": {"type": "string", "required": True}}, frigate_snapshot),
     ("netdata_system_summary", "Get current Netdata host monitoring identity.", "read", "netdata", {}, netdata_summary),
     ("qbittorrent_summary", "Get current qBittorrent speeds, active downloads, stalls, and disk space.", "read", "qbittorrent", {}, qbittorrent_summary),
     ("qbittorrent_list", "List normalized qBittorrent items using a safe filter.", "read", "qbittorrent", {"filter": {"type": "string"}}, qbittorrent_list),
@@ -770,6 +817,7 @@ class Invoke(BaseModel):
     client_id: str = "unknown"
     session_id: str = "unknown"
     confirmed: bool = False
+    action_id: str | None = None
 
 
 def public_schema(item):
@@ -816,5 +864,5 @@ async def invoke(req: Invoke):
         status, result = "error", {"error": f"{service} tool failed", "detail": type(exc).__name__}
     finally:
         AUDIT_CONTEXT.reset(context_token)
-    audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": status, "duration_ms": round((time.monotonic() - started) * 1000)})
+    audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": status, "action_id": req.action_id, "duration_ms": round((time.monotonic() - started) * 1000), "result_summary": audit_result(result)})
     return {"tool": req.name, "service": service, "permission": permission, "status": status, "result": result}
