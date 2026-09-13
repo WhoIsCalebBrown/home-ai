@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 import contextvars
 import html
@@ -12,7 +13,8 @@ import socket
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -314,7 +316,10 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
     results = []
     for item in response.json().get("results", [])[:8]:
         if item.get("url"):
-            results.append({"title": item.get("title", ""), "url": item["url"], "snippet": item.get("content", "")})
+            results.append({"title": item.get("title", ""), "url": item["url"],
+                            "domain": urlparse(item["url"]).hostname or "",
+                            "snippet": item.get("content", ""), "date": item.get("publishedDate"),
+                            "rank": len(results) + 1})
     return {"query": query, "results": results, "source": "SearXNG", "untrusted": True}
 
 
@@ -334,6 +339,89 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
             text = html.unescape(re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>|<[^>]+>", " ", text, flags=re.I))
             return {"url": target, "content": re.sub(r"\s+", " ", text).strip(), "untrusted": True}
     raise ValueError("too many redirects")
+
+
+def _safe_calculate(expression: str) -> float | int:
+    """Evaluate only arithmetic literals/operators; never execute arbitrary Python."""
+    tree = ast.parse(expression, mode="eval")
+    def visit(node):
+        if isinstance(node, ast.Expression): return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool): return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)): return (+1 if isinstance(node.op, ast.UAdd) else -1) * visit(node.operand)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)):
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Add): return left + right
+            if isinstance(node.op, ast.Sub): return left - right
+            if isinstance(node.op, ast.Mult): return left * right
+            if isinstance(node.op, ast.Div): return left / right
+            if isinstance(node.op, ast.FloorDiv): return left // right
+            if isinstance(node.op, ast.Mod): return left % right
+            if abs(right) > 1000: raise ValueError("exponent too large")
+            return left ** right
+        raise ValueError("only numeric arithmetic is supported")
+    value = visit(tree)
+    if abs(value) > 10**18: raise ValueError("result out of range")
+    return value
+
+
+async def calculator(args: dict[str, Any]) -> dict[str, Any]:
+    expression = str(args["expression"]).strip()
+    return {"expression": expression, "value": _safe_calculate(expression), "deterministic": True}
+
+
+async def unit_convert(args: dict[str, Any]) -> dict[str, Any]:
+    value, source, target = float(args["value"]), args["from_unit"].casefold(), args["to_unit"].casefold()
+    factors = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+               "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
+    if source in factors and target in factors:
+        result = value * factors[source] / factors[target]
+    elif source in {"c", "°c", "celsius"} and target in {"f", "°f", "fahrenheit"}:
+        result = value * 9 / 5 + 32
+    elif source in {"f", "°f", "fahrenheit"} and target in {"c", "°c", "celsius"}:
+        result = (value - 32) * 5 / 9
+    else:
+        raise ValueError("unsupported unit pair")
+    return {"value": value, "from_unit": source, "to_unit": target, "result": result, "deterministic": True}
+
+
+async def current_datetime(args: dict[str, Any]) -> dict[str, Any]:
+    zone = str(args.get("timezone") or os.getenv("DEFAULT_TIMEZONE", "America/Toronto"))
+    current = datetime.now(ZoneInfo(zone))
+    return {"timezone": zone, "iso": current.isoformat(), "date": current.date().isoformat(),
+            "time": current.strftime("%H:%M"), "weekday": current.strftime("%A"), "source": "system_clock"}
+
+
+async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
+    location = str(args.get("location") or os.getenv("WEATHER_DEFAULT_LOCATION", "")).strip()
+    if not location:
+        return {"location_required": True, "message": "A city or location is required; no default home location is configured."}
+    offset = max(0, min(7, int(args.get("days_from_now", 0))))
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        geo = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": location, "count": 1, "language": "en", "format": "json"})
+        geo.raise_for_status(); places = geo.json().get("results") or []
+        if not places: return {"location": location, "found": False}
+        place = places[0]
+        forecast = await client.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": place["latitude"], "longitude": place["longitude"],
+            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "temperature_unit": "celsius", "wind_speed_unit": "kmh", "forecast_days": max(2, offset + 1), "timezone": "auto"})
+        forecast.raise_for_status(); data = forecast.json()
+    daily = {k: (v[offset] if isinstance(v, list) and len(v) > offset else None) for k, v in data.get("daily", {}).items()}
+    return {"location": {"name": place.get("name"), "admin1": place.get("admin1"), "country": place.get("country")},
+            "days_from_now": offset, "current": data.get("current", {}), "day": daily,
+            "timezone": data.get("timezone"), "source": "Open-Meteo", "retrieved_at": now()}
+
+
+async def wikipedia_search(args: dict[str, Any]) -> dict[str, Any]:
+    query = str(args["query"]).strip()
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Home-AI-Tools/1.0"}) as client:
+        response = await client.get("https://en.wikipedia.org/w/rest.php/v1/search/page", params={"q": query, "limit": 5})
+        response.raise_for_status()
+    pages = []
+    for page in response.json().get("pages", []):
+        pages.append({"title": page.get("title"), "description": page.get("description"), "excerpt": re.sub(r"<[^>]+>", "", page.get("excerpt", "")), "url": "https://en.wikipedia.org/wiki/" + (page.get("key") or "").replace(" ", "_")})
+    return {"query": query, "results": pages, "source": "Wikipedia"}
 
 
 async def plex_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -795,6 +883,11 @@ REGISTRY = [
     ("overseerr_recent_requests", "Get recent Overseerr request records without exposing credentials.", "read", "overseerr", {}, overseerr_recent_requests),
     ("web_search", "Search the public internet through the private SearXNG backend.", "read", "internet", {"query": {"type": "string", "required": True}}, web_search),
     ("web_fetch", "Fetch a public webpage as untrusted reference text; internal and private targets are blocked.", "read", "internet", {"url": {"type": "string", "required": True}}, web_fetch),
+    ("weather_forecast", "Get current conditions or a daily forecast for an explicitly named city or configured home location.", "read", "weather", {"location": {"type": "string"}, "days_from_now": {"type": "integer"}}, weather_forecast),
+    ("calculator", "Evaluate a numeric arithmetic expression deterministically.", "read", "utility", {"expression": {"type": "string", "required": True}}, calculator),
+    ("unit_convert", "Convert supported storage and temperature units deterministically.", "read", "utility", {"value": {"type": "number", "required": True}, "from_unit": {"type": "string", "required": True}, "to_unit": {"type": "string", "required": True}}, unit_convert),
+    ("current_datetime", "Get the current date and time for a named IANA timezone.", "read", "utility", {"timezone": {"type": "string"}}, current_datetime),
+    ("wikipedia_search", "Search Wikipedia for factual reference pages.", "read", "knowledge", {"query": {"type": "string", "required": True}}, wikipedia_search),
     ("investigate_downloads", "Correlate qBittorrent, Sonarr, Radarr, Lidarr, Slskd, and Torbox download state.", "read", "media_pipeline", {}, investigate_downloads),
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
@@ -809,8 +902,57 @@ GROUP_SERVICES = {
     "downloads": {"qbittorrent", "torbox", "media_pipeline"},
     "cameras": {"frigate"},
     "requests": {"overseerr"},
-    "internet": {"internet"},
+    "internet": {"internet", "weather", "knowledge"},
+    "utilities": {"utility"},
 }
+
+CAPABILITY_METADATA = {
+    "frigate_stats": {"aliases": ["camera health", "fps", "detector"], "examples": ["is my camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
+    "frigate_recent_events": {"aliases": ["motion", "person detected", "recent camera event"], "examples": ["was someone at the door recently"], "freshness": "current", "visual_evidence": False},
+    "frigate_snapshot": {"aliases": ["see camera", "what does it look like", "current image"], "examples": ["describe the front door right now"], "freshness": "current", "visual_evidence": True},
+    "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline"], "examples": ["what is downloading", "is anything stuck"], "group": "downloads", "freshness": "current"},
+    "investigate_media_pipeline": {"aliases": ["music pipeline", "missing media", "artist status"], "examples": ["what is going on with UTOPIA", "how is Travis Scott coming along"], "group": "media_pipeline", "freshness": "current"},
+    "get_storage_status": {"aliases": ["disk space", "free space", "storage"], "examples": ["how much storage do I have left"], "freshness": "current"},
+    "list_containers": {"aliases": ["docker", "containers", "services"], "examples": ["how many containers are running"], "freshness": "current"},
+    "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
+    "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
+    "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
+    "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
+    "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
+    "wikipedia_search": {"aliases": ["wikipedia", "factual lookup", "encyclopedia"], "examples": ["look up this topic on Wikipedia"], "freshness": "reference"},
+    "web_search": {"aliases": ["internet", "search online", "news", "documentation"], "examples": ["search the web for current release notes"], "freshness": "current", "untrusted": True},
+    "web_fetch": {"aliases": ["open webpage", "read page"], "examples": ["fetch the official documentation"], "freshness": "current", "untrusted": True},
+}
+
+def capability_record(item):
+    schema = public_schema(item)
+    name, desc, permission, service, _, _ = item
+    meta = CAPABILITY_METADATA.get(name, {})
+    words = [name.replace("_", " "), desc, service, meta.get("group", service), *meta.get("aliases", []), *meta.get("examples", [])]
+    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission != "read", "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "search_text": " ".join(words)}}
+
+def _search_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 1}
+
+def discover_capabilities(query: str, max_results: int = 8) -> list[dict]:
+    q = _search_tokens(query)
+    lowered = query.casefold()
+    ranked = []
+    for item in REGISTRY:
+        record = capability_record(item)
+        meta = record["metadata"]
+        terms = _search_tokens(meta["search_text"])
+        overlap = len(q & terms)
+        exact = sum(2 for alias in meta["aliases"] if alias.casefold() in query.casefold())
+        example = sum(2 for example in meta["examples"] if any(token in q for token in _search_tokens(example)))
+        score = overlap + exact + example
+        if name := meta["canonical_name"]:
+            if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
+            if name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
+            if name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
+        if score: ranked.append((score, record))
+    ranked.sort(key=lambda pair: (-pair[0], pair[1]["metadata"]["canonical_name"]))
+    return [{**record, "metadata": {**record["metadata"], "rank": index + 1, "score": score}} for index, (score, record) in enumerate(ranked[:max(1, min(max_results, 8))])]
 
 
 class Invoke(BaseModel):
@@ -840,6 +982,13 @@ async def registry(groups: str = ""):
     services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
     items = REGISTRY if not requested else [item for item in REGISTRY if item[3] in services]
     return {"tools": [public_schema(x) for x in items], "groups": sorted(requested)}
+
+
+@app.get("/discover")
+async def discover(query: str, max_results: int = 8):
+    started = time.perf_counter()
+    results = discover_capabilities(query, max_results)
+    return {"tools": results, "query": query, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "total_enabled": len(REGISTRY)}
 
 
 @app.post("/invoke")
