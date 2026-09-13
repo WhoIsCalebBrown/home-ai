@@ -214,6 +214,12 @@ SOURCE_NAMES = {
     "beets": "Beets", "frigate": "Frigate", "docker": "Docker",
 }
 
+CONTAINER_DISPLAY_NAMES = {
+    "lidarr": "Lidarr", "sonarr": "Sonarr", "radarr": "Radarr", "plex": "Plex",
+    "frigate": "Frigate", "ollama": "Ollama", "piper": "Piper", "whisper": "Faster-Whisper",
+    "kokoro": "Kokoro-FastAPI",
+}
+
 
 def provenance_question(text: str) -> bool:
     return bool(re.search(r"\b(what|which|where).{0,30}\b(check|checked|services?|came from|get that|source|sources)\b|\bwhat did you check\b", text, re.I))
@@ -432,18 +438,22 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if action and action.get("expires", 0) <= time.time():
         pending.pop(client_id, None)
         action = None
+    if action and action.get("conversation_id") != client_id:
+        pending.pop(client_id, None)
+        action = None
     if action and is_confirmation(user_text):
         pending.pop(client_id, None)
         result = await invoke_tool(action["name"], action["arguments"], client_id, request_id, confirmed=True, action_id=action.get("action_id"))
         if action["name"] == "restart_container":
             details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
             target = action["arguments"].get("name", "the container")
+            display_target = CONTAINER_DISPLAY_NAMES.get(target.casefold(), target)
             if result.get("status") == "ok" and details.get("verified") is True:
-                full = f"I've restarted {target} and verified that it is running."
+                full = f"I've restarted {display_target} and verified that it is running."
             elif result.get("status") == "ok":
-                full = f"The restart request for {target} completed, but I couldn't verify its running state."
+                full = f"The restart request for {display_target} completed, but I couldn't verify its running state."
             else:
-                full = f"I couldn't restart {target}."
+                full = f"I couldn't restart {display_target}."
         else:
             messages = [{"role": "system", "content": SYSTEM}, *history[-12:], {"role": "tool", "name": action["name"], "content": json.dumps(result.get("result", {}), separators=(",", ":"))}, {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE}]
             full = await generate_final(messages)
@@ -487,7 +497,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 }
                 target = requested.get("name", "the container")
                 if result.get("tool") == "restart_container":
-                    full = f"Restart {target.capitalize()}? Please confirm."
+                    full = f"Restart {CONTAINER_DISPLAY_NAMES.get(target.casefold(), target)}? Please confirm."
                     await emit_answer(ws, request_id, full)
                     history.append({"role": "assistant", "content": full})
                     await ws.send_json({"type": "done", "request_id": request_id})
