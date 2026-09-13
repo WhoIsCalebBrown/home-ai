@@ -45,6 +45,7 @@ sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
+conversation_context: dict[str, dict] = {}
 tts_lock = asyncio.Lock()
 normalizer_lock = asyncio.Lock()
 speech_normalizer = None
@@ -354,9 +355,9 @@ def tool_groups(text: str) -> set[str]:
 async def tool_registry(user_text: str = "") -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=3) as http:
-            groups = tool_groups(user_text)
-            params = {"groups": ",".join(sorted(groups))} if groups else {}
-            response = await http.get(f"{TOOLS_URL}/registry", params=params)
+            endpoint = "/registry" if not user_text.strip() else "/discover"
+            params = {} if not user_text.strip() else {"query": user_text, "max_results": 8}
+            response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
             response.raise_for_status()
             return [item["function"] for item in response.json().get("tools", [])]
     except Exception:
@@ -519,7 +520,12 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
     if re.search(r"\bweather\b", t):
-        return [("web_search", {"query": "current weather today"})]
+        location = None
+        match = re.search(r"\b(?:in|for|at)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:today|tomorrow|now)\b|[?.!]|$)", text, re.I)
+        if match:
+            location = match.group(1).strip()
+        offset = 1 if re.search(r"\btomorrow\b", t) else 0
+        return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
     if re.search(r"\b(summary|overview)\b", t) and re.search(r"\b(server|media server)\b", t):
@@ -677,7 +683,23 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         if result.get("sources_checked") or result.get("investigation"):
             provenance[client_id] = {"tool": item.get("tool"), "sources_checked": result.get("sources_checked", []), "result": result}
+            conversation_context[client_id] = {"kind": result.get("investigation", "investigation"), "query": result.get("query", ""), "tool": item.get("tool")}
             return
+        if item.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
+            conversation_context[client_id] = {"kind": "weather", "location": result.get("location", {}).get("name", ""), "tool": item.get("tool")}
+
+
+def resolved_followup_text(client_id: str, text: str) -> str:
+    """Resolve only narrow, unambiguous follow-ups for routing; keep original text for display/reasoning."""
+    context = conversation_context.get(client_id, {})
+    lowered = text.casefold()
+    if context.get("kind") == "weather" and re.search(r"\b(what about|how about|and)\b", lowered):
+        location = context.get("location") or ""
+        offset = 1 if "tomorrow" in lowered else 0
+        return f"weather in {location} {'tomorrow' if offset else 'today'}"
+    if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
+        return f"what is the media pipeline status for {context.get('query', '')}"
+    return text
 
 
 async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str) -> None:
@@ -728,9 +750,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
-        tools = await tool_registry(user_text)
+        route_text = resolved_followup_text(client_id, user_text)
+        tools = await tool_registry(route_text)
         live_results = []
-        for name, planned_args in preflight_plan(user_text):
+        planned = preflight_plan(route_text)
+        for name, planned_args in planned:
             args = planned_args
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
@@ -762,7 +786,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 return
         for result in live_results:
             if result.get("status") == "confirmation_required":
-                requested = next((args for name, args in preflight_plan(user_text) if name == result.get("tool")), {})
+                requested = next((args for name, args in planned if name == result.get("tool")), {})
                 pending[client_id] = {
                     "name": result.get("tool"),
                     "arguments": requested,
