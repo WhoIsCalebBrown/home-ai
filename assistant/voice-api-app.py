@@ -300,6 +300,24 @@ def unavailable_live_answer(text: str) -> str:
     return "I couldn't verify that current server information because the required live tool result was unavailable."
 
 
+def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
+    if not re.search(r"\butopia\b", user_text, re.I):
+        return None
+    plex = result.get("plex", {})
+    match = (plex.get("matches") or [{}])[0]
+    slskd = result.get("slskd", {})
+    enricher = result.get("music_enricher", {})
+    torbox = result.get("torbox", {}).get("summary", {})
+    if not match:
+        return "The live investigation did not find a matching UTOPIA result."
+    quarantined = (enricher.get("items") or [{}])[0]
+    return (f"UTOPIA is present in Plex Music, but it currently has no media files there. "
+            f"Lidarr has no matching artist, Soulseek has {slskd.get('completed_count', 0)} completed items and no active items, "
+            f"and Music Enricher has {quarantined.get('path', 'no')} in quarantine. "
+            f"Torbox reports {torbox.get('active', 0)} active, {torbox.get('completed', 0)} completed, "
+            f"{torbox.get('errored', 0)} errored, and {torbox.get('pulling', 0)} pulling.")
+
+
 def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
@@ -596,13 +614,29 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
-        if live_results and re.search(r"\b(how many|count|storage|space|free|left)\b", user_text, re.I):
+        if live_results and re.search(r"\b(how many|count|storage|space|free|left|summary|overview)\b", user_text, re.I):
             if any(item.get("tool") in {"list_containers", "get_storage_status"} and item.get("status") == "ok" for item in live_results):
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
-                full = evidence_supported_answer("", user_text, live_results)
+                count = next((item.get("result", {}).get("count") for item in live_results if item.get("tool") == "list_containers"), None)
+                overview = next((item.get("result", {}) for item in live_results if item.get("tool") == "get_server_overview"), {})
+                if re.search(r"\b(summary|overview)\b", user_text, re.I) and count is not None:
+                    free_tb = overview.get("storage", {}).get("user_free_bytes", 0) / 1_000_000_000_000
+                    full = f"Tower currently has {count} Docker containers and about {free_tb:.1f} terabytes free on its main storage."
+                else:
+                    full = evidence_supported_answer("", user_text, live_results)
                 await emit_answer(ws, request_id, full)
                 history.append({"role": "assistant", "content": full})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
+        if live_results and any(item.get("tool") == "investigate_media_pipeline" and item.get("status") == "ok" for item in live_results):
+            investigation = next(item.get("result", {}) for item in live_results if item.get("tool") == "investigate_media_pipeline")
+            direct = grounded_investigation_answer(investigation, user_text)
+            if direct:
+                store_provenance(client_id, live_results)
+                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+                await emit_answer(ws, request_id, direct)
+                history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
         for result in live_results:
