@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Home-AI-Assistant</Name>
+  <Repository>ghcr.io/whoiscalebbrown/home-ai-assistant:stable</Repository>
+  <Registry>https://ghcr.io/whoiscalebbrown/home-ai-assistant</Registry>
+  <Network>voiceai</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/WhoIsCalebBrown/home-ai</Support>
+  <Project>https://github.com/WhoIsCalebBrown/home-ai</Project>
+  <Overview>Custom browser, HTTPS/WSS, voice orchestration, conversation state, LLM loop, and TTS playback. Deterministic NVIDIA NeMo English normalization and approved TTS-only pronunciation lexicon are applied downstream of the visible answer.</Overview>
+  <Category>AI:Tools</Category>
+  <WebUI>https://assistant.calebs.online/</WebUI>
+  <Config Name="Host Port" Target="8088" Default="8088" Mode="tcp" Description="Browser UI and WebSocket endpoint." Type="Port" Display="always" Required="true" Mask="false">18088</Config>
+  <Config Name="Ollama URL" Target="OLLAMA_URL" Default="http://voice-ollama:11434" Mode="" Description="Private LLM API." Type="Variable" Display="always" Required="true" Mask="false">http://voice-ollama:11434</Config>
+  <Config Name="Whisper URI" Target="WHISPER_URI" Default="tcp://voice-whisper:10300" Mode="" Description="Private Wyoming STT endpoint." Type="Variable" Display="always" Required="true" Mask="false">tcp://voice-whisper:10300</Config>
+  <Config Name="Piper URI" Target="PIPER_URI" Default="tcp://voice-piper:10200" Mode="" Description="Private Wyoming fallback TTS endpoint." Type="Variable" Display="always" Required="true" Mask="false">tcp://voice-piper:10200</Config>
+  <Config Name="LLM model" Target="LLM_MODEL" Default="qwen3.5:4b" Mode="" Description="Active Ollama model." Type="Variable" Display="always" Required="true" Mask="false">qwen3.5:4b</Config>
+  <Config Name="TTS provider" Target="TTS_PROVIDER" Default="chatterbox" Mode="" Description="Primary provider; Kokoro remains the immediate fallback." Type="Variable" Display="always" Required="true" Mask="false">chatterbox</Config>
+  <Config Name="TTS fallback provider" Target="TTS_FALLBACK_PROVIDER" Default="kokoro" Mode="" Description="Fallback provider used when the primary TTS request fails." Type="Variable" Display="always" Required="true" Mask="false">kokoro</Config>
+  <Config Name="Chatterbox API URL" Target="CHATTERBOX_API_URL" Default="http://Chatterbox-Turbo:8088/v1/audio/speech" Mode="" Description="Private Chatterbox endpoint on voiceai." Type="Variable" Display="always" Required="true" Mask="false">http://Chatterbox-Turbo:8088/v1/audio/speech</Config>
+  <Config Name="Chatterbox timeout" Target="CHATTERBOX_TIMEOUT" Default="30" Mode="" Description="Maximum seconds before Kokoro fallback." Type="Variable" Display="advanced" Required="true" Mask="false">30</Config>
+  <Config Name="Kokoro API URL" Target="KOKORO_API_URL" Default="http://Kokoro-FastAPI:8880/v1/audio/speech" Mode="" Description="Private OpenAI-compatible Kokoro endpoint." Type="Variable" Display="always" Required="true" Mask="false">http://Kokoro-FastAPI:8880/v1/audio/speech</Config>
+  <Config Name="Kokoro API format" Target="KOKORO_API_FORMAT" Default="openai" Mode="" Description="OpenAI-compatible Kokoro route." Type="Variable" Display="always" Required="true" Mask="false">openai</Config>
+  <Config Name="Kokoro voice" Target="KOKORO_VOICE" Default="am_puck" Mode="" Description="Fallback Kokoro voice." Type="Variable" Display="always" Required="true" Mask="false">am_puck</Config>
+  <Config Name="Kokoro speed" Target="KOKORO_SPEED" Default="1.18" Mode="" Description="Fallback Kokoro speed." Type="Variable" Display="always" Required="true" Mask="false">1.18</Config>
+  <Config Name="Tools URL" Target="TOOLS_URL" Default="http://server-tools:8090" Mode="" Description="Private typed tools service." Type="Variable" Display="always" Required="true" Mask="false">http://server-tools:8090</Config>
+  <Config Name="Pronunciation config" Target="/app/pronunciation" Default="/mnt/cache/appdata/home-ai/pronunciation" Mode="rw" Description="Persistent approved TTS lexicon, NeMo grammar cache, and optional TTS debug trace." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/home-ai/pronunciation</Config>
+  <Config Name="TTS samples" Target="/app/tts-tests" Default="/mnt/cache/appdata/voice-assistant/tts-tests" Mode="ro" Description="Optional TTS comparison samples." Type="Path" Display="advanced" Required="false" Mask="false">/mnt/cache/appdata/voice-assistant/tts-tests</Config>
+</Container>

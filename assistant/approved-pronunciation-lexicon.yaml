@@ -1,0 +1,26 @@
+version: 1
+active: true
+# Only reviewed high-confidence entries belong here. The larger candidate file
+# remains review-only and is never loaded by the production speech frontend.
+entries:
+  Lidarr: "lid arr"
+  Sonarr: "son arr"
+  Radarr: "rad arr"
+  Torbox: "tor box"
+  Slskd: "Soulseek D"
+  qBittorrent: "Q Bittorrent"
+  SearXNG: "sear ex en gee"
+  Ollama: "oh lama"
+  CUDA: "coo da"
+  NVENC: "en vee enk"
+  NVDEC: "en vee deck"
+  VRAM: "V RAM"
+  WSS: "W S S"
+  GHCR: "G H C R"
+  GB: "gigabytes"
+  TB: "terabytes"
+  Mylar3: "Mylar three"
+  Overseerr: "overseer"
+  Prowlarr: "prowler"
+  Notifiarr: "notify arr"
+  FlareSolverr: "flare solver"

@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -37,11 +38,49 @@ DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
 SAMPLES_DIR = Path(os.getenv("TTS_SAMPLES_DIR", "/app/tts-tests/kokoro-comparison")).resolve()
 COMPARISON_DIR = Path(os.getenv("TTS_COMPARISON_DIR", "/app/tts-tests/chatterbox-comparison")).resolve()
+PRONUNCIATION_LEXICON = Path(os.getenv("PRONUNCIATION_LEXICON", "/app/pronunciation/approved-pronunciation-lexicon.yaml")).resolve()
+NEMO_CACHE_DIR = Path(os.getenv("NEMO_CACHE_DIR", "/app/pronunciation/nemo-cache")).resolve()
+TTS_DEBUG_LOG = os.getenv("TTS_DEBUG_LOG", "/app/pronunciation/tts-debug.jsonl")
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
 tts_lock = asyncio.Lock()
+normalizer_lock = asyncio.Lock()
+speech_normalizer = None
+pronunciation_entries: dict[str, str] = {}
+normalization_init_seconds: float | None = None
+
+
+@app.on_event("startup")
+async def initialize_speech_frontend() -> None:
+    global speech_normalizer, pronunciation_entries, normalization_init_seconds
+    pronunciation_entries = load_pronunciation_lexicon()
+    started = time.perf_counter()
+    try:
+        from nemo_text_processing.text_normalization.normalize import Normalizer
+        NEMO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        speech_normalizer = Normalizer(
+            input_case="cased",
+            lang="en",
+            cache_dir=str(NEMO_CACHE_DIR),
+            overwrite_cache=False,
+            post_process=True,
+        )
+        normalization_init_seconds = time.perf_counter() - started
+        print(
+            f"TTS_NORMALIZATION_READY provider=nemo_text_processing entries={len(pronunciation_entries)} "
+            f"init_seconds={normalization_init_seconds:.3f} cache={NEMO_CACHE_DIR}",
+            flush=True,
+        )
+    except Exception as exc:
+        normalization_init_seconds = time.perf_counter() - started
+        speech_normalizer = None
+        print(
+            f"TTS_NORMALIZATION_UNAVAILABLE error={type(exc).__name__} "
+            f"init_seconds={normalization_init_seconds:.3f}",
+            flush=True,
+        )
 
 SYSTEM = """You are a local home voice assistant. Reply as natural spoken conversation.
 Use contractions, concise sentences, and plain text. Do not use Markdown, bullets, headings,
@@ -165,8 +204,67 @@ async def synthesize_piper(text: str) -> bytes:
                 return b""
 
 
-async def speak(ws: WebSocket, request_id: str, text: str) -> None:
-    text = spoken_text(text)
+def load_pronunciation_lexicon() -> dict[str, str]:
+    if not PRONUNCIATION_LEXICON.is_file():
+        return {}
+    data = yaml.safe_load(PRONUNCIATION_LEXICON.read_text(encoding="utf-8")) or {}
+    if not data.get("active", False):
+        return {}
+    entries = data.get("entries", {})
+    return {str(term): str(spoken) for term, spoken in entries.items() if str(term).strip() and str(spoken).strip()}
+
+
+def apply_pronunciation_lexicon(text: str) -> str:
+    adjusted = text
+    for term, spoken in sorted(pronunciation_entries.items(), key=lambda item: len(item[0]), reverse=True):
+        adjusted = re.sub(rf"(?<![\w]){re.escape(term)}(?![\w])", spoken, adjusted, flags=re.IGNORECASE)
+    return adjusted
+
+
+def normalize_for_speech(text: str) -> tuple[str, str, str]:
+    """Return original, NeMo-normalized, and lexicon-adjusted speech text."""
+    original = text
+    normalized = text
+    if speech_normalizer is not None:
+        normalized = speech_normalizer.normalize(
+            text, verbose=False, punct_pre_process=True, punct_post_process=True
+        )
+    normalized = re.sub(r"https?://\S+", "a link", normalized)
+    normalized = re.sub(r"[`*_#]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return original, normalized, apply_pronunciation_lexicon(normalized)
+
+
+def record_tts_debug(request_id: str, original: str, normalized: str, adjusted: str) -> None:
+    event = {
+        "timestamp": time.time(),
+        "request_id": request_id,
+        "original_display_text": original,
+        "nemo_normalized_text": normalized,
+        "lexicon_adjusted_text": adjusted,
+    }
+    print(f"TTS_TEXT {json.dumps(event, ensure_ascii=False)}", flush=True)
+    if not TTS_DEBUG_LOG:
+        return
+    try:
+        path = Path(TTS_DEBUG_LOG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"TTS_TEXT_DEBUG_WRITE_FAILED error={type(exc).__name__}", flush=True)
+
+
+async def prepare_tts_text(request_id: str, text: str) -> str:
+    async with normalizer_lock:
+        original, normalized, adjusted = normalize_for_speech(text)
+        record_tts_debug(request_id, original, normalized, adjusted)
+        return adjusted
+
+
+async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = False) -> None:
+    if not prepared:
+        text = await prepare_tts_text(request_id, text)
     primary = TTS_PROVIDER
     async with tts_lock:
         try:
@@ -202,7 +300,7 @@ async def speak(ws: WebSocket, request_id: str, text: str) -> None:
 
 def speakable_chunks(text: str, max_chars: int = 180) -> list[str]:
     """Split long prose at natural clause boundaries without splitting words."""
-    text = spoken_text(text)
+    text = text.strip()
     if len(text) <= max_chars:
         return [text] if text else []
     chunks: list[str] = []
@@ -229,13 +327,8 @@ def speakable_chunks(text: str, max_chars: int = 180) -> list[str]:
 
 
 def spoken_text(text: str) -> str:
-    text = re.sub(r"https?://\S+", "a link", text)
-    text = re.sub(r"[`*_#]", "", text)
-    text = re.sub(r"\bTB\b", "terabytes", text, flags=re.I)
-    text = re.sub(r"\bGB\b", "gigabytes", text, flags=re.I)
-    text = re.sub(r"\bMB\b", "megabytes", text, flags=re.I)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    """Compatibility alias for callers that need speech-only cleanup."""
+    return normalize_for_speech(text)[2]
 def tool_groups(text: str) -> set[str]:
     t = text.casefold()
     groups = set()
@@ -382,10 +475,10 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) 
 
 
 async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
-    text = spoken_text(text)
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-    await asyncio.gather(*(speak(ws, request_id, chunk) for chunk in speakable_chunks(text)))
+    prepared = await prepare_tts_text(request_id, text)
+    await asyncio.gather(*(speak(ws, request_id, chunk, prepared=True) for chunk in speakable_chunks(prepared)))
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
@@ -513,8 +606,8 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
             await ws.send_json({"type": "text", "text": separator + safe, "request_id": request_id})
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-            value = safe
-            tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk)) for chunk in speakable_chunks(value))
+            prepared = await prepare_tts_text(request_id, safe)
+            tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk, prepared=True)) for chunk in speakable_chunks(prepared))
 
     try:
         async with httpx.AsyncClient(timeout=None) as http:
@@ -742,7 +835,13 @@ async def run_response(ws: WebSocket, client_id: str, request_id: str, user_text
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": MODEL}
+    return {
+        "ok": True,
+        "model": MODEL,
+        "tts_normalization": "nemo_text_processing" if speech_normalizer is not None else "unavailable",
+        "pronunciation_entries": len(pronunciation_entries),
+        "normalization_init_seconds": normalization_init_seconds,
+    }
 
 
 @app.get("/")

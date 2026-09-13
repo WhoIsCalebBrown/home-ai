@@ -3,3 +3,4 @@ uvicorn[standard]==0.35.0
 httpx==0.28.1
 python-multipart==0.0.20
 wyoming==1.10.2
+nemo_text_processing==1.2.0
