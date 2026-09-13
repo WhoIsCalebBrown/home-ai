@@ -696,7 +696,8 @@ async def investigation_step(parent: str, name: str, fn, args: dict[str, Any]):
         value = await fn(args)
         audit({**ctx, "tool": name, "parent_tool": parent, "service": name.split("_")[0],
                "permission": "read", "arguments": safe_args(args), "status": "ok",
-               "duration_ms": round((time.monotonic() - started) * 1000)})
+               "duration_ms": round((time.monotonic() - started) * 1000),
+               "result_summary": audit_result(value)})
         return value
     except Exception as exc:
         audit({**ctx, "tool": name, "parent_tool": parent, "service": name.split("_")[0],

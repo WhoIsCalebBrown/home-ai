@@ -395,7 +395,7 @@ async def generate_final(messages: list[dict]) -> str:
         return visible_model_text(response.json().get("message", {}).get("content", "")).strip()
 
 
-def evidence_message(results: list[dict]) -> tuple[dict, list[str]]:
+def evidence_message(results: list[dict]) -> list[dict]:
     clean = []
     images = []
     for item in results:
@@ -405,10 +405,14 @@ def evidence_message(results: list[dict]) -> tuple[dict, list[str]]:
             images.append(result["image_base64"])
             copy["result"] = {k: v for k, v in result.items() if k != "image_base64"}
         clean.append(copy)
-    message = {"role": "system", "content": "<internal_server_evidence>\n" + INTERNAL_EVIDENCE_RULE + "\n" + json.dumps(clean, separators=(",", ":"), ensure_ascii=False) + "\n</internal_server_evidence>"}
+    messages = [{"role": "system", "content": "<internal_server_evidence>\n" + INTERNAL_EVIDENCE_RULE + "\n" + json.dumps(clean, separators=(",", ":"), ensure_ascii=False) + "\n</internal_server_evidence>"}]
     if images:
-        message["images"] = images
-    return message, images
+        messages.append({
+            "role": "user",
+            "content": "A current camera snapshot is attached. Describe only visual details actually visible in this image.",
+            "images": images,
+        })
+    return messages
 
 
 def store_provenance(client_id: str, results: list[dict]) -> None:
@@ -492,9 +496,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             store_provenance(client_id, live_results)
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
-            message, _ = evidence_message(live_results)
-            message["content"] = instruction + "\n" + message["content"]
-            messages.append(message)
+            evidence_messages = evidence_message(live_results)
+            evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
+            messages.extend(evidence_messages)
         full = ""
         for _ in range(4):
             async with httpx.AsyncClient(timeout=None) as http:
