@@ -200,6 +200,34 @@ async def speak(ws: WebSocket, request_id: str, text: str) -> None:
                 print(f"TTS fallback failed: provider={TTS_FALLBACK_PROVIDER} error={type(fallback_exc).__name__}", flush=True)
 
 
+def speakable_chunks(text: str, max_chars: int = 180) -> list[str]:
+    """Split long prose at natural clause boundaries without splitting words."""
+    text = spoken_text(text)
+    if len(text) <= max_chars:
+        return [text] if text else []
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        boundary = -1
+        # Prefer a clause boundary near the end of the allowed window.
+        for match in re.finditer(r"[;:](?=\s)|,(?=\s)", remaining[: max_chars + 1]):
+            candidate = match.end()
+            if candidate >= 55:
+                boundary = candidate
+        # If punctuation is not available, use the last whitespace as a safe fallback.
+        if boundary < 0:
+            boundary = remaining.rfind(" ", 55, max_chars + 1)
+        if boundary < 0:
+            break
+        chunk = remaining[:boundary].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[boundary:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def spoken_text(text: str) -> str:
     text = re.sub(r"https?://\S+", "a link", text)
     text = re.sub(r"[`*_#]", "", text)
@@ -357,7 +385,7 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
     text = spoken_text(text)
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-    await speak(ws, request_id, text)
+    await asyncio.gather(*(speak(ws, request_id, chunk) for chunk in speakable_chunks(text)))
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
@@ -486,7 +514,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
             await ws.send_json({"type": "text", "text": separator + safe, "request_id": request_id})
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
             value = safe
-            tts_tasks.append(asyncio.create_task(speak(ws, request_id, value.strip())))
+            tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk)) for chunk in speakable_chunks(value))
 
     try:
         async with httpx.AsyncClient(timeout=None) as http:
