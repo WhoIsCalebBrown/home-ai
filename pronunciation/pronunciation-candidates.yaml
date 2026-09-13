@@ -1,0 +1,372 @@
+# Review-only pronunciation candidates for Home-AI-Assistant.
+# This file is intentionally inactive. It must not be loaded by production TTS
+# until each proposed pronunciation has been listened to and approved.
+version: 1
+active: false
+scope: tts-only
+notes:
+  - Display text, tool names, entity extraction, audit records, and API arguments must remain unchanged.
+  - usage_proxy is an audit/tool-context count, not a count of every spoken occurrence.
+  - Exact-token or bounded matching is required when this is activated.
+
+high-confidence-automatic-candidates:
+  Lidarr:
+    spoken: "lid arr"
+    confidence: high
+    usage_proxy: 22
+    source: "Lidarr tool calls and local container"
+    reason: "Frequently spoken media service name; arr suffix is commonly misread."
+  Sonarr:
+    spoken: "son arr"
+    confidence: high
+    usage_proxy: 2
+    source: "Sonarr download investigation and local container"
+    reason: "Local *arr service name."
+  Radarr:
+    spoken: "rad arr"
+    confidence: high
+    usage_proxy: 1
+    source: "Radarr queue and local container"
+    reason: "Local *arr service name."
+  Plex:
+    spoken: "Plex"
+    confidence: high
+    usage_proxy: 55
+    source: "Plex searches and investigations"
+    reason: "Usually already pronounced correctly; retained as an explicit safe candidate."
+  Torbox:
+    spoken: "Tor box"
+    confidence: high
+    usage_proxy: 25
+    source: "Torbox status and download investigations"
+    reason: "Concatenated local service name."
+  Slskd:
+    spoken: "Soulseek D"
+    confidence: high
+    usage_proxy: 23
+    source: "Slskd download investigations and local container"
+    reason: "Lowercase consonant-heavy brand identifier is unlikely to be read naturally."
+  qBittorrent:
+    spoken: "Q Bittorrent"
+    confidence: high
+    usage_proxy: 22
+    source: "qBittorrent list calls and download investigations"
+    reason: "Mixed-case brand with a leading single-letter prefix."
+  SearXNG:
+    spoken: "sear ex en gee"
+    confidence: high
+    usage_proxy: 7
+    source: "web_search through SearXNG"
+    reason: "Acronym-like suffix and unusual capitalization."
+  Unraid:
+    spoken: "Unraid"
+    confidence: high
+    usage_proxy: 0
+    source: "Unraid host/templates"
+    reason: "Brand name; likely already acceptable but should be bounded if normalized."
+  Frigate:
+    spoken: "Frigate"
+    confidence: high
+    usage_proxy: 7
+    source: "Frigate status/stats calls and camera stack"
+    reason: "Common English word; no override may be needed, included for audition."
+  Ollama:
+    spoken: "oh lama"
+    confidence: high
+    usage_proxy: 0
+    source: "Ollama container and LLM runtime"
+    reason: "Brand capitalization may cause an unnatural reading."
+  Qwen:
+    spoken: "cue en"
+    confidence: medium
+    usage_proxy: 0
+    source: "Qwen3.5 model configuration"
+    reason: "Model name has no reliable English grapheme-to-phoneme reading; listen first despite high operational value."
+  CUDA:
+    spoken: "coo da"
+    confidence: high
+    usage_proxy: 0
+    source: "NVIDIA runtime and Chatterbox/Faster-Whisper stack"
+    reason: "All-caps technical name is often read letter-by-letter or incorrectly."
+  NVENC:
+    spoken: "en vee enk"
+    confidence: high
+    usage_proxy: 0
+    source: "Plex hardware transcoding"
+    reason: "NVIDIA codec acronym."
+  NVDEC:
+    spoken: "en vee deck"
+    confidence: high
+    usage_proxy: 0
+    source: "Plex hardware decoding"
+    reason: "NVIDIA codec acronym."
+  VRAM:
+    spoken: "V RAM"
+    confidence: high
+    usage_proxy: 0
+    source: "GPU telemetry and benchmark terminology"
+    reason: "Technical acronym."
+  WSS:
+    spoken: "W S S"
+    confidence: high
+    usage_proxy: 0
+    source: "Assistant browser transport"
+    reason: "Transport acronym."
+  GHCR:
+    spoken: "G H C R"
+    confidence: high
+    usage_proxy: 0
+    source: "Custom image registry configuration"
+    reason: "Registry acronym."
+  GB:
+    spoken: "gigabytes"
+    confidence: high
+    usage_proxy: 20
+    source: "Storage answers"
+    reason: "Unit should be expanded in speech, not pronounced as letters."
+  TB:
+    spoken: "terabytes"
+    confidence: high
+    usage_proxy: 20
+    source: "Storage answers"
+    reason: "Unit should be expanded in speech, not pronounced as letters."
+
+needs-listening-review:
+  Chatterbox:
+    spoken: "Chatterbox"
+    confidence: medium
+    usage_proxy: 0
+    source: "Current TTS provider"
+    reason: "Likely fine, but useful as a provider-label audition."
+  Kokoro:
+    spoken: "koh koh roh"
+    confidence: medium
+    usage_proxy: 0
+    source: "Production fallback TTS provider"
+    reason: "Pronunciation varies by speaker and project convention."
+  Piper:
+    spoken: "Piper"
+    confidence: high
+    usage_proxy: 0
+    source: "Fallback Wyoming TTS container"
+    reason: "Probably fine; review only because it is a provider name."
+  Whisper:
+    spoken: "Whisper"
+    confidence: high
+    usage_proxy: 0
+    source: "Faster-Whisper STT"
+    reason: "Probably fine; compound service label may need a bounded alias."
+  Faster-Whisper:
+    spoken: "Faster Whisper"
+    confidence: high
+    usage_proxy: 0
+    source: "STT container/template"
+    reason: "Hyphen should not create an awkward spoken break."
+  Kometa:
+    spoken: "koh meh tah"
+    confidence: medium
+    usage_proxy: 0
+    source: "Kometa container/template"
+    reason: "Brand pronunciation is not obvious from spelling."
+  Komga:
+    spoken: "kom gah"
+    confidence: medium
+    usage_proxy: 0
+    source: "Komga container"
+    reason: "Unusual media brand."
+  Mylar3:
+    spoken: "Mylar three"
+    confidence: high
+    usage_proxy: 0
+    source: "Mylar3 container"
+    reason: "Embedded number should be spoken explicitly."
+  Overseerr:
+    spoken: "overseer"
+    confidence: high
+    usage_proxy: 0
+    source: "Overseerr container/tool names"
+    reason: "Deliberately extended spelling may be misread."
+  Prowlarr:
+    spoken: "prowler"
+    confidence: high
+    usage_proxy: 0
+    source: "Prowlarr container"
+    reason: "Local *arr brand with nonstandard spelling."
+  Notifiarr:
+    spoken: "notify arr"
+    confidence: high
+    usage_proxy: 0
+    source: "Notifiarr container"
+    reason: "Concatenated brand plus *arr suffix."
+  FlareSolverr:
+    spoken: "flare solver"
+    confidence: high
+    usage_proxy: 0
+    source: "FlareSolverr container"
+    reason: "CamelCase compound service name."
+  Recyclarr:
+    spoken: "recycle arr"
+    confidence: medium
+    usage_proxy: 0
+    source: "Recyclarr container/template"
+    reason: "Nonstandard spelling plus *arr suffix."
+  Profilarr:
+    spoken: "profile arr"
+    confidence: medium
+    usage_proxy: 0
+    source: "Profilarr template"
+    reason: "Nonstandard spelling plus *arr suffix."
+  UTOPIA:
+    spoken: "you toe pee uh"
+    confidence: medium
+    usage_proxy: 72
+    source: "Repeated UTOPIA media investigations"
+    reason: "All-caps album title; natural pronunciation should be confirmed in context."
+  HEVC:
+    spoken: "H E V C"
+    confidence: high
+    usage_proxy: 0
+    source: "Video codec/media terminology"
+    reason: "Codec acronym."
+  H.264:
+    spoken: "H two sixty four"
+    confidence: high
+    usage_proxy: 0
+    source: "Video codec/media terminology"
+    reason: "Numeric codec label."
+  FLAC:
+    spoken: "flack"
+    confidence: high
+    usage_proxy: 0
+    source: "Music file format terminology"
+    reason: "All-caps file format."
+  MKV:
+    spoken: "M K V"
+    confidence: high
+    usage_proxy: 0
+    source: "Video file format terminology"
+    reason: "File-format acronym."
+
+probably-fine-without-override:
+  Docker:
+    spoken: "Docker"
+    confidence: high
+    usage_proxy: 17
+    source: "Container inventory and server answers"
+  Sonarr-Radarr-Lidarr:
+    spoken: "Sonarr, Radarr, and Lidarr"
+    confidence: high
+    usage_proxy: 0
+    source: "Arr-stack terminology"
+  Beets:
+    spoken: "Beets"
+    confidence: high
+    usage_proxy: 23
+    source: "Music pipeline investigations"
+  Plex-Media-Server:
+    spoken: "Plex Media Server"
+    confidence: high
+    usage_proxy: 0
+    source: "Container/template name"
+  Music-Enricher:
+    spoken: "Music Enricher"
+    confidence: high
+    usage_proxy: 23
+    source: "Music pipeline investigations"
+
+  Travis Scott:
+    spoken: "Travis Scott"
+    confidence: high
+    usage_proxy: 74
+    source: "Repeated Travis Scott media investigations"
+    reason: "High-frequency spoken entity; standard pronunciation should be preserved."
+  Dragon Ball:
+    spoken: "Dragon Ball"
+    confidence: high
+    usage_proxy: 4
+    source: "Plex/media query history"
+    reason: "Common title; no override expected."
+  One Piece:
+    spoken: "One Piece"
+    confidence: high
+    usage_proxy: 4
+    source: "Plex/media query history"
+    reason: "Common title; no override expected."
+  Bleach:
+    spoken: "Bleach"
+    confidence: high
+    usage_proxy: 2
+    source: "Plex/media query history"
+    reason: "Common title; no override expected."
+  OSHI:
+    spoken: "oh she"
+    confidence: medium
+    usage_proxy: 2
+    source: "Plex/media query history"
+    reason: "All-caps title; listen before changing."
+
+audition:
+  - term: Lidarr
+    sentence: "Lidarr is currently healthy."
+  - term: Sonarr
+    sentence: "Sonarr has no new items in its queue."
+  - term: Radarr
+    sentence: "Radarr is checking the movie queue."
+  - term: qBittorrent
+    sentence: "qBittorrent has a few downloads waiting."
+  - term: Slskd
+    sentence: "Soulseek D has no active transfers."
+  - term: Torbox
+    sentence: "Torbox reports twenty completed items."
+  - term: SearXNG
+    sentence: "Your SearXNG search completed successfully."
+  - term: Unraid
+    sentence: "Unraid currently has sixty one containers."
+  - term: Frigate
+    sentence: "Frigate reports that both cameras are healthy."
+  - term: Ollama
+    sentence: "Ollama is serving the Qwen model."
+  - term: Qwen
+    sentence: "Qwen is answering through Ollama."
+  - term: CUDA
+    sentence: "CUDA is available on the NVIDIA GPU."
+  - term: NVENC
+    sentence: "Plex is using NVENC for transcoding."
+  - term: NVDEC
+    sentence: "Plex is using NVDEC for decoding."
+  - term: HEVC
+    sentence: "The video is encoded with HEVC."
+  - term: H.264
+    sentence: "The stream is using H two sixty four video."
+  - term: FLAC
+    sentence: "The track is stored as FLAC audio."
+  - term: MKV
+    sentence: "The movie is stored in an M K V file."
+  - term: VRAM
+    sentence: "The GPU has enough V RAM available."
+  - term: WSS
+    sentence: "The browser is connected over W S S."
+  - term: GHCR
+    sentence: "The image was pulled from G H C R."
+  - term: Kometa
+    sentence: "Kometa is updating the Plex collections."
+  - term: Komga
+    sentence: "Komga is serving the comics library."
+  - term: Mylar3
+    sentence: "Mylar three is monitoring the comics downloads."
+  - term: Overseerr
+    sentence: "Overseerr has a new media request."
+  - term: Prowlarr
+    sentence: "Prowlarr is connected to the indexers."
+  - term: Notifiarr
+    sentence: "Notifiarr is ready to send notifications."
+  - term: FlareSolverr
+    sentence: "FlareSolverr is available to the indexer stack."
+  - term: Recyclarr
+    sentence: "Recyclarr is updating the recommended settings."
+  - term: Profilarr
+    sentence: "Profilarr is checking the profile settings."
+  - term: UTOPIA
+    sentence: "UTOPIA is present in Plex Music."
+  - term: Chatterbox
+    sentence: "Chatterbox is the current voice engine."

@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Home AI pronunciation audition</title>
+<h1>Pronunciation audition</h1>
+<p>Review-only samples. Left: original spelling. Right: proposed TTS spelling. This page does not activate the lexicon.</p>
+<div id="samples"></div>
+<script>
+const terms = [
+  'lidarr','sonarr','radarr','qbittorrent','slskd','torbox','searxng','unraid','frigate','ollama','qwen','cuda','nvenc','nvdec','hevc','h-264','flac','mkv','vram','wss','ghcr','kometa','komga','mylar3','overseerr','prowlarr','notifiarr','flaresolverr','recyclarr','profilarr'
+];
+const root = '';
+for (const term of terms) {
+  const row = document.createElement('p');
+  row.innerHTML = `<strong>${term}</strong><br>Without override <audio controls preload="none" src="${root}/${term}-without.wav"></audio><br>With proposed override <audio controls preload="none" src="${root}/${term}-with.wav"></audio>`;
+  document.querySelector('#samples').append(row);
+}
+</script>
