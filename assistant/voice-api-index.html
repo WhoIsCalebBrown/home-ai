@@ -1,0 +1,98 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local Voice Assistant</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;background:#101216;color:#eee}button{font:inherit;border:0;border-radius:10px;padding:14px 22px;margin-right:8px;background:#3b82f6;color:white;cursor:pointer}button:disabled{opacity:.45}#interrupt{background:#b91c1c}.card{background:#1b1f27;padding:18px;border-radius:14px;margin-top:18px;white-space:pre-wrap}.muted{color:#aab2c0}#state{font-weight:600}
+ .history-entry{border-top:1px solid #343a46;padding:10px 0}.history-entry:first-child{border-top:0}.history-role{font-size:12px;color:#93c5fd;text-transform:uppercase}.trace{font-size:12px;color:#aab2c0;margin-top:6px}
+</style>
+<h1>Local Voice Assistant</h1>
+<p class="muted">Client: gaming_pc · local server pipeline</p>
+<p id="state">Idle</p>
+<div class="card"><strong>Microphone diagnostics</strong><div id="miccap" class="muted"></div><div id="micdiag" class="muted"></div><div id="micerror"></div></div>
+<label for="inputDevice">Input device: </label><select id="inputDevice" disabled><option>Checking…</option></select>
+<button id="talk">Talk</button><button id="interrupt" disabled>Stop response</button>
+<div class="card"><strong>You</strong><div id="transcript" class="muted"></div></div>
+<div class="card"><strong>Assistant</strong><div id="response"></div></div>
+<div class="card"><strong>Conversation history</strong><div id="history" class="muted">No turns yet.</div></div>
+<div class="card"><strong>Kokoro voice comparison</strong><div class="muted">Same test lines, selectable voice and speed. This does not change the active assistant voice.</div><p><select id="sampleVoice"></select> <select id="sampleSpeed"></select> <select id="sampleLine"><option value="1">Server status line</option><option value="2">Plex search line</option></select></p><audio id="sampleAudio" controls preload="none" style="width:100%"></audio><div id="sampleMeta" class="muted"></div></div>
+<script>
+const state=document.querySelector('#state'),talk=document.querySelector('#talk'),interrupt=document.querySelector('#interrupt');
+const transcript=document.querySelector('#transcript'),response=document.querySelector('#response');
+const historyBox=document.querySelector('#history');
+const miccap=document.querySelector('#miccap'),micdiag=document.querySelector('#micdiag'),micerror=document.querySelector('#micerror'),inputDevice=document.querySelector('#inputDevice');
+const sampleVoice=document.querySelector('#sampleVoice'),sampleSpeed=document.querySelector('#sampleSpeed'),sampleLine=document.querySelector('#sampleLine'),sampleAudio=document.querySelector('#sampleAudio'),sampleMeta=document.querySelector('#sampleMeta');
+let ws,rec,chunks=[],requestId='',speaking=false,playing=false,stream,audioContext,nextAudioTime=0,audioSources=[],sentenceChunks=[],sentenceQueue=[],drainingSentences=false,analyser,vadFrame,vadStartedAt,history=[];
+let ttsSamples=[];
+try{history=JSON.parse(localStorage.getItem('voice-assistant-history')||'[]')}catch{history=[]}
+function saveHistory(){try{localStorage.setItem('voice-assistant-history',JSON.stringify(history.slice(-50)))}catch{}}
+function renderHistory(){if(!history.length){historyBox.textContent='No turns yet.';return}historyBox.innerHTML=history.map(x=>`<div class="history-entry"><div class="history-role">You</div><div>${escapeHtml(x.question)}</div><div class="history-role" style="margin-top:6px">Assistant</div><div>${escapeHtml(x.answer||'…')}</div>${x.trace?`<div class="trace">Checked: ${escapeHtml(x.trace)}</div>`:''}</div>`).join('');saveHistory()}
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function setState(s){state.textContent=s[0].toUpperCase()+s.slice(1);speaking=s==='speaking';interrupt.disabled=!speaking}
+function logMic(text,error=false){console[error?'error':'info'](`[voice-assistant] ${text}`);if(error)micerror.textContent=text;else micdiag.textContent=text}
+function audioSessionType(){return navigator.audioSession?.type||'unavailable'}
+function setAudioSession(type){if(!navigator.audioSession){logMic(`iOS audio session unavailable; requested ${type}`);return}try{navigator.audioSession.type=type;logMic(`Audio session: ${type} · previous/actual: ${audioSessionType()}`)}catch(e){logMic(`Audio session change failed for ${type}: ${e.message||e}`,true)}}
+function micTrackDiagnostics(prefix){const tracks=stream?.getAudioTracks?.()||[];logMic(`${prefix} · audioSession: ${audioSessionType()} · tracks: ${tracks.map(t=>t.readyState).join(',')||'none'} · AudioContext: ${audioContext?.state||'none'}`)}
+function inspectMic(){
+  const secure=window.isSecureContext;
+  const media=!!navigator.mediaDevices;
+  const gum=!!(media&&navigator.mediaDevices.getUserMedia);
+  miccap.textContent=`Secure context: ${secure ? 'yes' : 'no'} · mediaDevices: ${media ? 'yes' : 'no'} · getUserMedia: ${gum ? 'yes' : 'no'}`;
+  console.info(`[voice-assistant] ${miccap.textContent}`);
+  if(!secure||!gum){talk.disabled=true;logMic('Microphone access is unavailable because this page is not being served from a secure HTTPS context.',true);return false}
+  return true;
+}
+async function listDevices(){if(!navigator.mediaDevices?.enumerateDevices)return;const devices=await navigator.mediaDevices.enumerateDevices();const inputs=devices.filter(d=>d.kind==='audioinput');inputDevice.replaceChildren(...inputs.map((d,i)=>{const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||`Microphone ${i+1}`;return o;}));inputDevice.disabled=!inputs.length;}
+function connect(){return new Promise((resolve,reject)=>{const scheme=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(`${scheme}://${location.host}/ws`);ws.onopen=()=>{logMic(`WebSocket connected using ${scheme.toUpperCase()}`);resolve()};ws.onerror=()=>reject(new Error('WebSocket connection failed'));ws.onmessage=async e=>{const m=JSON.parse(e.data);if(m.type==='state')setState(m.state);if(m.type==='transcript'){transcript.textContent=m.text;response.textContent='';requestId=m.request_id;history.push({question:m.text,answer:'',trace:''});renderHistory()}if(m.type==='text'){response.textContent+=m.text;if(history.length)history[history.length-1].answer=response.textContent;renderHistory()}if(m.type==='trace'){const names=[];for(const x of (m.tools||[])){names.push(...(x.sources_checked||[]),x.tool)}if(history.length)history[history.length-1].trace=[...new Set(names)].join(', ');renderHistory()}if(m.type==='audio_chunk')sentenceChunks.push(m.audio);if(m.type==='audio_end'){sentenceQueue.push(sentenceChunks);sentenceChunks=[];drainSentences()}if(m.type==='cancelled'){stopPlayback();setState('idle')}if(m.type==='done')setState('idle')};ws.onclose=()=>setState('idle')})}
+async function drainSentences(){
+  if(drainingSentences)return;drainingSentences=true;
+  try{
+    setAudioSession('playback');
+    if(!audioContext)audioContext=new AudioContext({latencyHint:'interactive'});
+    await audioContext.resume();
+    while(sentenceQueue.length){
+      const encodedChunks=sentenceQueue.shift();if(!encodedChunks.length)continue;
+      const buffers=[];let channels=1,sampleRate=22050,total=0;
+      for(const encoded of encodedChunks){const raw=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));const buffer=await audioContext.decodeAudioData(raw.buffer.slice(0));buffers.push(buffer);channels=buffer.numberOfChannels;sampleRate=buffer.sampleRate;total+=buffer.length}
+      const merged=audioContext.createBuffer(channels,total,sampleRate);let offset=0;
+      for(const buffer of buffers){for(let c=0;c<channels;c++)merged.getChannelData(c).set(buffer.getChannelData(Math.min(c,buffer.numberOfChannels-1)),offset);offset+=buffer.length}
+      const source=audioContext.createBufferSource();source.buffer=merged;source.connect(audioContext.destination);
+      nextAudioTime=Math.max(nextAudioTime,audioContext.currentTime+0.08);source.start(nextAudioTime);nextAudioTime+=merged.duration;
+      audioSources.push(source);playing=true;source.onended=()=>{audioSources=audioSources.filter(s=>s!==source);if(!audioSources.length&&!sentenceQueue.length)playing=false};
+    }
+  }catch(e){logMic(`Audio playback error: ${e.message||e}`,true)}finally{drainingSentences=false;if(sentenceQueue.length)drainSentences()}
+}
+function stopPlayback(){sentenceChunks=[];sentenceQueue=[];for(const source of audioSources){try{source.stop()}catch{}}audioSources=[];nextAudioTime=0;playing=false}
+function monitorSilence(){
+  if(!analyser||!rec||rec.state!=='recording')return;
+  const data=new Uint8Array(analyser.fftSize);analyser.getByteTimeDomainData(data);let sum=0;for(const v of data){const x=(v-128)/128;sum+=x*x}const rms=Math.sqrt(sum/data.length);const now=performance.now();
+  if(rms>0.018){vadStartedAt=vadStartedAt||now;window._lastVoice=now}
+  if(vadStartedAt&&now-vadStartedAt>35000){logMic('Maximum recording duration reached; stopping');stop();return}
+  if(vadStartedAt&&window._lastVoice&&now-window._lastVoice>900){logMic('Silence detected; stopping recording');stop();return}
+  vadFrame=requestAnimationFrame(monitorSilence);
+}
+async function start(){
+  if(!inspectMic())return;
+  try{
+    if(!ws||ws.readyState!==1)await connect();
+    if(speaking){ws.send(JSON.stringify({type:'cancel'}));stopPlayback()}
+    setAudioSession('play-and-record');
+    const deviceId=inputDevice.value;
+    setState('requesting microphone');micerror.textContent='';
+    stream=await navigator.mediaDevices.getUserMedia({audio:deviceId?{deviceId:{exact:deviceId}}:true});
+    const track=stream.getAudioTracks()[0];
+    logMic(`Microphone active: ${track.label||'unnamed device'} · track state: ${track.readyState}`);
+    await listDevices();
+    chunks=[];ws.send(JSON.stringify({type:'start',client_id:'gaming_pc'}));
+    rec=new MediaRecorder(stream);rec.ondataavailable=e=>{if(e.data.size){chunks.push(e.data);logMic(`Captured audio chunk: ${e.data.size} bytes`)}};
+    rec.onerror=e=>logMic(`Microphone recording error: ${e.error?.message||e.type||'unknown error'}`,true);
+    rec.onstop=()=>{const tracks=stream?.getTracks?.()||[];tracks.forEach(t=>t.stop());logMic(`Microphone tracks stopped: ${tracks.map(t=>t.readyState).join(',')||'none'} · audioSession: ${audioSessionType()}`);stream=null;logMic(`Sending ${chunks.length} captured audio chunks to backend`);for(const c of chunks)ws.send(c);ws.send(JSON.stringify({type:'audio_end'}));};
+    audioContext=audioContext||new AudioContext();await audioContext.resume();analyser=audioContext.createAnalyser();analyser.fftSize=1024;audioContext.createMediaStreamSource(stream).connect(analyser);vadStartedAt=performance.now();window._lastVoice=0;
+    rec.start(250);setState('listening');talk.textContent='Stop listening';micTrackDiagnostics('Listening; silence detection is active');monitorSilence();
+  }catch(e){talk.textContent='Talk';setState('idle');logMic(`Microphone initialization failed: ${e.name||'Error'}${e.message?` — ${e.message}`:''}`,true);if(stream)stream.getTracks().forEach(t=>t.stop());}
+}
+function stop(){if(vadFrame)cancelAnimationFrame(vadFrame);if(rec&&rec.state==='recording'){rec.stop();talk.textContent='Talk'}}
+talk.onclick=()=>rec&&rec.state==='recording'?stop():start();interrupt.onclick=()=>{if(ws?.readyState===1)ws.send(JSON.stringify({type:'cancel'}));if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}stopPlayback();setAudioSession('playback');setState('idle')};
+async function loadTtsSamples(){try{ttsSamples=await fetch('/tts-samples').then(r=>r.json());const voices=[...new Set(ttsSamples.map(x=>x.voice))],speeds=[...new Set(ttsSamples.map(x=>x.speed))];sampleVoice.replaceChildren(...voices.map(v=>new Option(v,v)));sampleSpeed.replaceChildren(...speeds.map(v=>new Option(v.toFixed(2),v)));[sampleVoice,sampleSpeed,sampleLine].forEach(x=>x.onchange=updateTtsSample);updateTtsSample()}catch(e){sampleMeta.textContent='Voice comparison samples unavailable.'}}
+function updateTtsSample(){const v=sampleVoice.value,s=Number(sampleSpeed.value),line=Number(sampleLine.value),x=ttsSamples.find(x=>x.voice===v&&x.speed===s&&x.line===line);if(!x)return;sampleAudio.src=`/tts-samples/${encodeURIComponent(x.file)}`;sampleMeta.textContent=`${x.voice} · speed ${x.speed.toFixed(2)} · generation ${x.elapsed??'n/a'}s · RTF ${x.rtf??'n/a'}`}
+inspectMic();logMic(`Platform: ${navigator.platform||'unknown'} · user agent: ${navigator.userAgent} · navigator.audioSession: ${'audioSession' in navigator?'yes':'no'} · type: ${audioSessionType()}`);navigator.mediaDevices?.addEventListener?.('devicechange',listDevices);if(navigator.mediaDevices)listDevices();loadTtsSamples();connect().catch(()=>{});
+</script>
