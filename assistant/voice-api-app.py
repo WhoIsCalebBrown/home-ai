@@ -507,8 +507,21 @@ def artist_from_speech(text: str) -> str | None:
     return None
 
 
+def deterministic_plan(text: str) -> list[tuple[str, dict]]:
+    percent = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:of|times)\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+    if percent:
+        return [("calculator", {"expression": f"({percent.group(1)}) * ({percent.group(2)}) / 100"})]
+    convert = re.search(r"convert\s+([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z°]+)\s+(?:to|into)\s+([A-Za-z°]+)", text, re.I)
+    if convert:
+        return [("unit_convert", {"value": float(convert.group(1)), "from_unit": convert.group(2), "to_unit": convert.group(3)})]
+    return []
+
+
 def preflight_plan(text: str) -> list[tuple[str, dict]]:
     t = text.lower()
+    deterministic = deterministic_plan(text)
+    if deterministic:
+        return deterministic
     if visual_question(text):
         if re.search(r"\b(front door|door)\b", t):
             return [("frigate_snapshot", {"camera": "front_door"})]
@@ -774,6 +787,16 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        if live_results and any(item.get("tool") in {"calculator", "unit_convert"} and item.get("status") == "ok" for item in live_results):
+            result = next(item.get("result", {}) for item in live_results if item.get("tool") in {"calculator", "unit_convert"} and item.get("status") == "ok")
+            if "value" in result and "result" not in result:
+                full = f"{result['value']:g}."
+            else:
+                full = f"{result.get('result'):g} {result.get('to_unit', '')}.".replace(" .", ".")
+            await emit_answer(ws, request_id, full)
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         if live_results and any(item.get("tool") == "investigate_media_pipeline" and item.get("status") == "ok" for item in live_results):
             investigation = next(item.get("result", {}) for item in live_results if item.get("tool") == "investigate_media_pipeline")
             direct = grounded_investigation_answer(investigation, user_text)
