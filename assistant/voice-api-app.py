@@ -418,30 +418,45 @@ def synthesis_violation(text: str, user_text: str = "") -> str | None:
 async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "") -> str:
     sentence = ""
     full = full_seed
-    async with httpx.AsyncClient(timeout=None) as http:
-        payload = {"model": MODEL, "messages": messages, "stream": True, "think": False,
-                   "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": 4096, "num_predict": 128}}
-        async with http.stream("POST", f"{OLLAMA}/api/chat", json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
-                data = json.loads(line)
-                token = visible_model_text(data.get("message", {}).get("content", ""))
-                if not token:
-                    continue
-                full += token
-                sentence += token
-                await ws.send_json({"type": "text", "text": token, "request_id": request_id})
-                if re.search(r"[.!?](?:['\"])?\s*$", sentence) and len(sentence.strip()) >= 12:
-                    await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-                    await speak(ws, request_id, sentence.strip())
-                    sentence = ""
-                if data.get("done"):
-                    break
-    if sentence.strip():
-        await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-        await speak(ws, request_id, sentence.strip())
+    tts_tasks: list[asyncio.Task] = []
+
+    def queue_sentence(value: str) -> None:
+        if value.strip():
+            tts_tasks.append(asyncio.create_task(speak(ws, request_id, value.strip())))
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as http:
+            payload = {"model": MODEL, "messages": messages, "stream": True, "think": False,
+                       "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": 4096, "num_predict": 128}}
+            async with http.stream("POST", f"{OLLAMA}/api/chat", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    token = visible_model_text(data.get("message", {}).get("content", ""))
+                    if not token:
+                        continue
+                    full += token
+                    sentence += token
+                    await ws.send_json({"type": "text", "text": token, "request_id": request_id})
+                    if re.search(r"[.!?](?:['\"])?\s*$", sentence) and len(sentence.strip()) >= 12:
+                        await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
+                        queue_sentence(sentence)
+                        sentence = ""
+                    if data.get("done"):
+                        break
+        if sentence.strip():
+            await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
+        queue_sentence(sentence)
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks)
+    except asyncio.CancelledError:
+        for task in tts_tasks:
+            task.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+        raise
     return full.strip()
 
 
