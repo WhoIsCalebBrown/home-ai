@@ -624,10 +624,18 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
         if unsupported or any(number not in evidence for number in numeric_claims):
             return "I found the live investigation results, but I can't safely state that specific detail because it isn't explicitly supported by the current service results."
     if any(item.get("tool") == "list_containers" and item.get("status") == "ok" for item in results):
-        match = re.search(r"\b(\d+)\b", answer)
-        expected = next((item.get("result", {}).get("count") for item in results if item.get("tool") == "list_containers" and isinstance(item.get("result"), dict)), None)
-        if expected is not None and (not match or int(match.group(1)) != int(expected)):
-            return f"Your server currently has {expected} containers."
+        item = next((item for item in results if item.get("tool") == "list_containers" and isinstance(item.get("result"), dict)), None)
+        if item:
+            result = item["result"]
+            summary = result.get("summary", {})
+            status_filter = result.get("status_filter")
+            if status_filter in {"running", "paused", "restarting", "exited", "dead"}:
+                key = "stopped" if status_filter == "exited" else status_filter
+                expected = int(summary.get(key, result.get("count", 0)))
+                label = "stopped" if status_filter == "exited" else status_filter
+                return f"Your server currently has {expected} containers {label}."
+            expected = int(summary.get("total", result.get("count", 0)))
+            return f"Your server currently has {expected} containers in total, including {summary.get('running', 0)} running."
     if any(item.get("tool") == "get_storage_status" and item.get("status") == "ok" for item in results):
         result = next(item.get("result", {}) for item in results if item.get("tool") == "get_storage_status")
         user_share = result.get("user_share", {})
@@ -947,7 +955,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         # city. Keep the active qualified city when the current turn does not
         # identify a stronger replacement.
         active_location = context.get("location")
-        if active_location and (not location or location.casefold() in {"ontario", "canada"}):
+        if active_location and (
+            not location
+            or location.casefold() in {"ontario", "canada"}
+            or re.search(r"\b(?:weather|yeah|what|how|time|isn't|isnt|well)\b", location, re.I)
+        ):
             location = active_location
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]

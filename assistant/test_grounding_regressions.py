@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -105,6 +105,19 @@ def test_noisy_weather_followup_preserves_active_location():
         {"domain": "weather", "kind": "weather", "location": "Welland, Ontario"},
     )
     assert plan == [("weather_forecast", {"location": "Welland, Ontario", "days_from_now": 0})]
+
+
+def test_container_summary_is_status_specific():
+    answer = evidence_supported_answer(
+        "Your server currently has 61 containers.",
+        "How many containers are running?",
+        [{"tool": "list_containers", "status": "ok", "result": {
+            "count": 49, "status_filter": "running",
+            "summary": {"total": 61, "running": 49, "stopped": 12, "paused": 0, "restarting": 0, "dead": 0},
+        }}],
+        "server",
+    )
+    assert answer == "Your server currently has 49 containers running."
 
 
 def test_media_aliases_are_routing_only():
