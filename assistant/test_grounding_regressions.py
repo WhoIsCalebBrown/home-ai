@@ -90,6 +90,7 @@ def test_media_aliases_are_routing_only():
     text = routing_aliases("Is there anything on LiDAR that's going to be added to Plexium?")
     assert "Lidarr" in text and "Plex" in text
     assert preflight_plan(text)[0][0] == "investigate_media_pipeline"
+    assert "Lidarr" in routing_aliases("Is litter going to Plex right now?")
 
 
 def test_explicit_topic_change_clears_weather_bias():

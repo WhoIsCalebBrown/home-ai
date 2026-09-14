@@ -586,6 +586,10 @@ def routing_aliases(text: str) -> str:
     if re.search(r"\b(lidar|lidarr|plexium|plex|music|album|artist|added|download)\b", text, re.I):
         text = re.sub(r"\blidar\b", "Lidarr", text, flags=re.I)
         text = re.sub(r"\bplexium\b", "Plex", text, flags=re.I)
+    # Whisper occasionally renders Lidarr as "litter".  Accept it only when
+    # unmistakably surrounded by the local media/Plex domain.
+    if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist)\b", text, re.I):
+        text = re.sub(r"\blitter\b", "Lidarr", text, flags=re.I)
     return text
 
 
