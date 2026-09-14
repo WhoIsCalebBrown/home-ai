@@ -1,3 +1,5 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
 pocket-tts==3.1.0
