@@ -32,7 +32,13 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", f"{TOWER}:5000/webhook").rstrip("/")
 CLIDEBRID_BRIDGE_TOKEN = os.getenv("CLIDEBRID_BRIDGE_TOKEN", "")
-CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv("CLIDEBRID_BRIDGE_TOKEN_FILE", "/config/cli_debrid/cli_debrid_bridge_token")
+# Home-AI-Tools mounts the Unraid appdata root at /config; cli_debrid's
+# token lives below its mounted config directory.  Keep the path server-side
+# and fail closed if it is absent or unreadable.
+CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv(
+    "CLIDEBRID_BRIDGE_TOKEN_FILE",
+    "/config/cli_debrid/config/cli_debrid_bridge_token",
+)
 STANDARD_MEDIA_WRITES_ENABLED = os.getenv("STANDARD_MEDIA_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_MOVIE_WRITES_ENABLED = os.getenv("STANDARD_MOVIE_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_SEASON_WRITES_ENABLED = os.getenv("STANDARD_SEASON_WRITES_ENABLED", "false").casefold() == "true"
