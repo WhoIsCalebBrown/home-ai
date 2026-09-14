@@ -1249,6 +1249,7 @@ def _save_media_workflows(rows: list[dict[str, Any]]) -> None:
 def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any]:
     text = re.sub(r"\s+", " ", str(goal or "").strip())
     lowered = text.casefold()
+    mode = "permanent" if re.search(r"\b(?:permanent(?:ly)?|keep)\b", lowered) else "standard"
     kind = media_type
     if not kind:
         if re.search(r"\b(album|music|song|artist|record|release)\b|\bby\s+[^.]+", lowered):
@@ -1266,12 +1267,22 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title, artist = by_match.group(1), by_match.group(2)
     title = re.sub(r"^\s*(?:get|find|add|request|do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
+    season_match = re.search(r"\bseason\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
+    episode_match = re.search(r"\bepisode\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
+    season_scope = [int(season_match.group(1))] if season_match else []
+    episode_scope = [int(episode_match.group(1))] if episode_match else []
+    if season_match:
+        title = season_match.group(2).strip(" .?!")
+    elif episode_match:
+        title = episode_match.group(2).strip(" .?!")
+    title = re.sub(r"\s+and\s+keep(?:\s+it)?\s+permanently\s*$", "", title, flags=re.I).strip(" .?!")
     if kind in {"movie", "tv", "anime"}:
         title = re.sub(r"\b(?:the|original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
-            "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect"}
+            "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect",
+            "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope}
 
 
 def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool]:
@@ -1308,7 +1319,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     """Read/plan only. It never adds, searches, downloads, imports, or mutates a provider."""
     parts = _media_goal_parts(args.get("goal", ""), args.get("media_type"))
     kind, title, artist = parts["media_type"], parts["title_query"], parts["artist_query"]
-    plan: dict[str, Any] = {"plan_only": True, "goal": parts, "writes_required": [], "confirmation_required": False,
+    plan: dict[str, Any] = {"plan_only": True, "goal": parts, "mode": parts.get("mode", "standard"), "writes_required": [], "confirmation_required": False,
                             "canonical_identity": None, "current_state": "UNKNOWN", "steps": [], "providers": {}}
     matches: list[dict[str, Any]] = []
     if kind == "album":
@@ -1399,7 +1410,31 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             if parts["action"] == "ensure_available":
                 plan["writes_required"] = [{"owner": owner, "capability": "media.request", "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
                 plan["confirmation_required"] = True
-    if plan.get("writes_required"):
+    # Standard/watch-first movie and TV goals never create managed *arr
+    # records.  They bridge only the canonical TMDB identity and exact season
+    # scope to cli_debrid.  Music remains manager-owned for now.
+    if identity and parts.get("mode") == "standard" and kind in {"movie", "tv", "anime"} and parts.get("action") == "ensure_available":
+        if parts.get("episode_scope"):
+            plan["current_state"] = "BLOCKED"
+            plan["blocked_reason"] = "STANDARD_EPISODE_SCOPE_UNSUPPORTED"
+        else:
+            plan["writes_required"] = [{"owner": "cli_debrid", "capability": "media.standard_request",
+                                         "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
+            plan["confirmation_required"] = True
+            plan["bounded_write_plan"] = [{
+                "operation": "POST /webhook/api/v1/request",
+                "arguments": {
+                    "mediaType": "movie" if kind == "movie" else "tv",
+                    "mediaId": identity.get("tmdb_id"),
+                    "seasons": parts.get("season_scope", []) if kind != "movie" else [],
+                    "is4k": False, "serverId": 0, "profileId": 0, "rootFolder": "/", "userId": 1,
+                },
+                "ownership": "cli_debrid chooses scrapers, candidates, and acquisition",
+            }]
+            plan["steps"].append({"capability": "media.standard_request", "owner": "cli_debrid",
+                                   "reason": "watch-first acquisition without creating a managed *arr record"})
+
+    if plan.get("writes_required") and not (parts.get("mode") == "standard" and kind in {"movie", "tv", "anime"}):
         policy_type = "music" if kind == "album" else "movies" if kind == "movie" else kind
         policy_status = await validate_media_policy(policy_type)
         plan["policy"] = policy_status
@@ -1466,7 +1501,9 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             workflow_id=workflow["workflow_id"],
             plan=confirmation_plan,
             session_id=str(args.get("session_id") or "plan-only"),
-            operation=f"{plan['writes_required'][0].get('owner')}.media_execute_goal",
+            operation=("cli_debrid.media_standard_request"
+                       if plan.get("mode") == "standard" and kind in {"movie", "tv", "anime"}
+                       else f"{plan['writes_required'][0].get('owner')}.media_execute_goal"),
             arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run",
                        "canonical_identity": identity, "bounded_write_plan": plan.get("bounded_write_plan", [])},
         )
