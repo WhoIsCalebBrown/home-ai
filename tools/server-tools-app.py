@@ -30,7 +30,7 @@ TOWER = os.getenv("TOWER_URL", "http://192.168.40.44")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
-LISTS_PATH = Path(os.getenv("LISTS_PATH", "/config/home-ai-lists.json"))
+LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
 PROTECTED = {x.strip().lower() for x in os.getenv(
     "PROTECTED_CONTAINERS",
     "voice-api,voice-ollama,voice-whisper,voice-kokoro,voice-piper,Nginx-Proxy-Manager-Official,adguardhome,cloudflare-tunnel,mariadb,postgres,redis"
