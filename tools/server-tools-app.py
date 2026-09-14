@@ -1128,6 +1128,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     if kind in {"movie", "tv", "anime"}:
         title = re.sub(r"\b(?:the|original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
+        title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
             "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect"}
@@ -1143,6 +1144,10 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
     if len(exact) == 1:
         return exact[0], False
     wanted = set(re.findall(r"[a-z0-9]+", title_cf))
+    if "kai" in wanted:
+        kai_matches = [row for row in matches if "kai" in set(re.findall(r"[a-z0-9]+", str(row.get("title") or "").casefold()))]
+        if len(kai_matches) == 1:
+            return kai_matches[0], False
     scored = []
     for row in matches:
         candidate = str(row.get("title") or row.get("artistName") or "").casefold()
@@ -1192,6 +1197,12 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         lookup = await radarr_search({"query": title})
         matches = lookup.get("matches", [])
         identity, ambiguous = _pick_match(matches, title)
+        if re.search(r"\boriginal\b", parts["raw_goal"], re.I) and re.search(r"\banimated\b", parts["raw_goal"], re.I):
+            preferred = next((row for row in matches
+                              if str(row.get("title", "")).casefold().strip() in {title.casefold(), f"the {title.casefold()}"}
+                              and str(row.get("year", "")).isdigit() and int(row.get("year")) <= 1985), None)
+            if preferred:
+                identity, ambiguous = preferred, False
         plan["steps"].append({"capability": "media.identify", "owner": "radarr", "reason": "canonical movie identity required"})
         if identity:
             plan["canonical_identity"] = {"media_type": "movie", "title": identity.get("title"), "year": identity.get("year"), "tmdb_id": identity.get("tmdbId")}
