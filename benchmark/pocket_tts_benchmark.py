@@ -33,11 +33,8 @@ def main() -> None:
     model_start = time.perf_counter()
     model = TTSModel.load_model(language="english")
     model_load = time.perf_counter() - model_start
-    # The public no-voice-cloning weights are used only to measure the official
-    # CPU streaming path. A custom reference requires the gated voice-cloning
-    # weights and is intentionally not substituted here.
     conditioning_start = time.perf_counter()
-    state = model.get_state_for_audio_prompt("alba")
+    state = model.get_state_for_audio_prompt(reference, truncate=True)
     conditioning = time.perf_counter() - conditioning_start
     pocket_rows = []
     for index, text in enumerate(TEXTS):
