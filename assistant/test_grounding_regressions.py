@@ -6,8 +6,15 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "weather_location_from_text", "explicit_topic"}
-nodes = [node for node in tree.body if getattr(node, "name", None) in needed or (isinstance(node, (ast.Assign, ast.AnnAssign)) and any(getattr(target, "id", None) in needed for target in getattr(node, "targets", [])))]
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context"}
+def is_needed_assignment(node):
+    targets = getattr(node, "targets", [])
+    if isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    return isinstance(node, (ast.Assign, ast.AnnAssign)) and any(getattr(target, "id", None) in needed for target in targets)
+
+
+nodes = [node for node in tree.body if getattr(node, "name", None) in needed or is_needed_assignment(node)]
 namespace = {"json": json, "re": re}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "voice-api-app.py", "exec"), namespace)
 SOURCE_NAMES = namespace["SOURCE_NAMES"]
@@ -17,6 +24,9 @@ visual_question = namespace["visual_question"]
 grounded_camera_presence_answer = namespace["grounded_camera_presence_answer"]
 routing_aliases = namespace["routing_aliases"]
 weather_location_from_text = namespace["weather_location_from_text"]
+turn_context = namespace["turn_context"]
+resolved_followup_text = namespace["resolved_followup_text"]
+conversation_context = namespace["conversation_context"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -78,6 +88,21 @@ def test_media_aliases_are_routing_only():
     text = routing_aliases("Is there anything on LiDAR that's going to be added to Plexium?")
     assert "Lidarr" in text and "Plex" in text
     assert preflight_plan(text)[0][0] == "investigate_media_pipeline"
+
+
+def test_explicit_topic_change_clears_weather_bias():
+    conversation_context.clear()
+    turn_context("scenario", "What's the weather in Welland, Ontario?")
+    turn_context("scenario", "What's happening in the news today?")
+    assert resolved_followup_text("scenario", "What's happening in the news today?") == "What's happening in the news today?"
+    assert conversation_context["scenario"]["kind"] == "web_research"
+
+
+def test_weather_followup_inherits_only_when_referential():
+    conversation_context.clear()
+    turn_context("scenario", "What's the weather in Toronto?")
+    assert resolved_followup_text("scenario", "What about tomorrow?") == "weather in Toronto tomorrow"
+    assert resolved_followup_text("scenario", "And what's current news today?") == "And what's current news today?"
 
 
 if __name__ == "__main__":
