@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import os
+import queue
+import threading
 import wave
 from pathlib import Path
 
@@ -18,6 +21,7 @@ VOICE_STATE = Path(os.getenv("POCKET_VOICE_STATE", "/data/ref.voice.safetensors"
 MODEL: TTSModel | None = None
 VOICE_STATE_DATA = None
 LOCK = asyncio.Lock()
+THREAD_LOCK = threading.Lock()
 
 
 class SpeechRequest(BaseModel):
@@ -73,9 +77,25 @@ async def stream(request: SpeechRequest):
         raise HTTPException(status_code=400, detail="input is required")
 
     async def chunks():
-        async with LOCK:
-            generated = await asyncio.to_thread(lambda: list(MODEL.generate_audio_stream(VOICE_STATE_DATA, text)))
-        for chunk in generated:
-            yield wav_bytes(chunk)
+        output: queue.Queue = queue.Queue()
+
+        def generate():
+            try:
+                with THREAD_LOCK:
+                    for chunk in MODEL.generate_audio_stream(VOICE_STATE_DATA, text):
+                        output.put(wav_bytes(chunk))
+            except Exception as exc:  # surfaced as a terminal stream error
+                output.put(exc)
+            finally:
+                output.put(None)
+
+        threading.Thread(target=generate, daemon=True).start()
+        while True:
+            item = await asyncio.to_thread(output.get)
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield (base64.b64encode(item).decode("ascii") + "\n").encode("ascii")
 
     return StreamingResponse(chunks(), media_type="application/octet-stream")
