@@ -568,6 +568,7 @@ def current_external_question(text: str) -> bool:
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
     return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
             or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
+            or bool(re.search(r"\bblack\s*hawk\b", text, re.I))
             or bool(re.search(external_story, text, re.I) and re.search(r"\b(toronto|canada|city|over|above|world|government|technology|ai)\b", text, re.I)))
 
 
