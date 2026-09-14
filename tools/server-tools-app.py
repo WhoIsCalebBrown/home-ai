@@ -1511,7 +1511,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         bridge_arguments = {
             "workflow_id": workflow["workflow_id"],
             "mode": "standard",
-            "media_type": kind,
+            "media_type": "tv" if kind in {"tv", "anime"} else kind,
             "canonical_external_id": identity.get("tmdb_id"),
             "season_scope": parts.get("season_scope", []),
             "episode_scope": [],
