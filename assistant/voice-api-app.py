@@ -805,8 +805,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         action = None
     if action and is_confirmation(user_text):
         pending.pop(client_id, None)
-        result = await invoke_tool(action["name"], action["arguments"], client_id, request_id, confirmed=True, action_id=action.get("action_id"))
-        if action["name"] == "restart_container":
+        action_name = action.get("name")
+        # Older pending records used this internal alias. It is safe to map it
+        # only for the exact stored restart shape; never reconstruct an action
+        # from the confirmation text.
+        if action_name == "container_manage" and action.get("arguments", {}).get("action") == "restart":
+            action_name = "restart_container"
+        discovery_audit({"event": "confirmed_action", "client_id": client_id, "request_id": request_id, "action_id": action.get("action_id"), "stored_tool": action.get("name"), "executed_tool": action_name, "arguments": action.get("arguments", {})})
+        result = await invoke_tool(action_name, action["arguments"], client_id, request_id, confirmed=True, action_id=action.get("action_id"))
+        if action_name == "restart_container":
             details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
             target = action["arguments"].get("name", "the container")
             display_target = CONTAINER_DISPLAY_NAMES.get(target.casefold(), target)
