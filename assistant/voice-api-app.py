@@ -553,6 +553,58 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
 ARTIST_ALIASES = {"travis": "Travis Scott", "travis scott": "Travis Scott"}
 
 
+def routing_aliases(text: str) -> str:
+    """Normalize high-confidence STT aliases only for routing, never for display/history."""
+    if re.search(r"\b(lidar|lidarr|plexium|plex|music|album|artist|added|download)\b", text, re.I):
+        text = re.sub(r"\blidar\b", "Lidarr", text, flags=re.I)
+        text = re.sub(r"\bplexium\b", "Plex", text, flags=re.I)
+    return text
+
+
+def weather_location_from_text(text: str) -> str | None:
+    """Extract an explicitly named weather location without swallowing trailing intent words."""
+    patterns = (
+        r"\b(?:in|for|at)\s+(.+?)(?=\s+(?:weather|forecast|today|tomorrow|now|right now)\b|[?!]|$)",
+        r"\b(?:weather|forecast)\s+(?:in|for|at)\s+(.+?)(?=\s+(?:today|tomorrow|now|right now)\b|[?!]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            value = re.sub(r"^the\s+", "", match.group(1).strip(" .!?\t\r\n"), flags=re.I)
+            if value and value.casefold() not in {"one", "it", "that"}:
+                return value
+    return None
+
+
+def explicit_topic(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(weather|forecast|news|headlines?|president|prime minister|politics?|policy|policies|trump|trade war|trade dispute|"
+            r"lidarr|lidar|plexium|plex|download(?:s|ing)?|torrent|camera|frigate|front door|storage|docker|container|"
+            r"movie|movies|music|album|artist|sonarr|radarr|q?bittorrent|server)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def turn_context(client_id: str, text: str) -> dict:
+    """Apply explicit current-turn topic/entity state before discovery or tool execution."""
+    current = dict(conversation_context.get(client_id, {}))
+    lowered = text.casefold()
+    if re.search(r"\b(weather|forecast)\b", lowered):
+        location = weather_location_from_text(text) or current.get("location", "")
+        current = {"kind": "weather", "group": "weather", "tools": [], "location": location}
+    elif current_external_question(text) or re.search(r"\b(news|headlines?)\b", lowered):
+        current = {"kind": "web_research", "group": "internet", "tools": []}
+    elif re.search(r"\b(lidarr|lidar|plexium|plex|music|album|artist|download|downloading|torrent)\b", lowered):
+        current = {"kind": "media", "group": "media", "tools": []}
+    elif re.search(r"\b(front door|camera|cameras|frigate|wearing|snapshot|screenshot)\b", lowered):
+        current = {"kind": "camera", "group": "cameras", "tools": []}
+    conversation_context[client_id] = current
+    return current
+
+
 def artist_from_speech(text: str) -> str | None:
     lowered = text.casefold()
     for alias, canonical in sorted(ARTIST_ALIASES.items(), key=lambda item: -len(item[0])):
@@ -587,14 +639,13 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
     if re.search(r"\bweather\b", t):
-        location = None
-        match = re.search(r"\b(?:in|for|at)\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
-        if match:
-            location = match.group(1).strip(" .!?\t\r\n")
+        location = weather_location_from_text(text)
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if current_external_question(text):
         return [("web_search", {"query": text.strip()})]
+    if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(plex|plexium|added|adding|going|coming|download|music)\b", t):
+        return [("investigate_media_pipeline", {"entity_type": "auto", "query": routing_aliases(text), "focus": "status"})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
     if re.search(r"\b(summary|overview)\b", t) and re.search(r"\b(server|media server)\b", t):
@@ -765,10 +816,20 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
             conversation_context[client_id] = {"kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
+        elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
+            conversation_context[client_id] = {"kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         if result.get("sources_checked") or result.get("investigation"):
-            provenance[client_id] = {"tool": item.get("tool"), "sources_checked": result.get("sources_checked", []), "result": result}
+            provenance[client_id] = {
+                "tool": item.get("tool"),
+                "sources_checked": result.get("sources_checked", []),
+                "result": result,
+                "originating_turn": item.get("request_id"),
+                "timestamp": time.time(),
+                "success": item.get("status") == "ok",
+                "freshness": "current",
+            }
             return
         if item.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
             conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": [item.get("tool")], "location": result.get("location", {}).get("name", "")}
@@ -777,8 +838,10 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
 def resolved_followup_text(client_id: str, text: str) -> str:
     """Resolve only narrow, unambiguous follow-ups for routing; keep original text for display/reasoning."""
     context = conversation_context.get(client_id, {})
-    lowered = text.casefold()
-    if context.get("kind") == "weather" and re.search(r"\b(what about|how about|and)\b", lowered):
+    lowered = routing_aliases(text).casefold()
+    if explicit_topic(text):
+        return routing_aliases(text)
+    if context.get("kind") == "weather" and re.search(r"\b(what about|how about|look|find|check|one|it|that|there|right now|tomorrow)\b", lowered):
         explicit = re.search(r"\b(?:what|how) about\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
         candidate = explicit.group(1).strip(" .!?\t\r\n") if explicit else ""
         if candidate.casefold() in {"today", "tomorrow", "now"}:
@@ -851,8 +914,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
+        context = turn_context(client_id, user_text)
         route_text = resolved_followup_text(client_id, user_text)
-        context = conversation_context.get(client_id, {})
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
@@ -938,6 +1001,16 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             messages.extend(evidence_messages)
         full = ""
         for _ in range(4):
+            discovery_audit({
+                "event": "ollama_request",
+                "client_id": client_id,
+                "request_id": request_id,
+                "request_index": _ + 1,
+                "model": MODEL,
+                "context": LLM_CONTEXT,
+                "message_roles": [item.get("role") for item in messages],
+                "tool_schemas": [item.get("name") for item in tools],
+            })
             async with httpx.AsyncClient(timeout=None) as http:
                 payload = {"model": MODEL, "messages": messages, "tools": tools, "stream": False, "think": False,
                            "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
