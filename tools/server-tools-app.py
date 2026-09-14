@@ -1402,6 +1402,42 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             plan["writes_required"][0]["status"] = "BLOCKED_POLICY"
             plan["confirmation_required"] = False
             plan["blocked_reason"] = policy_status.get("reason")
+        elif kind == "movie":
+            plan["bounded_write_plan"] = [
+                {"operation": "POST /api/v3/movie", "arguments": {
+                    "base": "canonical Radarr lookup resource",
+                    "rootFolderPath": policy_status["root_folder"],
+                    "qualityProfileId": policy_status["profile"]["id"],
+                    "minimumAvailability": policy_status["policy"]["minimum_availability"],
+                    "monitored": True, "addOptions": {"searchForMovie": False}}},
+                {"operation": "POST /api/v3/command", "arguments": {
+                    "name": "MoviesSearch", "movieIds": ["newly-created-radarr-movie-id"]}},
+            ]
+        elif kind == "anime":
+            plan["bounded_write_plan"] = [
+                {"operation": "POST /api/v3/series", "arguments": {
+                    "base": "canonical Sonarr lookup resource",
+                    "rootFolderPath": policy_status["root_folder"],
+                    "qualityProfileId": policy_status["profile"]["id"],
+                    "seriesType": policy_status["policy"]["series_type"],
+                    "seasonFolder": policy_status["policy"]["season_folder"],
+                    "monitored": True,
+                    "addOptions": {"searchForMissingEpisodes": False, "searchForCutoffUnmetEpisodes": False}}},
+                {"operation": "POST /api/v3/command", "arguments": {
+                    "name": "SeriesSearch", "seriesId": ["newly-created-sonarr-series-id"]}},
+            ]
+        elif kind == "album":
+            plan["bounded_write_plan"] = [
+                {"operation": "POST /api/v1/artist (only if artist is absent)", "arguments": {
+                    "rootFolderPath": policy_status["root_folder"],
+                    "qualityProfileId": policy_status["profile"]["id"],
+                    "metadataProfileId": policy_status["policy"]["metadata_profile_id"],
+                    "monitorNewItems": "none", "addOptions": {"monitor": "none"}}},
+                {"operation": "PUT /api/v1/album/monitor", "arguments": {
+                    "albumIds": ["exact-Lidarr-album-id"], "monitored": True}},
+                {"operation": "POST /api/v1/command", "arguments": {
+                    "name": "AlbumSearch", "albumIds": ["exact-Lidarr-album-id"]}},
+            ]
         plan["steps"].append({"capability": "media.request", "owner": plan["writes_required"][0]["owner"],
                                "reason": "item is identified but not yet managed; execution is disabled in plan mode",
                                "policy_status": policy_status.get("reason", "VALID")})
@@ -1426,7 +1462,8 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             plan=confirmation_plan,
             session_id=str(args.get("session_id") or "plan-only"),
             operation=f"{plan['writes_required'][0].get('owner')}.media_execute_goal",
-            arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run", "canonical_identity": identity},
+            arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run",
+                       "canonical_identity": identity, "bounded_write_plan": plan.get("bounded_write_plan", [])},
         )
     plan["idempotent"] = True
     return plan
