@@ -17,10 +17,11 @@ def main() -> None:
     source = TARGET.read_text(encoding="utf-8")
     if MARKER in source:
         if "import secrets\n" not in source:
-            if "import os\n" in source:
-                source = source.replace("import os\n", "import os\nimport secrets\n", 1)
-            else:
-                source = source.replace("import logging\n", "import logging\nimport secrets\n", 1)
+            lines = source.splitlines(keepends=True)
+            insert_at = next((i + 1 for i, line in enumerate(lines)
+                              if line.startswith("import os") or line.startswith("import logging")), 0)
+            lines.insert(insert_at, "import secrets\n")
+            source = "".join(lines)
             TARGET.write_text(source, encoding="utf-8")
         return
     if "def webhook():\n" not in source or "def agregarr_create_request():\n" not in source:
@@ -28,7 +29,11 @@ def main() -> None:
 
     helper = f'''\n{MARKER}\ndef _home_ai_bridge_authorized():\n    try:\n        expected = Path({TOKEN_PATH!r}).read_text(encoding="utf-8").strip()\n    except OSError:\n        return False\n    supplied = request.headers.get("X-Home-AI-Bridge-Token", "")\n    return bool(expected) and secrets.compare_digest(supplied, expected)\n'''
     if "import secrets\n" not in source:
-        source = source.replace("import os\n", "import os\nimport secrets\n", 1)
+        lines = source.splitlines(keepends=True)
+        insert_at = next((i + 1 for i, line in enumerate(lines)
+                          if line.startswith("import os") or line.startswith("import logging")), 0)
+        lines.insert(insert_at, "import secrets\n")
+        source = "".join(lines)
     source = source.replace("webhook_bp = Blueprint('webhook', __name__)\n", "webhook_bp = Blueprint('webhook', __name__)\n" + helper, 1)
     source = source.replace("def webhook():\n    data = request.json\n", "def webhook():\n    if not _home_ai_bridge_authorized():\n        return jsonify({\"error\": \"unauthorized\"}), 401\n    data = request.json\n", 1)
     source = source.replace("def agregarr_create_request():\n", "def agregarr_create_request():\n", 1)
