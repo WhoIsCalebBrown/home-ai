@@ -32,7 +32,11 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", f"{TOWER}:5000/webhook").rstrip("/")
 CLIDEBRID_BRIDGE_TOKEN = os.getenv("CLIDEBRID_BRIDGE_TOKEN", "")
+CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv("CLIDEBRID_BRIDGE_TOKEN_FILE", "/config/cli_debrid/cli_debrid_bridge_token")
 STANDARD_MEDIA_WRITES_ENABLED = os.getenv("STANDARD_MEDIA_WRITES_ENABLED", "false").casefold() == "true"
+STANDARD_MOVIE_WRITES_ENABLED = os.getenv("STANDARD_MOVIE_WRITES_ENABLED", "false").casefold() == "true"
+STANDARD_SEASON_WRITES_ENABLED = os.getenv("STANDARD_SEASON_WRITES_ENABLED", "false").casefold() == "true"
+STANDARD_EPISODE_WRITES_ENABLED = os.getenv("STANDARD_EPISODE_WRITES_ENABLED", "false").casefold() == "true"
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
 MEDIA_WORKFLOWS_PATH = Path(os.getenv("MEDIA_WORKFLOWS_PATH", "/data/media-workflows.json"))
@@ -1491,7 +1495,10 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     key = json.dumps({"type": kind, "id": (identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("title"))}, sort_keys=True)
     existing = next((row for row in rows if row.get("dedupe_key") == key), None)
     workflow = existing or {"workflow_id": str(uuid.uuid4()), "dedupe_key": key, "created_at": now(), "action_history": []}
-    workflow.update({"media_type": kind, "canonical_identity": identity, "desired_goal": parts["action"], "current_state": plan["current_state"], "last_checked": now(), "plan_only": True})
+    active_states = {"REQUESTED", "SEARCHING", "ACQUIRING", "VERIFYING", "ACQUIRED", "AVAILABLE_IN_PLEX"}
+    preserved_state = existing.get("current_state") if existing and existing.get("current_state") in active_states else plan["current_state"]
+    workflow.update({"media_type": kind, "canonical_identity": identity, "desired_goal": parts["action"], "mode": parts.get("mode", "standard"),
+                     "current_state": preserved_state, "last_checked": now(), "plan_only": True})
     if not existing:
         rows.append(workflow)
     _save_media_workflows(rows)
@@ -1501,6 +1508,18 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         # would persist. It is never consumed or authorized by this planner.
         confirmation_plan = dict(plan)
         confirmation_plan.pop("confirmation_record", None)
+        bridge_arguments = {
+            "workflow_id": workflow["workflow_id"],
+            "mode": "standard",
+            "media_type": kind,
+            "canonical_external_id": identity.get("tmdb_id"),
+            "season_scope": parts.get("season_scope", []),
+            "episode_scope": [],
+        }
+        confirmation_arguments = (bridge_arguments
+                                  if plan.get("mode") == "standard" and kind in {"movie", "tv", "anime"}
+                                  else {"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run",
+                                        "canonical_identity": identity, "bounded_write_plan": plan.get("bounded_write_plan", [])})
         plan["confirmation_record"] = media_confirmation_record(
             workflow_id=workflow["workflow_id"],
             plan=confirmation_plan,
@@ -1508,9 +1527,12 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             operation=("cli_debrid.media_standard_request"
                        if plan.get("mode") == "standard" and kind in {"movie", "tv", "anime"}
                        else f"{plan['writes_required'][0].get('owner')}.media_execute_goal"),
-            arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run",
-                       "canonical_identity": identity, "bounded_write_plan": plan.get("bounded_write_plan", [])},
+            arguments=confirmation_arguments,
         )
+        workflow.update({"plan_version_hash": plan["confirmation_record"]["plan_version_hash"],
+                         "confirmation_id": plan["confirmation_record"]["confirmation_id"],
+                         "confirmation_status": "PENDING"})
+        _save_media_workflows(rows)
     plan["idempotent"] = True
     return plan
 
@@ -1555,6 +1577,41 @@ def _build_cli_debrid_request(args: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _standard_bridge_secret() -> str:
+    if CLIDEBRID_BRIDGE_TOKEN:
+        return CLIDEBRID_BRIDGE_TOKEN
+    try:
+        return Path(CLIDEBRID_BRIDGE_TOKEN_FILE).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _standard_argument_binding(args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workflow_id": str(args.get("workflow_id", "")),
+        "mode": "standard",
+        "media_type": str(args.get("media_type", "")).casefold(),
+        "canonical_external_id": int(args.get("canonical_external_id")),
+        "season_scope": sorted(set(args.get("season_scope") or [])),
+        "episode_scope": [],
+    }
+
+
+def _standard_binding_hash(args: dict[str, Any]) -> str:
+    value = json.dumps(_standard_argument_binding(args), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _workflow_for_id(workflow_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    rows = _media_workflows()
+    return rows, next((row for row in rows if row.get("workflow_id") == workflow_id), None)
+
+
+def _save_workflow_update(rows: list[dict[str, Any]], row: dict[str, Any]) -> None:
+    row["updated_at"] = now()
+    _save_media_workflows(rows)
+
+
 async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     """Bounded standard/watch-first bridge; execution is disabled by default."""
     workflow_id = str(args.get("workflow_id", "")).strip()
@@ -1565,27 +1622,75 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     except ValueError as exc:
         return {"status": "rejected", "reason": str(exc), "write_executed": False}
 
-    required_binding = {"confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at"}
+    if args.get("episode_scope"):
+        return {"status": "rejected", "reason": "STANDARD_EPISODE_SCOPE_UNSUPPORTED", "write_executed": False}
+    if not STANDARD_MEDIA_WRITES_ENABLED:
+        return {"status": "disabled", "reason": "STANDARD_MEDIA_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
+    if payload["mediaType"] == "movie" and not STANDARD_MOVIE_WRITES_ENABLED:
+        return {"status": "disabled", "reason": "STANDARD_MOVIE_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
+    if payload["mediaType"] == "tv" and not STANDARD_SEASON_WRITES_ENABLED:
+        return {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
+    if not _standard_bridge_secret():
+        return {"status": "disabled", "reason": "BRIDGE_SECRET_MISSING", "write_executed": False, "request_shape": payload}
+
+    required_binding = {"confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at", "status"}
     binding = args.get("confirmation_context")
     if not isinstance(binding, dict) or not required_binding.issubset(binding):
         return {"status": "rejected", "reason": "CONFIRMATION_BINDING_REQUIRED", "write_executed": False}
+    if binding.get("status") != "PENDING" or str(args.get("session_id", "")) != str(binding.get("session_id")):
+        return {"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID", "write_executed": False}
+    try:
+        if datetime.now(timezone.utc) >= datetime.fromisoformat(str(binding["expires_at"])):
+            return {"status": "rejected", "reason": "CONFIRMATION_EXPIRED", "write_executed": False}
+    except (TypeError, ValueError):
+        return {"status": "rejected", "reason": "CONFIRMATION_EXPIRY_INVALID", "write_executed": False}
+    if str(binding.get("arguments_hash")) != _standard_binding_hash(args):
+        return {"status": "rejected", "reason": "ARGUMENT_HASH_MISMATCH", "write_executed": False}
 
-    if not STANDARD_MEDIA_WRITES_ENABLED:
-        return {
-            "status": "disabled",
-            "reason": "STANDARD_MEDIA_WRITES_DISABLED",
-            "write_executed": False,
-            "workflow_id": workflow_id,
-            "request_shape": payload,
-        }
+    rows, workflow = _workflow_for_id(workflow_id)
+    if not workflow or workflow.get("mode") != "standard":
+        return {"status": "rejected", "reason": "WORKFLOW_NOT_FOUND_OR_MODE_INVALID", "write_executed": False}
+    if str(workflow.get("plan_version_hash")) != str(binding.get("plan_version_hash")):
+        return {"status": "rejected", "reason": "PLAN_HASH_MISMATCH", "write_executed": False}
+    if workflow.get("canonical_identity", {}).get("tmdb_id") != payload["mediaId"]:
+        return {"status": "rejected", "reason": "CANONICAL_ID_MISMATCH", "write_executed": False}
+    if binding.get("confirmation_id") != workflow.get("confirmation_id"):
+        return {"status": "rejected", "reason": "CONFIRMATION_ID_MISMATCH", "write_executed": False}
+    if workflow.get("confirmation_status") != "PENDING":
+        return {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}
+    if workflow.get("current_state") in {"REQUESTED", "SEARCHING", "ACQUIRING", "VERIFYING", "ACQUIRED", "AVAILABLE_IN_PLEX"}:
+        return {"status": "no_op", "reason": "STANDARD_WORKFLOW_ALREADY_ACTIVE_OR_SATISFIED", "write_executed": False, "workflow_id": workflow_id}
+
+    title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
+    if title and not payload.get("seasons"):
+        plex_library = "Movies" if payload["mediaType"] == "movie" else "TV Shows"
+        plex = await plex_library_lookup({"query": title, "library": plex_library})
+        if plex.get("available"):
+            workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "permanent_local"})
+            _save_workflow_update(rows, workflow)
+            return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_PLEX", "write_executed": False, "workflow_id": workflow_id}
+
+    # Claim the confirmation before the network write. A replay sees this
+    # state and cannot submit the same standard request twice.
+    workflow.update({"confirmation_status": "SUBMITTING", "canonical_state": "REQUESTED", "mode": "standard"})
+    _save_workflow_update(rows, workflow)
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    if CLIDEBRID_BRIDGE_TOKEN:
-        headers["X-Home-AI-Bridge-Token"] = CLIDEBRID_BRIDGE_TOKEN
+    headers["X-Home-AI-Bridge-Token"] = _standard_bridge_secret()
     async with httpx.AsyncClient(timeout=12, headers=headers) as client:
-        response = await client.post(f"{CLIDEBRID_BASE}/api/v1/request", json=payload)
-        response.raise_for_status()
-        body = response.json() if response.content else {}
+        try:
+            await client.get(f"{CLIDEBRID_BASE}/api/v1/status")
+            response = await client.post(f"{CLIDEBRID_BASE}/api/v1/request", json=payload)
+            response.raise_for_status()
+            body = response.json() if response.content else {}
+        except Exception:
+            workflow.update({"confirmation_status": "FAILED", "canonical_state": "FAILED", "failure_reason": "BRIDGE_UNAVAILABLE"})
+            _save_workflow_update(rows, workflow)
+            raise
+    workflow.update({"confirmation_status": "CONSUMED", "current_state": "REQUESTED", "canonical_state": "REQUESTED",
+                     "cli_debrid_state": "Wanted", "submitted_at": now(), "request_shape": payload,
+                     "request_response": {key: body.get(key) for key in ("id", "status", "type", "createdAt", "updatedAt") if key in body}})
+    _save_workflow_update(rows, workflow)
     return {
         "status": "submitted",
         "write_executed": True,
@@ -1666,7 +1771,7 @@ REGISTRY = [
     ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
-    ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
+    ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
 GROUP_SERVICES = {
@@ -1815,7 +1920,9 @@ async def invoke(req: Invoke):
     result: Any
     context_token = AUDIT_CONTEXT.set({"client_id": req.client_id, "session_id": req.session_id})
     try:
-        result = await asyncio.wait_for(fn(req.arguments), timeout=12)
+        call_arguments = dict(req.arguments)
+        call_arguments.setdefault("session_id", req.session_id)
+        result = await asyncio.wait_for(fn(call_arguments), timeout=12)
     except asyncio.TimeoutError:
         status, result = "timeout", {"error": f"{service} tool timed out"}
     except httpx.HTTPStatusError as exc:

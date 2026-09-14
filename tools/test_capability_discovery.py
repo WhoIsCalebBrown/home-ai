@@ -147,3 +147,10 @@ def test_cli_debrid_standard_request_rejects_episode_scope_and_is_disabled_by_de
     }))
     assert result["status"] == "disabled"
     assert result["write_executed"] is False
+
+
+def test_standard_binding_changes_when_scope_or_identity_changes():
+    movie = {"workflow_id": "wf", "media_type": "movie", "canonical_external_id": 1362}
+    season = {"workflow_id": "wf", "media_type": "tv", "canonical_external_id": 95396, "season_scope": [2]}
+    assert module._standard_binding_hash(movie) != module._standard_binding_hash({**movie, "canonical_external_id": 999})
+    assert module._standard_binding_hash(season) != module._standard_binding_hash({**season, "season_scope": [1]})
