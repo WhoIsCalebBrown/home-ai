@@ -645,7 +645,7 @@ def is_repair_turn(text: str) -> bool:
     if re.search(r"\b(restart|reboot|reload|turn|dim|set|add|remove|delete|clear)\b", text, re.I):
         return False
     return bool(re.search(
-        r"\b(?:i\s+meant|mean[t]?|sorry[,.]?\s+i\s+meant|actually|no[,.]?\s+(?:i\s+)?meant|not\s+[^,.!?]+,\s*\w+)\b",
+        r"\b(?:i\s+meant|mean[t]?|sorry[,.]?\s+i\s+meant|actually|no[,.]?\s+(?:i\s+)?meant|not\s+[^,.!?]+,\s*\w+|i['’]?m\s+(?:at|on)\s+(?:lidarr|lidar|plex|plexium|sonarr|radarr))\b",
         text, re.I,
     ))
 

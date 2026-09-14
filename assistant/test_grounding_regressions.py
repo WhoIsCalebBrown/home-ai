@@ -146,6 +146,9 @@ def test_generic_media_repair_reuses_previous_pipeline_request():
     assert is_repair_turn("Yeah, I meant Lidarr.")
     repaired = repair_route_text("Yeah, I meant Lidarr.", conversation_context["scenario"])
     assert "Lidarr" in repaired and preflight_plan(repaired)[0][0] == "investigate_media_pipeline"
+    assert is_repair_turn("Yeah, I'm at Lidar.")
+    repaired_stt = repair_route_text("Yeah, I'm at Lidar.", conversation_context["scenario"])
+    assert preflight_plan(repaired_stt)[0][0] == "investigate_media_pipeline"
 
 
 def test_repair_preserves_weather_and_replaces_location():
