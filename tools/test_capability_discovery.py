@@ -93,8 +93,8 @@ def test_media_plan_is_read_only_and_idempotent(monkeypatch, tmp_path):
 def test_media_policy_is_centralized_and_fails_closed():
     assert module.MEDIA_POLICY["music"]["root_folder"] == "/data/media/music"
     assert module.MEDIA_POLICY["music"]["quality_profile_id"] == 2
-    assert module.MEDIA_POLICY["movies"]["quality_profile_id"] is None
-    assert module.MEDIA_POLICY["anime"]["quality_profile_id"] is None
+    assert module.MEDIA_POLICY["movies"]["quality_profile_id"] == 11
+    assert module.MEDIA_POLICY["anime"]["quality_profile_id"] == 17
 
 
 def test_media_confirmation_binds_session_plan_and_expiry():

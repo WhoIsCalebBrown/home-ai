@@ -1107,7 +1107,7 @@ MEDIA_POLICY = {
     "movies": {
         "manager": "radarr",
         "root_folder": "/data/media/movies",
-        "quality_profile_id": None,
+        "quality_profile_id": 11,
         "minimum_availability": "released",
     },
     "tv": {
@@ -1120,7 +1120,7 @@ MEDIA_POLICY = {
     "anime": {
         "manager": "sonarr",
         "root_folder": "/data/media/anime",
-        "quality_profile_id": None,
+        "quality_profile_id": 17,
         "series_type": "anime",
         "season_folder": True,
     },
