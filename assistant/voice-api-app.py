@@ -587,9 +587,9 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
             return [("restart_container", {"name": service})]
     if re.search(r"\bweather\b", t):
         location = None
-        match = re.search(r"\b(?:in|for|at)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:today|tomorrow|now)\b|[?.!]|$)", text, re.I)
+        match = re.search(r"\b(?:in|for|at)\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
         if match:
-            location = match.group(1).strip()
+            location = match.group(1).strip(" .!?\t\r\n")
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if current_external_question(text):
@@ -774,8 +774,11 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     context = conversation_context.get(client_id, {})
     lowered = text.casefold()
     if context.get("kind") == "weather" and re.search(r"\b(what about|how about|and)\b", lowered):
-        explicit = re.search(r"\b(?:what|how) about\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:today|tomorrow|now)\b|[?.!]|$)", text, re.I)
-        location = explicit.group(1).strip() if explicit else (context.get("location") or "")
+        explicit = re.search(r"\b(?:what|how) about\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
+        candidate = explicit.group(1).strip(" .!?\t\r\n") if explicit else ""
+        if candidate.casefold() in {"today", "tomorrow", "now"}:
+            candidate = ""
+        location = candidate or (context.get("location") or "")
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
     if context.get("group") == "cameras":
