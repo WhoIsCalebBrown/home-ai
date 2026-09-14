@@ -142,6 +142,13 @@ def test_social_acknowledgement_does_not_inherit_tools():
     assert explicit_domain("Thank you.", conversation_context["scenario"]) == "general"
 
 
+def test_server_fallback_cannot_leak_into_news_synthesis():
+    result = [{"tool": "web_search", "status": "ok", "result": {"results": [{"title": "AI news"}]}}]
+    answer = evidence_supported_answer("I couldn't verify that current server information because the required live tool result was unavailable.", "Anything interesting with AI specifically?", result, "web_research")
+    assert "server" not in answer.lower()
+    assert "news results" in answer.lower()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

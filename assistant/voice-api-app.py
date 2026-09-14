@@ -494,6 +494,13 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
 def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None) -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
+    if re.search(r"current server information|current server status", answer, re.I) and resolved_domain != "server":
+        if any(item.get("status") == "ok" for item in results):
+            if resolved_domain == "web_research":
+                return "I found current news results for that question, but the synthesis was inconclusive."
+            if resolved_domain == "media":
+                return "I found live media results for the requested Lidarr and Plex check, but the synthesis was inconclusive."
+        return unavailable_live_answer(user_text)
     if visual_question(user_text) and (resolved_domain is None or resolved_domain == "camera") and not any(
         isinstance(item.get("result"), dict) and item.get("result", {}).get("vision_ready")
         for item in results
