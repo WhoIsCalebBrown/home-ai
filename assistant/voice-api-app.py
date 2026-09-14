@@ -106,9 +106,9 @@ def repair_decimal_spacing(text: str) -> str:
     return re.sub(r"(?<![\w.])(\d+)\s*\.\s*(\d+)(?!\.\d)", r"\1.\2", text)
 
 
-def round_weather_temperatures(text: str, user_text: str) -> str:
+def round_weather_temperatures(text: str, user_text: str, domain: str | None = None) -> str:
     """Make ordinary weather speech conversational while retaining raw tool data."""
-    if not re.search(r"\b(weather|forecast|temperature|degrees?)\b", user_text, re.I):
+    if domain != "weather" and not re.search(r"\b(weather|forecast|temperature|degrees?)\b", user_text, re.I):
         return text
     if re.search(r"\b(exact|precise|decimal|to the tenth|to one decimal)\b", user_text, re.I):
         return text
@@ -1026,7 +1026,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
         if value.strip():
             nonlocal full
             safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain) if guard_user_text else value.strip()
-            safe = round_weather_temperatures(safe, guard_user_text) if guard_user_text else repair_decimal_spacing(safe)
+            safe = round_weather_temperatures(safe, guard_user_text, guard_domain) if guard_user_text else repair_decimal_spacing(safe)
             separator = "" if not full or full.endswith((" ", "\n")) else " "
             full += separator + safe
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
