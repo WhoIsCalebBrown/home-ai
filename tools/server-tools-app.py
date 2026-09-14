@@ -1419,6 +1419,8 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         if parts.get("episode_scope"):
             plan["current_state"] = "BLOCKED"
             plan["blocked_reason"] = "STANDARD_EPISODE_SCOPE_UNSUPPORTED"
+            plan["writes_required"] = []
+            plan["confirmation_required"] = False
         else:
             plan["writes_required"] = [{"owner": "cli_debrid", "capability": "media.standard_request",
                                          "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
