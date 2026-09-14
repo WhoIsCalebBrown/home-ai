@@ -33,6 +33,7 @@ KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.92"))
 CHATTERBOX_URL = os.getenv("CHATTERBOX_URL", "http://Chatterbox-Turbo:8088")
 CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", f"{CHATTERBOX_URL}/v1/audio/speech")
 CHATTERBOX_TIMEOUT = float(os.getenv("CHATTERBOX_TIMEOUT", "30"))
+POCKET_API_URL = os.getenv("POCKET_API_URL", "http://pocket-tts:8095/v1/audio/speech")
 MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 LLM_CONTEXT = int(os.getenv("LLM_CONTEXT", "4096"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
@@ -206,6 +207,14 @@ async def synthesize_chatterbox(text: str) -> bytes:
         return response.content
 
 
+async def synthesize_pocket(text: str) -> bytes:
+    print(f"TTS_TIMING event=pocket_request t={time.time():.6f} text={json.dumps(text, ensure_ascii=False)}", flush=True)
+    async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
+        response = await http.post(POCKET_API_URL, json={"input": text})
+        response.raise_for_status()
+        return response.content
+
+
 async def synthesize_piper(text: str) -> bytes:
     async with AsyncClient.from_uri(PIPER_URI) as client:
         await client.write_event(Synthesize(text=text).event())
@@ -298,6 +307,8 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
             print(f"TTS_TIMING request={request_id} event={primary}_request t={time.time():.6f}", flush=True)
             if primary == "chatterbox":
                 wav = await synthesize_chatterbox(text)
+            elif primary == "pocket":
+                wav = await synthesize_pocket(text)
             elif primary == "kokoro":
                 wav = await synthesize_kokoro(text)
             else:
@@ -315,6 +326,8 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
             try:
                 if TTS_FALLBACK_PROVIDER == "kokoro":
                     wav = await synthesize_kokoro(text)
+                elif TTS_FALLBACK_PROVIDER == "pocket":
+                    wav = await synthesize_pocket(text)
                 elif TTS_FALLBACK_PROVIDER == "chatterbox":
                     wav = await synthesize_chatterbox(text)
                 else:
