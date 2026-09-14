@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import os
 import queue
 import threading
@@ -96,6 +97,6 @@ async def stream(request: SpeechRequest):
                 break
             if isinstance(item, Exception):
                 raise item
-            yield (base64.b64encode(item).decode("ascii") + "\n").encode("ascii")
+            yield (json.dumps({"audio": base64.b64encode(item).decode("ascii")}) + "\n").encode("utf-8")
 
     return StreamingResponse(chunks(), media_type="application/octet-stream")
