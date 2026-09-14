@@ -850,9 +850,9 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
     if context.get("group") == "cameras":
-        explicit_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
+        explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
         followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
-        if followup and not explicit_topic:
+        if followup and not explicit_camera_topic:
             return f"front door camera current snapshot person {text}"
     if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
