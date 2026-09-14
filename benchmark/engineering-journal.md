@@ -34,3 +34,13 @@
 - Change: added explicit domain-transition gating (server terms override camera language), current-news follow-up preflight, social acknowledgement short-circuit, media correction handling, domain-scoped unavailable responses, and a shared `resolved_current_request` synthesis contract containing raw/normalized text, domain, entities, referents, selected tools, and result keys.
 - Result: local regressions and CI passed; deployed assistant image commit `2672fe0`. Live Toronto→tomorrow, Plex count, Frigate event, and provenance fixtures reached the new contract; 9B remains active at 8192.
 - Keep/rollback: assistant-only deployment; rollback to the prior assistant image/template remains available. No tools, model, TTS, camera, or media services were changed.
+
+## 2026-09-14 — repair turns, safe lists, and measured concurrency
+
+- Public references checked: OHF-Voice/wyoming-faster-whisper `main` / v3.5.0 (`5b5854f`, accessed 2026-09-14), OpenVoiceOS/ovos-core `dev` (`4a095d879468`), Open WebUI `main` (`0a7c15832fb3`), and Home Assistant core/frontend current branches. No third-party code was copied. The adapted patterns were contextual vocabulary/entity biasing, explicit serialized session state, first-class tool-result provenance, and bounded risk classes.
+- Change: `845dd0c` preserves the immediately preceding resolved media request for STT-shaped corrections such as “I’m at Lidar”, so a repair reruns the previous media investigation instead of incorrectly switching to a Lidarr health query.
+- Change: `e82c058`/`228af0f` add persistent, bounded grocery/shopping/packing/todo list tools. Read-only and low-risk list writes do not require confirmation; restart/destructive actions retain confirmation. Storage is `/mnt/cache/appdata/voice-tools/home-ai-lists.json` on the host.
+- Change: `e82c058` adds a mobile-first assistant UI with explicit listening/transcribing/thinking/speaking status and a collapsed diagnostics panel. It is responsive, but a full installable PWA manifest/service worker is not yet enabled.
+- Change: media/download investigations now run independent read-only service calls concurrently. A live media investigation measured roughly 975 ms parent wall time with per-service timings recorded; no state-changing tools were parallelized.
+- Change: `bbfd4b3` adds a bounded recovery for clipped STT list phrasing (“the milk on my grocery list”), without globally rewriting words. CI/build is pending before deployment.
+- Safety: no Home Assistant container is present on the host, so smart-home tools remain intentionally unavailable rather than being claimed or faked. No new public port, unrestricted shell, SQL, Docker socket, or credential path was added.
