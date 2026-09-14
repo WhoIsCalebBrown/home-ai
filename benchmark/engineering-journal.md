@@ -10,6 +10,15 @@
 - Result: local grounding regressions pass. Deployment pending live browser validation.
 - Keep/rollback: reversible source change; preserve baseline commits `0089884` and `de3d6ed`.
 
+## 2026-09-14 — live validation and production fallback
+
+- Live reproduction after the fix: Toronto → St. Catharines → tomorrow preserved the replaced location and day offset. Plex count, downloads provenance, Frigate event freshness, and visual snapshot follow-ups passed through HTTPS/WSS/STT/tool/Qwen/TTS/browser.
+- 9B re-check: current Ollama `qwen3.5:9b-q4_K_M` remained partially offloaded with Faster-Whisper active: 13% CPU / 87% GPU at 4096 and 12% CPU / 88% GPU at 6144; 8192 previously measured 14% CPU / 86% GPU. It was not promoted.
+- 4B production baseline: `qwen3.5:4b`, `LLM_CONTEXT=8192`, `100% GPU`, Ollama context 8192. Ten warm browser interactions measured median first browser playback 2.99 s and empirical P95 3.44 s.
+- TTS/GPU: Kokoro `am_puck` at `1.18` is running on GTX 1660; Chatterbox remains installed but stopped. Frigate and Plex containers are healthy.
+- Quantization research: current Ollama tags expose 9B `q4_K_M` (6.6 GB), `q8_0` (11 GB), and larger bf16/MLX variants; no smaller official CUDA-compatible 9B tag was selected. Lower-bit community variants were not installed because current llama.cpp/Qwen issue history shows backend/quant-specific risks.
+- Keep/rollback: final runtime is the safe 4B/8192 + Kokoro configuration. Exact previous 4B/4096 + Chatterbox templates remain backed up on the host; source commits `38fd650`, `e3f53e3`, and `b39d25d` contain the scoped-state, tracing, and explicit deployment-default changes.
+
 ## Research notes
 
 - No third-party code was copied or installed. Only architectural ideas were adapted.
