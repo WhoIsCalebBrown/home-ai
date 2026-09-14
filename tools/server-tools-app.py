@@ -27,9 +27,12 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
 
-TOWER = os.getenv("TOWER_URL", "http://192.168.40.44")
+TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
+CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", f"{TOWER}:5000/webhook").rstrip("/")
+CLIDEBRID_BRIDGE_TOKEN = os.getenv("CLIDEBRID_BRIDGE_TOKEN", "")
+STANDARD_MEDIA_WRITES_ENABLED = os.getenv("STANDARD_MEDIA_WRITES_ENABLED", "false").casefold() == "true"
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
 MEDIA_WORKFLOWS_PATH = Path(os.getenv("MEDIA_WORKFLOWS_PATH", "/data/media-workflows.json"))
@@ -1475,6 +1478,80 @@ async def media_get_workflow(args: dict[str, Any]) -> dict[str, Any]:
     return {"found": bool(row), "workflow": row}
 
 
+def _build_cli_debrid_request(args: dict[str, Any]) -> dict[str, Any]:
+    """Translate one bounded Home-AI goal into cli_debrid's request shape."""
+    media_type = str(args.get("media_type", "")).casefold()
+    if media_type not in {"movie", "tv"}:
+        raise ValueError("STANDARD_SCOPE_UNSUPPORTED")
+    try:
+        media_id = int(args.get("canonical_external_id"))
+    except (TypeError, ValueError):
+        raise ValueError("CANONICAL_EXTERNAL_ID_REQUIRED") from None
+    if media_id <= 0:
+        raise ValueError("CANONICAL_EXTERNAL_ID_REQUIRED")
+    if args.get("episode_scope"):
+        raise ValueError("STANDARD_EPISODE_SCOPE_UNSUPPORTED")
+
+    seasons = args.get("season_scope") or []
+    if media_type == "movie" and seasons:
+        raise ValueError("MOVIE_SEASON_SCOPE_INVALID")
+    if not isinstance(seasons, list) or any(not isinstance(item, int) or item < 0 or item > 99 for item in seasons):
+        raise ValueError("INVALID_SEASON_SCOPE")
+
+    payload: dict[str, Any] = {
+        "mediaType": media_type,
+        "mediaId": media_id,
+        "is4k": False,
+        "serverId": 0,
+        "profileId": 0,
+        "rootFolder": "/",
+        "userId": 1,
+    }
+    if media_type == "tv" and seasons:
+        payload["seasons"] = sorted(set(seasons))
+    return payload
+
+
+async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
+    """Bounded standard/watch-first bridge; execution is disabled by default."""
+    workflow_id = str(args.get("workflow_id", "")).strip()
+    if not workflow_id or len(workflow_id) > 128:
+        return {"status": "rejected", "reason": "WORKFLOW_ID_REQUIRED", "write_executed": False}
+    try:
+        payload = _build_cli_debrid_request(args)
+    except ValueError as exc:
+        return {"status": "rejected", "reason": str(exc), "write_executed": False}
+
+    required_binding = {"confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at"}
+    binding = args.get("confirmation_context")
+    if not isinstance(binding, dict) or not required_binding.issubset(binding):
+        return {"status": "rejected", "reason": "CONFIRMATION_BINDING_REQUIRED", "write_executed": False}
+
+    if not STANDARD_MEDIA_WRITES_ENABLED:
+        return {
+            "status": "disabled",
+            "reason": "STANDARD_MEDIA_WRITES_DISABLED",
+            "write_executed": False,
+            "workflow_id": workflow_id,
+            "request_shape": payload,
+        }
+
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if CLIDEBRID_BRIDGE_TOKEN:
+        headers["X-Home-AI-Bridge-Token"] = CLIDEBRID_BRIDGE_TOKEN
+    async with httpx.AsyncClient(timeout=12, headers=headers) as client:
+        response = await client.post(f"{CLIDEBRID_BASE}/api/v1/request", json=payload)
+        response.raise_for_status()
+        body = response.json() if response.content else {}
+    return {
+        "status": "submitted",
+        "write_executed": True,
+        "workflow_id": workflow_id,
+        "cli_debrid": {key: body.get(key) for key in ("id", "status", "type", "createdAt", "updatedAt") if key in body},
+        "request_shape": payload,
+    }
+
+
 async def media_policy_status(args: dict[str, Any]) -> dict[str, Any]:
     """Read-only policy/config validation; never changes a manager."""
     requested = str(args.get("media_type", "all")).casefold()
@@ -1546,6 +1623,7 @@ REGISTRY = [
     ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
+    ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
 GROUP_SERVICES = {

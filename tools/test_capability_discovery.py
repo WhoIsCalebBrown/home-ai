@@ -114,3 +114,36 @@ def test_media_confirmation_binds_session_plan_and_expiry():
     assert module.validate_media_confirmation(record, session_id="session-a", current_plan=changed)[1] == "PLAN_CHANGED"
     expired = datetime.now(timezone.utc) + timedelta(minutes=5)
     assert module.validate_media_confirmation(record, session_id="session-a", current_plan=plan, now_value=expired)[1] == "EXPIRED"
+
+
+def test_cli_debrid_standard_request_shape_is_canonical_and_bounded():
+    assert module._build_cli_debrid_request({
+        "media_type": "movie", "canonical_external_id": 1362,
+    }) == {
+        "mediaType": "movie", "mediaId": 1362, "is4k": False,
+        "serverId": 0, "profileId": 0, "rootFolder": "/", "userId": 1,
+    }
+    assert module._build_cli_debrid_request({
+        "media_type": "tv", "canonical_external_id": 95396, "season_scope": [2, 2],
+    })["seasons"] == [2]
+
+
+def test_cli_debrid_standard_request_rejects_episode_scope_and_is_disabled_by_default():
+    import asyncio
+    import pytest
+
+    with pytest.raises(ValueError, match="STANDARD_EPISODE_SCOPE_UNSUPPORTED"):
+        module._build_cli_debrid_request({
+            "media_type": "tv", "canonical_external_id": 1, "episode_scope": [8],
+        })
+    result = asyncio.run(module.media_standard_request({
+        "workflow_id": "wf-test",
+        "media_type": "movie",
+        "canonical_external_id": 1362,
+        "confirmation_context": {
+            "confirmation_id": "c", "session_id": "s", "plan_version_hash": "p",
+            "arguments_hash": "a", "expires_at": "2099-01-01T00:00:00+00:00",
+        },
+    }))
+    assert result["status"] == "disabled"
+    assert result["write_executed"] is False
