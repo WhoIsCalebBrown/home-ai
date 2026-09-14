@@ -565,7 +565,10 @@ def dynamic_fact_question(text: str) -> bool:
 def current_external_question(text: str) -> bool:
     fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this week|breaking|updated|update|release|version)\b"
     subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue)\b"
-    return bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I)) or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
+    external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
+    return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
+            or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
+            or bool(re.search(external_story, text, re.I) and re.search(r"\b(toronto|canada|city|over|above|world|government|technology|ai)\b", text, re.I)))
 
 
 def unavailable_live_answer(text: str) -> str:
@@ -657,14 +660,14 @@ def grounded_camera_presence_answer(result: dict) -> str:
     event = events[0]
     age = event.get("age_seconds")
     if event.get("active") or (isinstance(age, (int, float)) and age <= 10):
-        return "Frigate currently shows an active person event at the front door."
+        return "Yeah, someone's at the front door."
     if isinstance(age, (int, float)):
         if age < 120:
             when = f"about {round(age)} seconds ago"
         else:
             when = f"about {round(age / 60)} minutes ago"
-        return f"Frigate detected a person at the front door {when}, but that event is no longer active."
-    return "Frigate detected a person at the front door, but the event time was unavailable, so I can't say they are there right now."
+        return f"Yeah, someone was at the front door {when}, but they aren't there now."
+    return "Someone was detected at the front door, but I can't tell if they're still there right now."
 
 
 async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str | None = None, origin: str = "assistant") -> None:
@@ -927,6 +930,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t):
         status = next(value for value in ("running", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t))
         return [("list_containers", {"status": status})]
+    if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", t):
+        return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
@@ -967,7 +972,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("web_search", {"query": text.strip()})]
     if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events)\b", t):
         return [("web_search", {"query": text.strip()})]
+    if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:added|in plex|to plex)\b|\bwhat(?:'s| is) the last thing added\b", t):
+        return [("plex_recently_added", {"limit": 1})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(plex|plexium|added|adding|going|coming|download|music)\b", t):
+        if re.search(r"\b(looking|wanted|missing|searching|needs|need)\b", t):
+            return [("lidarr_missing_tracks", {})]
         return [("investigate_media_pipeline", {"entity_type": "auto", "query": routing_aliases(text), "focus": "status"})]
     if re.search(r"\b(lidarr|lidar)\b", t) and (re.search(r"\b(status|state|health|online|offline|working|running)\b", t) or re.search(r"\b(meant|mean|correction|not)\b", t)):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
@@ -1158,6 +1167,13 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             conversation_context[client_id] = {**prior_state, "domain": "server", "kind": "server", "group": "server", "tools": tool_names, "referent_type": "containers"}
         elif last.get("tool") == "plex_library_counts":
             conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "plex_library", "group": "plex", "tools": tool_names, "referent_type": "plex_movies"}
+        elif last.get("tool") == "plex_recently_added":
+            items = result.get("items") or []
+            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "plex_recently_added", "group": "plex", "tools": tool_names, "referent_type": "plex_recent_item", "referent_ids": [item.get("rating_key") for item in items if item.get("rating_key")]}
+        elif last.get("tool") == "lidarr_missing_tracks":
+            items = result.get("items") or []
+            album_ids = sorted({item.get("album_id") for item in items if item.get("album_id") is not None})
+            conversation_context[client_id] = {**prior_state, "domain": "music", "kind": "lidarr_wanted", "group": "music", "tools": tool_names, "referent_type": "lidarr_albums", "referent_ids": album_ids}
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
@@ -1206,7 +1222,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour)\b", lowered):
         return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
-        explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
+        explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr|blackhawk|flying|helicopter|toronto|heard|search|look into|technology|ai)\b", lowered)
         followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
         if followup and not explicit_camera_topic:
             return f"front door camera current snapshot person {text}"
@@ -1214,6 +1230,9 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"current news today about {routing_aliases(text)}"
     if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
+    if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", lowered):
+        ids = ",".join(str(value) for value in context.get("referent_ids", []))
+        return f"check Lidarr import status for album ids {ids}"
     if context.get("domain") == "server" and context.get("referent_type") == "containers" and re.search(r"\b(how many|which|what|are|is)\b", lowered) and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", lowered):
         return f"how many containers are {lowered}"
     if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):

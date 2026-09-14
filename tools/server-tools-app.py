@@ -31,6 +31,7 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
+USER_PROFILE_PATH = Path(os.getenv("USER_PROFILE_PATH", "/config/home-ai-user-profile.json"))
 WEATHER_LOCATION_HINTS = {}
 for _hint in os.getenv("WEATHER_LOCATION_HINTS", "").split(";"):
     if "=" in _hint:
@@ -65,6 +66,14 @@ AUDIT_CONTEXT: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar("
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def user_profile() -> dict[str, Any]:
+    try:
+        value = json.loads(USER_PROFILE_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
 
 
 def event_time(value: Any) -> float | None:
@@ -419,7 +428,8 @@ async def current_datetime(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
-    location = str(args.get("location") or os.getenv("WEATHER_DEFAULT_LOCATION", "")).strip()
+    profile = user_profile()
+    location = str(args.get("location") or os.getenv("WEATHER_DEFAULT_LOCATION", "") or profile.get("home_location", "")).strip()
     if not location:
         return {"location_required": True, "message": "A city or location is required; no default home location is configured."}
     offset = max(0, min(7, int(args.get("days_from_now", 0))))
@@ -436,7 +446,20 @@ async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
             "temperature_unit": "celsius", "wind_speed_unit": "kmh", "forecast_days": max(2, offset + 1), "timezone": "auto"})
         forecast.raise_for_status(); data = forecast.json()
     daily = {k: (v[offset] if isinstance(v, list) and len(v) > offset else None) for k, v in data.get("daily", {}).items()}
-    return {"location": {"name": place.get("name"), "admin1": place.get("admin1"), "country": place.get("country")},
+    resolved = {"name": place.get("name"), "admin1": place.get("admin1"), "country": place.get("country")}
+    unit = str(profile.get("temperature_unit") or os.getenv("WEATHER_TEMPERATURE_UNIT", "C")).upper()
+    if unit not in {"C", "F"}:
+        unit = "C"
+    if unit == "F":
+        def convert(value):
+            return round(float(value) * 9 / 5 + 32, 1) if value is not None else None
+        for key in ("temperature_2m", "apparent_temperature"):
+            if key in data.get("current", {}):
+                data["current"][key] = convert(data["current"][key])
+        for key in ("temperature_2m_max", "temperature_2m_min"):
+            daily[key] = [convert(value) for value in daily.get(key, [])] if isinstance(daily.get(key), list) else convert(daily.get(key))
+    return {"requested_location": location, "resolved_location": ", ".join(str(x) for x in (resolved.get("name"), resolved.get("admin1"), resolved.get("country")) if x),
+            "location": resolved, "temperature_unit": unit,
             "days_from_now": offset, "current": data.get("current", {}), "day": daily,
             "timezone": data.get("timezone"), "source": "Open-Meteo", "retrieved_at": now()}
 
@@ -568,6 +591,37 @@ async def plex_counts(_: dict[str, Any]) -> dict[str, Any]:
     return {"libraries": counts}
 
 
+async def plex_recently_added(args: dict[str, Any]) -> dict[str, Any]:
+    """Return Plex library metadata, kept separate from acquisition state."""
+    token = xml_value(Path("/config") / SERVICES["plex"][1], "PlexOnlineToken")
+    base, _ = SERVICES["plex"]
+    limit = max(1, min(int(args.get("limit", 10)), 50))
+    requested_type = str(args.get("media_type") or "").casefold()
+    async with httpx.AsyncClient(timeout=8) as client:
+        sections = await client.get(base + "/library/sections", params={"X-Plex-Token": token})
+        sections.raise_for_status()
+        root = ET.fromstring(sections.text)
+        rows = []
+        for section in root:
+            section_key = section.attrib.get("key")
+            if not section_key or (requested_type and section.attrib.get("type", "").casefold() != requested_type):
+                continue
+            response = await client.get(base + f"/library/sections/{section_key}/all", params={
+                "X-Plex-Token": token, "sort": "addedAt:desc", "X-Plex-Container-Start": 0, "X-Plex-Container-Size": limit})
+            response.raise_for_status()
+            media = ET.fromstring(response.text)
+            for item in media:
+                attrs = item.attrib
+                if not attrs.get("ratingKey"):
+                    continue
+                rows.append({"title": attrs.get("title"), "year": int(attrs["year"]) if attrs.get("year", "").isdigit() else attrs.get("year"),
+                             "media_type": attrs.get("type"), "library": section.attrib.get("title"),
+                             "added_at": attrs.get("addedAt"), "rating_key": attrs.get("ratingKey"),
+                             "show": attrs.get("grandparentTitle"), "season": attrs.get("parentIndex"), "episode": attrs.get("index")})
+    rows.sort(key=lambda row: int(row.get("added_at") or 0), reverse=True)
+    return {"items": rows[:limit], "count": min(len(rows), limit), "source": "Plex", "metadata_only": True}
+
+
 async def plex_sessions(_: dict[str, Any]) -> dict[str, Any]:
     token = xml_value(Path("/config") / SERVICES["plex"][1], "PlexOnlineToken")
     base, _ = SERVICES["plex"]
@@ -634,6 +688,18 @@ async def lidarr_artist_status(args):
     return {"query": args["query"], "known": bool(matches), "matches": matches[:20]}
 
 
+async def lidarr_import_status(args):
+    ids = [int(value) for value in (args.get("album_ids") or []) if str(value).isdigit()]
+    rows = []
+    for album_id in ids[:50]:
+        data = await arr_get("lidarr", f"/api/v1/album/{album_id}")
+        stats = data.get("statistics") or {}
+        rows.append({"album_id": album_id, "title": data.get("title"), "artist": (data.get("artist") or {}).get("artistName"),
+                     "track_count": stats.get("trackCount"), "track_file_count": stats.get("trackFileCount"),
+                     "imported": stats.get("trackCount") is not None and stats.get("trackFileCount") == stats.get("trackCount")})
+    return {"album_ids": ids, "items": rows, "imported_count": sum(1 for row in rows if row["imported"]), "source": "Lidarr"}
+
+
 async def frigate_status(_: dict[str, Any]) -> dict[str, Any]:
     data = await get_json("frigate", "/api/version")
     return {"reachable": True, "version": data.get("version") if isinstance(data, dict) else data}
@@ -696,7 +762,7 @@ async def arr_missing(service: str, _: dict[str, Any]) -> dict[str, Any]:
     path = {"sonarr": "/api/v3/wanted/missing", "radarr": "/api/v3/wanted/missing", "lidarr": "/api/v1/wanted/missing"}[service]
     data = await arr_get(service, path, {"page": 1, "pageSize": 50})
     records = data.get("records", []) if isinstance(data, dict) else []
-    return {"service": service, "count": data.get("totalRecords", len(records)), "items": [{"title": x.get("title"), "series": x.get("series", {}).get("title") if isinstance(x.get("series"), dict) else None, "artist": x.get("artist", {}).get("artistName") if isinstance(x.get("artist"), dict) else None, "season": x.get("seasonNumber"), "episode": x.get("episodeNumber")} for x in records[:50]]}
+    return {"service": service, "count": data.get("totalRecords", len(records)), "items": [{"id": x.get("id"), "album_id": x.get("albumId"), "title": x.get("title"), "series": x.get("series", {}).get("title") if isinstance(x.get("series"), dict) else None, "artist": x.get("artist", {}).get("artistName") if isinstance(x.get("artist"), dict) else None, "season": x.get("seasonNumber"), "episode": x.get("episodeNumber")} for x in records[:50]]}
 
 
 async def netdata_summary(_: dict[str, Any]) -> dict[str, Any]:
@@ -976,6 +1042,7 @@ REGISTRY = [
     ("plex_search", "Search Plex libraries and report matching library.", "read", "plex", {"query": {"type": "string", "required": True}, "library": {"type": "string"}}, plex_search),
     ("plex_artist_library", "List albums and tracks actually present for an exact artist in Plex Music.", "read", "plex", {"query": {"type": "string", "required": True}}, plex_artist_library),
     ("plex_library_counts", "Get distinct Plex library counts.", "read", "plex", {}, plex_counts),
+    ("plex_recently_added", "Get the newest items from Plex library metadata; this does not query download services.", "read", "plex", {"media_type": {"type": "string"}, "library": {"type": "string"}, "limit": {"type": "integer"}}, plex_recently_added),
     ("plex_current_sessions", "Get active Plex playback and transcode sessions.", "read", "plex", {}, plex_sessions),
     ("sonarr_search_series", "Search Sonarr for a TV series.", "read", "sonarr", {"query": {"type": "string", "required": True}}, sonarr_search),
     ("sonarr_queue", "Get the current Sonarr queue.", "read", "sonarr", {}, lambda a: arr_queue("sonarr", a)),
@@ -987,6 +1054,7 @@ REGISTRY = [
     ("radarr_missing_movies", "Get Radarr missing movies.", "read", "radarr", {}, lambda a: arr_missing("radarr", a)),
     ("lidarr_search_artist", "Search Lidarr for an artist.", "read", "lidarr", {"query": {"type": "string", "required": True}}, lidarr_search),
     ("lidarr_artist_status", "Get the managed Lidarr status for an artist, including album and track file counts.", "read", "lidarr", {"query": {"type": "string", "required": True}}, lidarr_artist_status),
+    ("lidarr_import_status", "Check import/file state for the same Lidarr albums returned by an earlier wanted query.", "read", "lidarr", {"album_ids": {"type": "array", "required": True}}, lidarr_import_status),
     ("lidarr_search_album", "Search Lidarr for an album.", "read", "lidarr", {"query": {"type": "string", "required": True}}, lidarr_search_album),
     ("lidarr_queue", "Get the current Lidarr queue.", "read", "lidarr", {}, lambda a: arr_queue("lidarr", a)),
     ("lidarr_health", "Get Lidarr health issues.", "read", "lidarr", {}, lambda a: arr_health("lidarr", a)),
@@ -1050,6 +1118,7 @@ CAPABILITY_METADATA = {
     "list_containers": {"aliases": ["docker", "containers", "services"], "examples": ["how many containers are running"], "freshness": "current"},
     "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
     "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
+    "plex_recently_added": {"aliases": ["recently added", "last added", "newest in plex"], "examples": ["what was the last thing added to Plex"], "freshness": "current"},
     "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},

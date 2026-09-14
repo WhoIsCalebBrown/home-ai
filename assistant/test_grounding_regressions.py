@@ -73,7 +73,7 @@ def test_recent_frigate_event_does_not_prove_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 30, "active": False}]}
     answer = grounded_camera_presence_answer(result)
     assert "30 seconds ago" in answer
-    assert "no longer active" in answer
+    assert "aren't there now" in answer
 
 
 def test_somebody_front_door_phrase_uses_frigate_events():
@@ -82,7 +82,7 @@ def test_somebody_front_door_phrase_uses_frigate_events():
 
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
-    assert "active person event" in grounded_camera_presence_answer(result)
+    assert grounded_camera_presence_answer(result) == "Yeah, someone's at the front door."
 
 
 def test_explicit_weather_location_beats_old_context():
@@ -93,6 +93,21 @@ def test_explicit_weather_location_beats_old_context():
 def test_temperature_outside_routes_to_weather():
     plan = preflight_plan("What's the temperature outside in Welland?")
     assert plan == [("weather_forecast", {"location": "Welland", "days_from_now": 0})]
+
+
+def test_home_weather_can_use_configured_default():
+    assert preflight_plan("What's the weather?") == [("weather_forecast", {"location": None, "days_from_now": 0})]
+
+
+def test_external_blackhawk_topic_overrides_camera_context():
+    conversation_context["blackhawk"] = {"domain": "camera", "group": "cameras", "camera": "front_door"}
+    text = resolved_followup_text("blackhawk", "I heard something about a Blackhawk flying over Toronto. Look into that for me.")
+    assert "front door camera" not in text.casefold()
+    assert preflight_plan(text)[0][0] == "web_search"
+
+
+def test_recently_added_is_plex_only():
+    assert preflight_plan("What's the last thing added to Plex?") == [("plex_recently_added", {"limit": 1})]
 
 
 def test_weather_followup_keeps_location_without_topic_contamination():
