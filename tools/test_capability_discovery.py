@@ -47,3 +47,44 @@ def test_lidarr_missing_tracks_preserves_album_identifier(monkeypatch):
     monkeypatch.setattr(module, "arr_get", fake_arr_get)
     result = asyncio.run(module.arr_missing("lidarr", {}))
     assert result["items"][0]["album_id"] == 395
+
+
+def test_media_capability_registry_is_semantic_and_writes_are_not_enabled():
+    assert "media.library.check" in module.MEDIA_CAPABILITY_REGISTRY["plex"]["capabilities"]
+    assert "media.acquire" in module.MEDIA_CAPABILITY_REGISTRY["torbox-client"]["capabilities"]
+    assert module.MEDIA_CAPABILITY_REGISTRY["torbox-client"]["risk"] == "READ_ONLY"
+    assert "media.request" in module.MEDIA_CAPABILITY_REGISTRY["lidarr"]["capabilities"]
+
+
+def test_media_goal_parsing_preserves_identity_parts():
+    rodeo = module._media_goal_parts("Get Rodeo by Travis Scott")
+    assert rodeo["media_type"] == "album"
+    assert rodeo["title_query"] == "Rodeo"
+    assert rodeo["artist_query"] == "Travis Scott"
+    hobbit = module._media_goal_parts("Get the original animated Hobbit movie")
+    assert hobbit["media_type"] == "movie"
+    assert "Hobbit" in hobbit["title_query"]
+
+
+def test_media_plan_is_read_only_and_idempotent(monkeypatch, tmp_path):
+    import asyncio
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+
+    async def album_lookup(_):
+        return {"matches": [{"title": "Rodeo", "artist": "Travis Scott", "release_date": "2015-09-04", "foreign_album_id": "album-1", "album_type": "Album"}]}
+
+    async def plex_lookup(_):
+        return {"matches": [], "available": False}
+
+    async def managed(*_):
+        return []
+
+    monkeypatch.setattr(module, "lidarr_search_album", album_lookup)
+    monkeypatch.setattr(module, "plex_library_lookup", plex_lookup)
+    monkeypatch.setattr(module, "arr_get", managed)
+    first = asyncio.run(module.media_plan_goal({"goal": "Get Rodeo by Travis Scott"}))
+    second = asyncio.run(module.media_plan_goal({"goal": "Get Rodeo by Travis Scott"}))
+    assert first["plan_only"] is True
+    assert first["writes_required"][0]["status"] == "NOT_EXECUTED"
+    assert first["workflow_id"] == second["workflow_id"]
+    assert len(module._media_workflows()) == 1

@@ -31,6 +31,7 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
+MEDIA_WORKFLOWS_PATH = Path(os.getenv("MEDIA_WORKFLOWS_PATH", "/data/media-workflows.json"))
 USER_PROFILE_PATH = Path(os.getenv("USER_PROFILE_PATH", "/config/home-ai-user-profile.json"))
 WEATHER_LOCATION_HINTS = {}
 for _hint in os.getenv("WEATHER_LOCATION_HINTS", "").split(";"):
@@ -529,6 +530,36 @@ async def plex_search(args: dict[str, Any]) -> dict[str, Any]:
         results = [x for x in results if x.get("library_title") == library]
     unique_titles = len({(x.get("title"), x.get("year")) for x in results})
     return {"query": args["query"], "unique_titles": unique_titles, "matches": results[:20]}
+
+
+async def plex_library_lookup(args: dict[str, Any]) -> dict[str, Any]:
+    """Fast metadata-only Plex lookup used by semantic planning.
+
+    Keep this separate from plex_search: the latter enriches every match with
+    media details and is intentionally slower for user-facing investigations.
+    """
+    token = xml_value(Path("/config") / SERVICES["plex"][1], "PlexOnlineToken")
+    base, _ = SERVICES["plex"]
+    query = str(args.get("query", "")).strip()
+    if not token or not query:
+        return {"query": query, "matches": [], "available": False, "error": "Plex lookup unavailable"}
+    async with httpx.AsyncClient(timeout=5) as client:
+        response = await client.get(base + "/search", params={"query": query, "X-Plex-Token": token})
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    wanted_library = str(args.get("library", "")).casefold().strip()
+    matches = []
+    for item in root:
+        attrs = item.attrib
+        library = attrs.get("librarySectionTitle") or attrs.get("librarySectionName") or ""
+        if wanted_library and wanted_library not in library.casefold() and not (wanted_library == "music" and attrs.get("type") in {"artist", "album", "track"}):
+            continue
+        matches.append({k: v for k, v in {
+            "title": attrs.get("title"), "year": int(attrs["year"]) if attrs.get("year", "").isdigit() else attrs.get("year"),
+            "media_type": attrs.get("type"), "rating_key": attrs.get("ratingKey"),
+            "library": library, "parent_title": attrs.get("parentTitle"),
+        }.items() if v is not None})
+    return {"query": query, "available": bool(matches), "matches": matches[:20], "source": "Plex"}
 
 
 async def plex_artist_library(args: dict[str, Any]) -> dict[str, Any]:
@@ -1031,6 +1062,179 @@ async def investigate_plex_missing(args: dict[str, Any]) -> dict[str, Any]:
     return {"investigation": "plex_missing_episode", **result}
 
 
+# Semantic media orchestration -------------------------------------------------
+# These records describe what each backend can own.  The planner consumes this
+# registry; Qwen never receives raw service credentials or arbitrary API calls.
+MEDIA_CAPABILITY_REGISTRY = {
+    "plex": {"owner": "plex", "media_types": ["movie", "tv", "anime", "album", "track"],
+              "capabilities": {"media.library.check", "media.library.recent", "media.verify"}, "risk": "READ_ONLY"},
+    "radarr": {"owner": "radarr", "media_types": ["movie"],
+               "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.request", "media.import.read"}, "risk": "CONFIRMATION_REQUIRED"},
+    "sonarr": {"owner": "sonarr", "media_types": ["tv", "anime"],
+               "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.request", "media.import.read"}, "risk": "CONFIRMATION_REQUIRED"},
+    "lidarr": {"owner": "lidarr", "media_types": ["music_artist", "album", "track"],
+                "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.import.read", "media.request"}, "risk": "CONFIRMATION_REQUIRED"},
+    "torbox-client": {"owner": "torbox-client", "media_types": ["movie", "tv", "anime", "album"],
+                      "capabilities": {"media.acquire", "media.queue.read", "media.download.read"}, "risk": "READ_ONLY"},
+    "qBittorrent": {"owner": "qBittorrent", "media_types": ["movie", "tv", "anime", "album"],
+                    "capabilities": {"media.queue.read", "media.download.read"}, "risk": "READ_ONLY"},
+    "slskd": {"owner": "slskd", "media_types": ["album", "track"],
+              "capabilities": {"media.search", "media.download.read"}, "risk": "READ_ONLY"},
+    "music-enricher": {"owner": "music-enricher", "media_types": ["album", "track"],
+                        "capabilities": {"media.enrich", "media.import.read"}, "risk": "READ_ONLY"},
+    "beets": {"owner": "beets", "media_types": ["album", "track"],
+              "capabilities": {"media.enrich", "media.import.read"}, "risk": "READ_ONLY"},
+}
+
+MEDIA_LIFECYCLE = ["UNKNOWN", "IDENTIFIED", "ALREADY_AVAILABLE", "WANTED", "REQUESTED", "SEARCHING",
+                   "CANDIDATE_FOUND", "QUEUED", "ACQUIRING", "DOWNLOADED", "PENDING_IMPORT", "IMPORTED",
+                   "ENRICHING", "AVAILABLE_IN_PLEX", "FAILED", "BLOCKED", "NOT_FOUND"]
+
+
+def _media_workflows() -> list[dict[str, Any]]:
+    try:
+        value = json.loads(MEDIA_WORKFLOWS_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_media_workflows(rows: list[dict[str, Any]]) -> None:
+    MEDIA_WORKFLOWS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MEDIA_WORKFLOWS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows[-100:], indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(MEDIA_WORKFLOWS_PATH)
+
+
+def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(goal or "").strip())
+    lowered = text.casefold()
+    kind = media_type
+    if not kind:
+        if re.search(r"\b(album|music|song|artist|record|release)\b|\bby\s+[^.]+", lowered):
+            kind = "album"
+        elif re.search(r"\b(anime|series|show|season|episode|kai)\b", lowered):
+            kind = "anime" if "anime" in lowered else "tv"
+        elif re.search(r"\b(movie|film|hobbit)\b", lowered):
+            kind = "movie"
+        else:
+            kind = "unknown"
+    artist = None
+    title = text
+    by_match = re.search(r"\b(.+?)\s+by\s+(.+?)(?:[.!?]|$)", text, re.I)
+    if by_match:
+        title, artist = by_match.group(1), by_match.group(2)
+    title = re.sub(r"^\s*(?:get|find|add|request|do i have|is there)\s+", "", title, flags=re.I)
+    title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
+    if kind in {"movie", "tv", "anime"}:
+        title = re.sub(r"\b(?:the )?(?:original )?(?:animated )?(?:version|movie|film|series|show)\b", " ", title, flags=re.I)
+        title = re.sub(r"\s+", " ", title).strip(" .?!") or text
+    return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
+            "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect"}
+
+
+def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool]:
+    if not matches:
+        return None, False
+    title_cf = title.casefold()
+    artist_cf = (artist or "").casefold()
+    exact = [m for m in matches if str(m.get("title") or m.get("artistName") or "").casefold() == title_cf
+              and (not artist_cf or artist_cf in json.dumps(m).casefold())]
+    if len(exact) == 1:
+        return exact[0], False
+    return (matches[0] if len(matches) == 1 else None), len(matches) > 1
+
+
+async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
+    """Read/plan only. It never adds, searches, downloads, imports, or mutates a provider."""
+    parts = _media_goal_parts(args.get("goal", ""), args.get("media_type"))
+    kind, title, artist = parts["media_type"], parts["title_query"], parts["artist_query"]
+    plan: dict[str, Any] = {"plan_only": True, "goal": parts, "writes_required": [], "confirmation_required": False,
+                            "canonical_identity": None, "current_state": "UNKNOWN", "steps": [], "providers": {}}
+    matches: list[dict[str, Any]] = []
+    if kind == "album":
+        lookup = await lidarr_search_album({"query": " ".join(x for x in (title, artist) if x)})
+        matches = lookup.get("matches", [])
+        identity, ambiguous = _pick_match(matches, title, artist)
+        plan["steps"].append({"capability": "media.identify", "owner": "lidarr", "reason": "canonical album identity required"})
+        if identity:
+            plan["canonical_identity"] = {"media_type": "album", "title": identity.get("title"), "artist": identity.get("artist"),
+                                           "year": str(identity.get("release_date", ""))[:4] or None, "foreign_album_id": identity.get("foreign_album_id"),
+                                           "album_type": identity.get("album_type")}
+        plan["ambiguous"] = ambiguous
+        plex = await plex_library_lookup({"query": title, "library": "Music"})
+        plan["providers"]["plex_music"] = plex
+        plan["steps"].append({"capability": "media.library.check", "owner": "plex", "reason": "avoid duplicate acquisition"})
+        if plan["canonical_identity"] and not ambiguous:
+            managed = await arr_get("lidarr", "/api/v1/album", {})
+            fid = plan["canonical_identity"].get("foreign_album_id")
+            owned = next((row for row in managed if str(row.get("foreignAlbumId")) == str(fid)), None) if isinstance(managed, list) else None
+            plan["providers"]["lidarr"] = {"managed": bool(owned), "album_id": owned.get("id") if owned else None,
+                                             "monitored": owned.get("monitored") if owned else None,
+                                             "track_file_count": (owned.get("statistics") or {}).get("trackFileCount") if owned else None,
+                                             "track_count": (owned.get("statistics") or {}).get("trackCount") if owned else None}
+            plan["steps"].append({"capability": "media.wanted.read", "owner": "lidarr", "reason": "determine whether the album is already managed"})
+    elif kind == "movie":
+        lookup = await radarr_search({"query": title})
+        matches = lookup.get("matches", [])
+        identity, ambiguous = _pick_match(matches, title)
+        plan["steps"].append({"capability": "media.identify", "owner": "radarr", "reason": "canonical movie identity required"})
+        if identity:
+            plan["canonical_identity"] = {"media_type": "movie", "title": identity.get("title"), "year": identity.get("year"), "tmdb_id": identity.get("tmdbId")}
+        plan["ambiguous"] = ambiguous
+        plan["providers"]["plex"] = await plex_library_lookup({"query": title, "library": "Movies"})
+        plan["steps"].append({"capability": "media.library.check", "owner": "plex", "reason": "avoid duplicate acquisition"})
+        if identity:
+            managed = await arr_get("radarr", "/api/v3/movie", {})
+            owned = next((row for row in managed if str(row.get("tmdbId")) == str(identity.get("tmdbId"))), None) if isinstance(managed, list) else None
+            plan["providers"]["radarr"] = {"managed": bool(owned), "movie_id": owned.get("id") if owned else None, "has_file": owned.get("hasFile") if owned else None}
+    elif kind in {"tv", "anime"}:
+        lookup = await sonarr_search({"query": title})
+        matches = lookup.get("matches", [])
+        identity, ambiguous = _pick_match(matches, title)
+        plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
+        if identity:
+            plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"), "tvdb_id": identity.get("tvdbId")}
+        plan["ambiguous"] = ambiguous
+    else:
+        plan["ambiguous"] = True
+    identity = plan.get("canonical_identity") or {}
+    plex_matches = (plan.get("providers", {}).get("plex_music") or plan.get("providers", {}).get("plex") or {}).get("matches", [])
+    if identity and any(str(m.get("title", "")).casefold() == str(identity.get("title", "")).casefold() for m in plex_matches):
+        plan["current_state"] = "AVAILABLE_IN_PLEX"
+    elif plan.get("ambiguous"):
+        plan["current_state"] = "AMBIGUOUS_IDENTITY"
+    elif identity:
+        owner = "lidarr" if kind == "album" else "radarr" if kind == "movie" else "sonarr"
+        provider = plan.get("providers", {}).get(owner, {})
+        if provider.get("managed"):
+            plan["current_state"] = "WANTED" if not provider.get("has_file") and not (provider.get("track_file_count") == provider.get("track_count") and provider.get("track_count") is not None) else "IMPORTED"
+        else:
+            plan["current_state"] = "IDENTIFIED"
+            if parts["action"] == "ensure_available":
+                plan["writes_required"] = [{"owner": owner, "capability": "media.request", "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
+                plan["confirmation_required"] = True
+    plan["lifecycle_states"] = MEDIA_LIFECYCLE
+    plan["recommended_workflow"] = " / ".join(step["capability"] for step in plan["steps"])
+    rows = _media_workflows()
+    key = json.dumps({"type": kind, "id": (identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("title"))}, sort_keys=True)
+    existing = next((row for row in rows if row.get("dedupe_key") == key), None)
+    workflow = existing or {"workflow_id": str(uuid.uuid4()), "dedupe_key": key, "created_at": now(), "action_history": []}
+    workflow.update({"media_type": kind, "canonical_identity": identity, "desired_goal": parts["action"], "current_state": plan["current_state"], "last_checked": now(), "plan_only": True})
+    if not existing:
+        rows.append(workflow)
+    _save_media_workflows(rows)
+    plan["workflow_id"] = workflow["workflow_id"]
+    plan["idempotent"] = True
+    return plan
+
+
+async def media_get_workflow(args: dict[str, Any]) -> dict[str, Any]:
+    workflow_id = str(args.get("workflow_id", ""))
+    row = next((item for item in _media_workflows() if item.get("workflow_id") == workflow_id), None)
+    return {"found": bool(row), "workflow": row}
+
+
 REGISTRY = [
     ("get_server_overview", "Current host, uptime, RAM/storage summary.", "read", "server", {}, server_overview),
     ("get_storage_status", "Current user-share and cache storage usage.", "read", "storage", {}, storage_status),
@@ -1040,6 +1244,7 @@ REGISTRY = [
     ("get_container_logs", "Get a capped tail of one container's logs.", "read", "docker", {"name": {"type": "string", "required": True}, "lines": {"type": "integer"}}, container_logs),
     ("restart_container", "Restart a named Docker container after confirmation.", "confirm", "docker", {"name": {"type": "string", "required": True}}, restart_container),
     ("plex_search", "Search Plex libraries and report matching library.", "read", "plex", {"query": {"type": "string", "required": True}, "library": {"type": "string"}}, plex_search),
+    ("plex_library_lookup", "Fast metadata-only Plex availability lookup for media planning; does not query download services.", "read", "plex", {"query": {"type": "string", "required": True}, "library": {"type": "string"}}, plex_library_lookup),
     ("plex_artist_library", "List albums and tracks actually present for an exact artist in Plex Music.", "read", "plex", {"query": {"type": "string", "required": True}}, plex_artist_library),
     ("plex_library_counts", "Get distinct Plex library counts.", "read", "plex", {}, plex_counts),
     ("plex_recently_added", "Get the newest items from Plex library metadata; this does not query download services.", "read", "plex", {"media_type": {"type": "string"}, "library": {"type": "string"}, "limit": {"type": "integer"}}, plex_recently_added),
@@ -1091,6 +1296,8 @@ REGISTRY = [
     ("investigate_downloads", "Correlate qBittorrent, Sonarr, Radarr, Lidarr, Slskd, and Torbox download state.", "read", "media_pipeline", {}, investigate_downloads),
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
+    ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
+    ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
 GROUP_SERVICES = {
@@ -1105,6 +1312,7 @@ GROUP_SERVICES = {
     "internet": {"internet", "weather", "knowledge"},
     "utilities": {"utility"},
     "lists": {"lists"},
+    "media": {"media_planner", "plex", "sonarr", "radarr", "lidarr", "media_pipeline", "qbittorrent", "torbox", "slskd", "music_enricher", "beets"},
 }
 
 CAPABILITY_METADATA = {
@@ -1119,6 +1327,9 @@ CAPABILITY_METADATA = {
     "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
     "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
     "plex_recently_added": {"aliases": ["recently added", "last added", "newest in plex"], "examples": ["what was the last thing added to Plex"], "freshness": "current"},
+    "plex_library_lookup": {"aliases": ["do i have", "is it in plex", "plex availability"], "examples": ["do I already have Rodeo"], "group": "plex", "freshness": "current"},
+    "media_plan_goal": {"aliases": ["get media", "add movie", "request album", "put it in plex", "media goal"], "examples": ["get Rodeo by Travis Scott", "get the original animated Hobbit movie"], "group": "media", "freshness": "current"},
+    "media_get_workflow": {"aliases": ["how is it doing", "is it downloading", "did it import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current"},
     "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
@@ -1200,6 +1411,12 @@ async def registry(groups: str = ""):
     services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
     items = REGISTRY if not requested else [item for item in REGISTRY if item[3] in services]
     return {"tools": [public_schema(x) for x in items], "groups": sorted(requested)}
+
+
+@app.get("/media/capabilities")
+async def media_capabilities():
+    return {"capabilities": MEDIA_CAPABILITY_REGISTRY, "lifecycle_states": MEDIA_LIFECYCLE,
+            "write_execution": "disabled_until_planner_validation"}
 
 
 @app.get("/discover")

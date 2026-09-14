@@ -486,6 +486,8 @@ def tool_groups(text: str) -> set[str]:
         groups.add("music")
     if re.search(r"\b(download|downloading|torrent|torbox|queue|stuck|missing)\b", t):
         groups.add("downloads")
+    if re.search(r"\b(get|find|add|request|album|movie|film|series|anime|hobbit|rodeo|astroworld|plex|lidarr|sonarr|radarr)\b", t):
+        groups.add("media")
     if re.search(r"\b(camera|cameras|frigate|door|garage|motion)\b", t):
         groups.add("cameras")
     if re.search(r"\b(request|overseerr)\b", t):
@@ -694,6 +696,22 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
     item = successful[0]
     tool = item.get("tool")
     result = item["result"]
+    if tool == "media_plan_goal":
+        identity = result.get("canonical_identity") or {}
+        title = identity.get("title") or result.get("goal", {}).get("title_query") or "that item"
+        kind = result.get("goal", {}).get("media_type", "media")
+        if result.get("ambiguous"):
+            return f"I found more than one possible match for {title}. Can you be a little more specific?"
+        if result.get("current_state") == "AVAILABLE_IN_PLEX":
+            return f"You already have {title} in Plex."
+        if result.get("current_state") == "IMPORTED":
+            return f"{title} is already managed and imported."
+        if result.get("writes_required"):
+            pipeline = "music" if kind == "album" else "movie" if kind == "movie" else "TV"
+            return f"I found {title}. It isn't in Plex yet, and I haven't changed anything. I can request it through your configured {pipeline} pipeline when you're ready."
+        if identity:
+            return f"I found {title}, but it isn't in Plex yet."
+        return "I couldn't identify a confident media match without changing anything."
     if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
         offset = int(result.get("days_from_now") or 0)
         unit = result.get("temperature_unit", "C")
@@ -988,6 +1006,12 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("list_containers", {"status": status})]
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", t):
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
+    # Semantic media goals are planned above the service layer.  This is
+    # intentionally read/plan-only: it does not add or search anything.
+    media_goal = re.search(r"\b(get|find|add|request|do i have|is it in plex|how(?:'s| is)\s+.+\b(?:doing|going)|did it import|is it downloading|where is)\b", t)
+    media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
+    if media_goal and media_nouns:
+        return [("media_plan_goal", {"goal": text})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
@@ -1230,6 +1254,12 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             items = result.get("items") or []
             album_ids = sorted({item.get("album_id") for item in items if item.get("album_id") is not None})
             conversation_context[client_id] = {**prior_state, "domain": "music", "kind": "lidarr_wanted", "group": "music", "tools": tool_names, "referent_type": "lidarr_albums", "referent_ids": album_ids}
+        elif last.get("tool") == "media_plan_goal" and result.get("workflow_id"):
+            identity = result.get("canonical_identity") or {}
+            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names,
+                                               "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
+                                               "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
+                                               "canonical_identity": identity, "media_type": result.get("goal", {}).get("media_type")}
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
