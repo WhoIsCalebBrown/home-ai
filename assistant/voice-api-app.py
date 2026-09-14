@@ -114,6 +114,25 @@ INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated e
 FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Internal evidence is already available in this conversation. Do not describe where it came from and do not attribute it to the user. Return only a concise natural spoken answer. Every dynamic claim must map to an explicit field in the current evidence."
 
 
+def resolved_request_record(client_id: str, raw_text: str, route_text: str, context: dict, selected_tools: list[str], planned: list[tuple[str, dict]] | None = None, results: list[dict] | None = None) -> dict:
+    """Build the authoritative current-turn contract shared by routing and synthesis."""
+    return {
+        "raw_utterance": raw_text,
+        "normalized_utterance": routing_aliases(raw_text),
+        "route_query": route_text,
+        "resolved_domain": context.get("domain") or context.get("group") or "general",
+        "resolved_entities": context.get("entities") or context.get("location") or context.get("camera") or [],
+        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query") if context.get(key)},
+        "selected_tools": selected_tools,
+        "planned_tools": [name for name, _ in (planned or [])],
+        "tool_results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in (results or [])],
+    }
+
+
+def resolved_request_message(record: dict) -> dict:
+    return {"role": "system", "content": "<resolved_current_request>\n" + json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\nThis is the authoritative interpretation of the current turn. Answer this turn only. Current-turn domain and canonical entities override older conversation text. Do not reinterpret a canonical service name as a different subject.\n</resolved_current_request>"}
+
+
 def wav_wrap(pcm: bytes, rate: int, width: int, channels: int) -> bytes:
     out = io.BytesIO()
     import wave
@@ -438,7 +457,7 @@ def dynamic_fact_question(text: str) -> bool:
 
 def current_external_question(text: str) -> bool:
     fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this week|breaking|updated|update|release|version)\b"
-    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|policy|policies|news|headline|ollama|software|release|product|documentation|rules|bug|issue)\b"
+    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue)\b"
     return bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I)) or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
 
 
@@ -448,7 +467,9 @@ def unavailable_live_answer(text: str) -> str:
     if re.search(r"\b(lidarr|lidar)\b", text, re.I):
         return "I couldn't verify Lidarr's current status because its live status check was unavailable."
     if current_external_question(text):
-        return "I couldn't verify that current external information because live web research was unavailable."
+        return "I couldn't verify the current external information because live web research was unavailable."
+    if re.search(r"\b(news|headline|technology|tech|ai|artificial intelligence|canada|canadian)\b", text, re.I):
+        return "I couldn't verify the current news because live web research was unavailable."
     return "I couldn't verify that current server information because the required live tool result was unavailable."
 
 
@@ -581,26 +602,60 @@ def explicit_topic(text: str) -> bool:
         re.search(
             r"\b(weather|forecast|news|headlines?|president|prime minister|politics?|policy|policies|trump|trade war|trade dispute|"
             r"lidarr|lidar|plexium|plex|download(?:s|ing)?|torrent|camera|frigate|front door|storage|docker|container|"
-            r"movie|movies|music|album|artist|sonarr|radarr|q?bittorrent|server)\b",
+            r"movie|movies|music|album|artist|sonarr|radarr|q?bittorrent|server|gpu|gpus|vram|process|service|technology|tech|ai|artificial intelligence)\b",
             text,
             re.I,
         )
     )
 
 
+def social_acknowledgement(text: str) -> bool:
+    return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks)[.!]?\s*", text, re.I))
+
+
+def explicit_domain(text: str, prior: dict | None = None) -> str | None:
+    """Resolve an explicit current-turn domain before applying conversational context."""
+    lowered = routing_aliases(text).casefold()
+    if social_acknowledgement(text):
+        return "general"
+    # Infrastructure terms are deliberately checked before visual language such as
+    # "see".  "What containers can you see?" is a Docker question, not a camera query.
+    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu)\b", lowered):
+        return "server"
+    if re.search(r"\b(weather|forecast|temperature|rain|snow)\b", lowered):
+        return "weather"
+    if re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|president|prime minister|trump|trade war|trade dispute)\b", lowered):
+        return "web_research"
+    if re.search(r"\b(lidarr|lidar|plexium|plex|sonarr|radarr|qbittorrent|slskd|torbox|music|album|artist|download|downloading|travis|utopia|media pipeline)\b", lowered):
+        return "media"
+    if re.search(r"\b(front door|camera|cameras|frigate|snapshot|screenshot|event image)\b", lowered):
+        return "camera"
+    if prior and prior.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian)\b", lowered):
+        return "web_research"
+    return None
+
+
 def turn_context(client_id: str, text: str) -> dict:
     """Apply explicit current-turn topic/entity state before discovery or tool execution."""
-    current = dict(conversation_context.get(client_id, {}))
+    prior = dict(conversation_context.get(client_id, {}))
+    current = dict(prior)
     lowered = text.casefold()
-    if re.search(r"\b(weather|forecast)\b", lowered):
-        location = weather_location_from_text(text) or current.get("location", "")
-        current = {"kind": "weather", "group": "weather", "tools": [], "location": location}
-    elif current_external_question(text) or re.search(r"\b(news|headlines?)\b", lowered):
-        current = {"kind": "web_research", "group": "internet", "tools": []}
-    elif re.search(r"\b(lidarr|lidar|plexium|plex|music|album|artist|download|downloading|torrent)\b", lowered):
-        current = {"kind": "media", "group": "media", "tools": []}
-    elif re.search(r"\b(front door|camera|cameras|frigate|wearing|snapshot|screenshot)\b", lowered):
-        current = {"kind": "camera", "group": "cameras", "tools": []}
+    domain = explicit_domain(text, prior)
+    if domain == "weather":
+        location = weather_location_from_text(text) or prior.get("location", "")
+        current = {"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": location}
+    elif domain == "web_research":
+        current = {"domain": "web_research", "kind": "web_research", "group": "internet", "tools": [], "topic": text}
+    elif domain == "media":
+        current = {"domain": "media", "kind": "media", "group": "media", "tools": [], "entities": routing_aliases(text)}
+    elif domain == "camera":
+        current = {"domain": "camera", "kind": "camera", "group": "cameras", "tools": [], "camera": prior.get("camera", "front_door"), "subject": prior.get("subject")}
+    elif domain == "server":
+        current = {"domain": "server", "kind": "server", "group": "server", "tools": [], "entities": routing_aliases(text)}
+    elif domain == "general":
+        current = {"domain": "general", "kind": "general", "group": "general", "tools": []}
+    elif re.search(r"\b(what about|how about|tomorrow|there|they|them|that|it|look|wear|wearing|snapshot|describe)\b", lowered):
+        current = prior
     conversation_context[client_id] = current
     return current
 
@@ -628,6 +683,14 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
+        plan = []
+        if re.search(r"\b(gpu|gpus|vram)\b", t):
+            plan.append(("get_gpu_status", {}))
+        if re.search(r"\b(container|containers|docker|service|services)\b", t):
+            plan.append(("list_containers", {}))
+        if plan:
+            return plan
     if visual_question(text):
         if re.search(r"\b(front door|door)\b", t):
             return [("frigate_snapshot", {"camera": "front_door"})]
@@ -644,9 +707,11 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if current_external_question(text):
         return [("web_search", {"query": text.strip()})]
+    if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events)\b", t):
+        return [("web_search", {"query": text.strip()})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(plex|plexium|added|adding|going|coming|download|music)\b", t):
         return [("investigate_media_pipeline", {"entity_type": "auto", "query": routing_aliases(text), "focus": "status"})]
-    if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
+    if re.search(r"\b(lidarr|lidar)\b", t) and (re.search(r"\b(status|state|health|online|offline|working|running)\b", t) or re.search(r"\b(meant|mean|correction|not)\b", t)):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
     if re.search(r"\b(summary|overview)\b", t) and re.search(r"\b(server|media server)\b", t):
         return [("get_server_overview", {}), ("list_containers", {})]
@@ -839,6 +904,11 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     """Resolve only narrow, unambiguous follow-ups for routing; keep original text for display/reasoning."""
     context = conversation_context.get(client_id, {})
     lowered = routing_aliases(text).casefold()
+    domain = explicit_domain(text, context)
+    # An explicit current-turn domain is a hard boundary.  Do not prepend camera,
+    # weather, or news context to a new server/media question.
+    if domain and domain != context.get("domain"):
+        return routing_aliases(text)
     if explicit_topic(text):
         return routing_aliases(text)
     if context.get("kind") == "weather" and re.search(r"\b(what about|how about|look|find|check|one|it|that|there|right now|tomorrow)\b", lowered):
@@ -854,6 +924,8 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
         if followup and not explicit_camera_topic:
             return f"front door camera current snapshot person {text}"
+    if context.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian|topic|story)", lowered):
+        return f"current news today about {routing_aliases(text)}"
     if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
     return text
@@ -913,6 +985,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
+        if social_acknowledgement(user_text):
+            full = "You're welcome."
+            await emit_answer(ws, request_id, full)
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
         context = turn_context(client_id, user_text)
         route_text = resolved_followup_text(client_id, user_text)
@@ -920,12 +998,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
         planned = preflight_plan(route_text)
+        messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         for name, planned_args in planned:
             args = planned_args
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
-        if current_external_question(user_text):
+        if current_external_question(user_text) or context.get("domain") == "web_research":
             search_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "web_search" and item.get("status") == "ok"), None)
             first_url = next((item.get("url") for item in (search_result or {}).get("results", []) if item.get("url")), None)
             if first_url:
@@ -1042,6 +1121,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
             messages.extend(evidence_messages)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+        # Re-emit the contract after execution so final synthesis sees the same
+        # canonical interpretation plus the exact tools/results for this turn.
+        messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
         full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results)
     history.append({"role": "assistant", "content": full.strip()})

@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -27,6 +27,8 @@ weather_location_from_text = namespace["weather_location_from_text"]
 turn_context = namespace["turn_context"]
 resolved_followup_text = namespace["resolved_followup_text"]
 conversation_context = namespace["conversation_context"]
+explicit_domain = namespace["explicit_domain"]
+social_acknowledgement = namespace["social_acknowledgement"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -103,6 +105,41 @@ def test_weather_followup_inherits_only_when_referential():
     turn_context("scenario", "What's the weather in Toronto?")
     assert resolved_followup_text("scenario", "What about tomorrow?") == "weather in Toronto tomorrow"
     assert resolved_followup_text("scenario", "And what's current news today?") == "And what's current news today?"
+
+
+def test_explicit_domain_switches_override_camera_context():
+    conversation_context.clear()
+    turn_context("scenario", "Is somebody at my front door right now?")
+    assert explicit_domain("How many GPUs are being used right now?", conversation_context["scenario"]) == "server"
+    assert "front door camera" not in resolved_followup_text("scenario", "How many GPUs are being used right now?")
+    assert preflight_plan("How many GPUs are being used right now?") == [("get_gpu_status", {})]
+
+
+def test_container_see_is_server_not_vision():
+    conversation_context.clear()
+    assert explicit_domain("What containers can you see?") == "server"
+    assert preflight_plan("What containers can you see?") == [("list_containers", {})]
+
+
+def test_current_news_followup_about_ai_uses_web():
+    conversation_context.clear()
+    turn_context("scenario", "What's the biggest news story in Canada today?")
+    assert preflight_plan("Anything interesting with AI specifically?") == [("web_search", {"query": "Anything interesting with AI specifically?"})]
+
+
+def test_media_correction_keeps_media_intent():
+    conversation_context.clear()
+    turn_context("scenario", "Is there anything in lidar going to Plex?")
+    corrected = routing_aliases("Yeah, I meant Lidarr and I also meant Plex, not flux")
+    assert explicit_domain(corrected, conversation_context["scenario"]) == "media"
+    assert preflight_plan(corrected)[0][0] == "investigate_media_pipeline"
+
+
+def test_social_acknowledgement_does_not_inherit_tools():
+    assert social_acknowledgement("Thank you.")
+    conversation_context.clear()
+    turn_context("scenario", "Is somebody at my front door?")
+    assert explicit_domain("Thank you.", conversation_context["scenario"]) == "general"
 
 
 if __name__ == "__main__":
