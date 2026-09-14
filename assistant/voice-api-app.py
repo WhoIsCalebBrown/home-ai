@@ -788,7 +788,9 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
     list_name = (list_match.group(0).rsplit(" ", 1)[0].casefold() if list_match else "grocery")
     if re.search(r"\b(?:what(?:'s| is)|show|read)\b.*\blist\b", text, re.I):
         return [("list_items", {"list": list_name})]
-    add_match = re.search(r"\b(?:add|put|include)\s+(.+?)\s+(?:on|to|onto)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
+    # "put" is commonly transcribed as "but" in this exact list-command frame;
+    # keep the correction bounded to a named personal-list action.
+    add_match = re.search(r"\b(?:add|put|include|but)\s+(.+?)\s+(?:on|to|onto)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     if add_match:
         return [("add_list_items", {"list": list_name, "item": add_match.group(1).strip(" .?!")})]
     remove_match = re.search(r"\b(?:remove|take)\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
