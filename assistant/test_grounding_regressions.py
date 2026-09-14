@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -32,6 +32,10 @@ social_acknowledgement = namespace["social_acknowledgement"]
 contextual_entity_resolution = namespace["contextual_entity_resolution"]
 is_repair_turn = namespace["is_repair_turn"]
 repair_route_text = namespace["repair_route_text"]
+repeat_intent = namespace["repeat_intent"]
+rephrase_intent = namespace["rephrase_intent"]
+repair_decimal_spacing = namespace["repair_decimal_spacing"]
+round_weather_temperatures = namespace["round_weather_temperatures"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -192,6 +196,34 @@ def test_server_fallback_cannot_leak_into_news_synthesis():
     answer = evidence_supported_answer("I couldn't verify that current server information because the required live tool result was unavailable.", "Anything interesting with AI specifically?", result, "web_research")
     assert "server" not in answer.lower()
     assert "news results" in answer.lower()
+
+
+def test_repeat_is_deterministic_and_does_not_mean_refresh():
+    assert repeat_intent("Say that again.")
+    assert repeat_intent("Sorry, say that one more time.")
+    assert repeat_intent("Repeat what you said.")
+    assert not repeat_intent("Check that again.")
+    assert not rephrase_intent("Say that again.")
+
+
+def test_rephrase_is_separate_from_repeat():
+    assert rephrase_intent("Say that another way.")
+    assert rephrase_intent("Can you make that simpler?")
+    assert rephrase_intent("What do you mean?")
+    assert not repeat_intent("Explain that again.")
+
+
+def test_decimal_spacing_repair_preserves_versions_and_ips():
+    assert repair_decimal_spacing("18. 9 degrees") == "18.9 degrees"
+    assert repair_decimal_spacing("7. 1 GB") == "7.1 GB"
+    assert repair_decimal_spacing("7.3.2") == "7.3.2"
+    assert repair_decimal_spacing("192.168.40.44") == "192.168.40.44"
+    assert repair_decimal_spacing("The temperature is 18. 9. Tomorrow will be warmer.") == "The temperature is 18.9. Tomorrow will be warmer."
+
+
+def test_weather_rounding_is_spoken_only_and_exact_requests_are_preserved():
+    assert round_weather_temperatures("It is 18.9 degrees in Welland.", "What's the weather in Welland?") == "It is 19 degrees in Welland."
+    assert round_weather_temperatures("It is 18.9 degrees.", "What's the exact temperature?") == "It is 18.9 degrees."
 
 
 if __name__ == "__main__":

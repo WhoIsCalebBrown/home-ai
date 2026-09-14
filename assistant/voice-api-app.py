@@ -56,6 +56,70 @@ pronunciation_entries: dict[str, str] = {}
 normalization_init_seconds: float | None = None
 
 
+def record_assistant_response(client_id: str, text: str, request_id: str | None = None, origin: str = "") -> None:
+    """Store conversational recency independently from routing/tool state.
+
+    A general answer is still an assistant turn even when no tool ran.  Keeping
+    this record separate prevents repeat requests from accidentally reusing the
+    last resolved request or tool result.
+    """
+    display = text.strip()
+    if not display:
+        return
+    _, _, spoken = normalize_for_speech(display)
+    state = conversation_context.setdefault(client_id, {})
+    state["latest_assistant_response"] = {
+        "text": display,
+        "spoken_text": spoken,
+        "request_id": request_id,
+        "origin": origin or "assistant",
+        "timestamp": time.time(),
+    }
+    state["latest_spoken_response"] = spoken
+
+
+def repeat_intent(text: str) -> bool:
+    """Recognize replay requests without treating refresh requests as replay."""
+    lowered = text.casefold().strip()
+    if re.search(r"\b(?:check|look\s+(?:up|at)|verify|refresh|search|find)\b.*\bagain\b", lowered):
+        return False
+    return bool(
+        re.search(r"\b(?:say|repeat)\b.*\b(?:again|one\s+more\s+time|what\s+you\s+said|that)\b", lowered)
+        or re.search(r"\bwhat\s+did\s+you\s+just\s+say\b", lowered)
+        or re.search(r"\bcan\s+you\s+repeat\b", lowered)
+        or re.search(r"\bsorry[, ]+what\s+was\s+that\b", lowered)
+    )
+
+
+def rephrase_intent(text: str) -> bool:
+    lowered = text.casefold().strip()
+    return bool(
+        re.search(r"\bsay\s+that\s+another\s+way\b", lowered)
+        or re.search(r"\bexplain\s+that\s+again\b", lowered)
+        or re.search(r"\bmake\s+that\s+simpler\b", lowered)
+        or re.search(r"\bwhat\s+do\s+you\s+mean\b", lowered)
+    )
+
+
+def repair_decimal_spacing(text: str) -> str:
+    """Repair spaces inserted inside a decimal, without touching versions/IPs."""
+    return re.sub(r"(?<![\w.])(\d+)\s*\.\s*(\d+)(?!\.\d)", r"\1.\2", text)
+
+
+def round_weather_temperatures(text: str, user_text: str) -> str:
+    """Make ordinary weather speech conversational while retaining raw tool data."""
+    if not re.search(r"\b(weather|forecast|temperature|degrees?)\b", user_text, re.I):
+        return text
+    if re.search(r"\b(exact|precise|decimal|to the tenth|to one decimal)\b", user_text, re.I):
+        return text
+
+    def rounded(match: re.Match[str]) -> str:
+        value = float(match.group(1).replace(" ", ""))
+        return f"{round(value):g} degrees"
+
+    return re.sub(r"(-?\d+(?:\.\s*\d+)?)\s*degrees", rounded, repair_decimal_spacing(text), flags=re.I)
+
+
 @app.on_event("startup")
 async def initialize_speech_frontend() -> None:
     global speech_normalizer, pronunciation_entries, normalization_init_seconds
@@ -270,11 +334,12 @@ def apply_pronunciation_lexicon(text: str) -> str:
 def normalize_for_speech(text: str) -> tuple[str, str, str]:
     """Return original, NeMo-normalized, and lexicon-adjusted speech text."""
     original = text
-    normalized = text
+    normalized = repair_decimal_spacing(text)
     if speech_normalizer is not None:
         normalized = speech_normalizer.normalize(
-            text, verbose=False, punct_pre_process=True, punct_post_process=True
+            normalized, verbose=False, punct_pre_process=True, punct_post_process=True
         )
+    normalized = repair_decimal_spacing(normalized)
     normalized = re.sub(r"https?://\S+", "a link", normalized)
     normalized = re.sub(r"[`*_#]", "", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -587,7 +652,10 @@ def grounded_camera_presence_answer(result: dict) -> str:
     return "Frigate detected a person at the front door, but the event time was unavailable, so I can't say they are there right now."
 
 
-async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
+async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str | None = None, origin: str = "assistant") -> None:
+    text = repair_decimal_spacing(text)
+    if client_id:
+        record_assistant_response(client_id, text, request_id=request_id, origin=origin)
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
     prepared = await prepare_tts_text(request_id, text)
@@ -792,6 +860,9 @@ def turn_context(client_id: str, text: str) -> dict:
         current = {"domain": "general", "kind": "general", "group": "general", "tools": []}
     elif re.search(r"\b(what about|how about|tomorrow|there|they|them|that|it|look|wear|wearing|snapshot|describe)\b", lowered):
         current = prior
+    for key in ("latest_user_utterance", "latest_resolved_request", "latest_tool_result", "latest_assistant_response", "latest_spoken_response"):
+        if key in prior and key not in current:
+            current[key] = prior[key]
     if repair:
         current["repair"] = True
     conversation_context[client_id] = current
@@ -948,6 +1019,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
         if value.strip():
             nonlocal full
             safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain) if guard_user_text else value.strip()
+            safe = round_weather_temperatures(safe, guard_user_text) if guard_user_text else repair_decimal_spacing(safe)
             separator = "" if not full or full.endswith((" ", "\n")) else " "
             full += separator + safe
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
@@ -987,7 +1059,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
         if tts_tasks:
             await asyncio.gather(*tts_tasks, return_exceptions=True)
         raise
-    return full.strip()
+    return repair_decimal_spacing(full.strip())
 
 
 async def generate_final(messages: list[dict]) -> str:
@@ -1022,6 +1094,12 @@ def evidence_message(results: list[dict]) -> list[dict]:
 def store_provenance(client_id: str, results: list[dict]) -> None:
     prior_state = dict(conversation_context.get(client_id, {}))
     successful = [item for item in results if item.get("status") == "ok"]
+    if results:
+        conversation_context.setdefault(client_id, {})["latest_tool_result"] = {
+            "tools": [item.get("tool") for item in results],
+            "results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in results],
+            "timestamp": time.time(),
+        }
     if successful:
         last = successful[-1]
         tool_names = [item.get("tool") for item in successful if item.get("tool")]
@@ -1087,8 +1165,33 @@ def resolved_followup_text(client_id: str, text: str) -> str:
 async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str) -> None:
     history = sessions.setdefault(client_id, [])
     history.append({"role": "user", "content": user_text})
+    conversation_context.setdefault(client_id, {})["latest_user_utterance"] = {
+        "text": user_text, "request_id": request_id, "timestamp": time.time()
+    }
     await ws.send_json({"type": "transcript", "text": user_text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "thinking", "request_id": request_id})
+    latest = conversation_context.get(client_id, {}).get("latest_assistant_response") or {}
+    if repeat_intent(user_text):
+        repeated = latest.get("text")
+        full = repeated or "I don't have a previous answer to repeat."
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="repeat")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    if rephrase_intent(user_text):
+        source = latest.get("text")
+        if source:
+            messages = [
+                {"role": "system", "content": "Rewrite the assistant's immediately previous answer another way. Preserve its facts and scope. Return only the concise rewritten answer, with no preamble or discussion of this instruction."},
+                {"role": "user", "content": source},
+            ]
+            full = await generate_final(messages)
+        else:
+            full = "I don't have a previous answer to rephrase."
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="rephrase")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
     action = pending.get(client_id)
     if action and action.get("expires", 0) <= time.time():
         pending.pop(client_id, None)
@@ -1119,11 +1222,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         else:
             messages = [{"role": "system", "content": SYSTEM}, *history[-12:], {"role": "tool", "name": action["name"], "content": json.dumps(result.get("result", {}), separators=(",", ":"))}, {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE}]
             full = await generate_final(messages)
-        await emit_answer(ws, request_id, full)
+        await emit_answer(ws, request_id, full, client_id=client_id)
     else:
         if re.search(r"\b(what can you help me with|what can you do|your capabilities|what are you able to do)\b", user_text, re.I):
             full = await capability_summary()
-            await emit_answer(ws, request_id, full)
+            await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
@@ -1134,13 +1237,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 full = "I checked " + ", ".join(names[:-1]) + (", and " if len(names) > 1 else "") + (names[-1] if names else "nothing") + "."
             else:
                 full = "I don't have a preceding investigation with recorded sources for that question."
-            await emit_answer(ws, request_id, full)
+            await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         if social_acknowledgement(user_text):
             full = "You're welcome."
-            await emit_answer(ws, request_id, full)
+            await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
@@ -1160,6 +1263,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
         context["resolved_request"] = resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)
+        context["latest_resolved_request"] = context["resolved_request"]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         for name, planned_args in planned:
@@ -1183,7 +1287,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     full = f"Tower currently has {count} Docker containers and about {free_tb:.1f} terabytes free on its main storage."
                 else:
                     full = evidence_supported_answer("", user_text, live_results)
-                await emit_answer(ws, request_id, full)
+                await emit_answer(ws, request_id, full, client_id=client_id)
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
@@ -1193,7 +1297,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 full = f"{result['value']:g}."
             else:
                 full = f"{result.get('result'):g} {result.get('to_unit', '')}.".replace(" .", ".")
-            await emit_answer(ws, request_id, full)
+            await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
@@ -1203,7 +1307,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 store_provenance(client_id, live_results)
                 full = grounded_camera_presence_answer(event_result)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
-                await emit_answer(ws, request_id, full)
+                await emit_answer(ws, request_id, full, client_id=client_id)
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
@@ -1213,7 +1317,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if direct:
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
-                await emit_answer(ws, request_id, direct)
+                await emit_answer(ws, request_id, direct, client_id=client_id)
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
@@ -1231,7 +1335,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 target = requested.get("name", "the container")
                 if result.get("tool") == "restart_container":
                     full = f"Restart {CONTAINER_DISPLAY_NAMES.get(target.casefold(), target)}? Please confirm."
-                    await emit_answer(ws, request_id, full)
+                    await emit_answer(ws, request_id, full, client_id=client_id)
                     history.append({"role": "assistant", "content": full})
                     await ws.send_json({"type": "done", "request_id": request_id})
                     return
@@ -1289,6 +1393,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
         full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results, guard_domain=context.get("domain"))
+        record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})
 
