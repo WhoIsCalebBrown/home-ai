@@ -540,8 +540,9 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
             response.raise_for_status()
             payload = response.json()
             result = payload.get("result") if isinstance(payload, dict) else {}
-            if isinstance(result, dict):
-                result = {key: value for key, value in result.items() if key not in {"image_base64"}}
+            # Keep image evidence in the in-process result so evidence_message()
+            # can attach it to Ollama's multimodal request. The audit record only
+            # stores keys and provenance, never the image bytes themselves.
             discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id, "tool": name, "status": payload.get("status"), "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [], "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
             return payload
     except Exception as exc:
@@ -1054,7 +1055,11 @@ async def websocket(ws: WebSocket):
                     continue
                 await ws.send_json({"type": "state", "state": "transcribing", "request_id": request_id})
                 try:
+                    raw_audio_bytes = len(audio)
                     text = await transcribe(bytes(audio))
+                    normalized_text = text.strip() if text else ""
+                    discovery_audit({"event": "stt", "client_id": client_id, "request_id": request_id, "raw_audio_bytes": raw_audio_bytes, "transcript": text or "", "normalized_transcript": normalized_text})
+                    text = normalized_text
                     if text:
                         old = active.pop(client_id, None)
                         if old:
