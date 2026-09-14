@@ -25,3 +25,12 @@
 - Ollama’s current documented native sequence is assistant tool call → tool-role result → follow-up chat request.
 - OVOS currently carries a serialized session on every bus message and exposes explicit context add/remove/clear events.
 - Open WebUI currently treats native function calling as the default and emphasizes keeping stable system/tool context for cache reuse.
+
+## 2026-09-14 — 9B mixed-domain synthesis regression
+
+- Problem: live 9B turns retained camera/weather context and final synthesis sometimes answered an older weather question despite correct web/media tool selection.
+- Evidence: production trace showed `route_query` being rewritten with `front door camera` for the GPU turn; the Ollama request contained long prior history but no authoritative current-turn interpretation. The generic unavailable string was also unconditional for non-weather/non-Lidarr failures.
+- Public pattern adapted: current-turn canonical request plus scoped session context, following OVOS explicit session context; Ollama’s documented assistant-tool-result sequencing; Open WebUI’s separation of normalized message metadata from chat content. References and access-date commits are recorded above.
+- Change: added explicit domain-transition gating (server terms override camera language), current-news follow-up preflight, social acknowledgement short-circuit, media correction handling, domain-scoped unavailable responses, and a shared `resolved_current_request` synthesis contract containing raw/normalized text, domain, entities, referents, selected tools, and result keys.
+- Result: local regressions and CI passed; deployed assistant image commit `2672fe0`. Live Toronto→tomorrow, Plex count, Frigate event, and provenance fixtures reached the new contract; 9B remains active at 8192.
+- Keep/rollback: assistant-only deployment; rollback to the prior assistant image/template remains available. No tools, model, TTS, camera, or media services were changed.

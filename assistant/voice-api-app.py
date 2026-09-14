@@ -491,10 +491,10 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
             f"{torbox.get('errored', 0)} errored, and {torbox.get('pulling', 0)} pulling.")
 
 
-def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) -> str:
+def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None) -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
-    if visual_question(user_text) and not any(
+    if visual_question(user_text) and (resolved_domain is None or resolved_domain == "camera") and not any(
         isinstance(item.get("result"), dict) and item.get("result", {}).get("vision_ready")
         for item in results
     ):
@@ -787,7 +787,7 @@ def synthesis_violation(text: str, user_text: str = "") -> str | None:
     return None
 
 
-async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None) -> str:
+async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None, guard_domain: str | None = None) -> str:
     sentence = ""
     full = full_seed
     tts_tasks: list[asyncio.Task] = []
@@ -795,7 +795,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
     async def emit_sentence(value: str) -> None:
         if value.strip():
             nonlocal full
-            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or []) if guard_user_text else value.strip()
+            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain) if guard_user_text else value.strip()
             separator = "" if not full or full.endswith((" ", "\n")) else " "
             full += separator + safe
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
@@ -1125,7 +1125,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results)
+        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results, guard_domain=context.get("domain"))
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})
 
