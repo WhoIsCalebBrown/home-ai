@@ -1221,6 +1221,16 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         if identity:
             plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"), "tvdb_id": identity.get("tvdbId")}
         plan["ambiguous"] = ambiguous
+        if identity:
+            plan["providers"]["plex"] = await plex_library_lookup({"query": identity.get("title", title), "library": "TV Shows"})
+            managed = await arr_get("sonarr", "/api/v3/series", {})
+            owned = next((row for row in managed if str(row.get("tvdbId")) == str(identity.get("tvdb_id"))), None) if isinstance(managed, list) else None
+            plan["providers"]["sonarr"] = {"managed": bool(owned), "series_id": owned.get("id") if owned else None,
+                                             "monitored": owned.get("monitored") if owned else None,
+                                             "episode_file_count": (owned.get("statistics") or {}).get("episodeFileCount") if owned else None,
+                                             "episode_count": (owned.get("statistics") or {}).get("episodeCount") if owned else None}
+            plan["steps"].append({"capability": "media.library.check", "owner": "plex", "reason": "avoid duplicate acquisition"})
+            plan["steps"].append({"capability": "media.wanted.read", "owner": "sonarr", "reason": "determine whether the series is already managed"})
     else:
         plan["ambiguous"] = True
     identity = plan.get("canonical_identity") or {}
@@ -1239,6 +1249,8 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             if parts["action"] == "ensure_available":
                 plan["writes_required"] = [{"owner": owner, "capability": "media.request", "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
                 plan["confirmation_required"] = True
+    if plan.get("writes_required"):
+        plan["steps"].append({"capability": "media.request", "owner": plan["writes_required"][0]["owner"], "reason": "item is identified but not yet managed; execution is disabled in plan mode"})
     plan["lifecycle_states"] = MEDIA_LIFECYCLE
     plan["recommended_workflow"] = " / ".join(step["capability"] for step in plan["steps"])
     rows = _media_workflows()
