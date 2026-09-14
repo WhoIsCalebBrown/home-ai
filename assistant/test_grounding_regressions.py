@@ -90,6 +90,11 @@ def test_explicit_weather_location_beats_old_context():
     assert preflight_plan("And what's the current weather in Welland, Ontario?") == [("weather_forecast", {"location": "Welland, Ontario", "days_from_now": 0})]
 
 
+def test_temperature_outside_routes_to_weather():
+    plan = preflight_plan("What's the temperature outside in Welland?")
+    assert plan == [("weather_forecast", {"location": "Welland", "days_from_now": 0})]
+
+
 def test_weather_followup_keeps_location_without_topic_contamination():
     assert preflight_plan("What is the weather tomorrow?") == [("weather_forecast", {"location": None, "days_from_now": 1})]
 
@@ -128,6 +133,26 @@ def test_container_see_is_server_not_vision():
     conversation_context.clear()
     assert explicit_domain("What containers can you see?") == "server"
     assert preflight_plan("What containers can you see?") == [("list_containers", {})]
+
+
+def test_container_running_followup_preserves_referent():
+    context = {"domain": "server", "referent_type": "containers"}
+    assert preflight_plan("How many are running?", context) == [("list_containers", {"status": "running"})]
+
+
+def test_front_door_alerts_use_events_not_stats():
+    assert preflight_plan("Any alerts from our front camera?")[0][0] == "frigate_recent_events"
+
+
+def test_event_image_followup_preserves_event_id():
+    context = {"domain": "camera", "group": "cameras", "camera": "front_door", "latest_event_id": "event-123"}
+    assert resolved_followup_text("scenario", "Describe the image from that detection.") == "Describe the image from that detection."
+    assert preflight_plan("describe the event image for event event-123", context) == [("frigate_event_snapshot", {"event_id": "event-123"})]
+
+
+def test_plex_acquisition_followup_uses_download_investigation():
+    context = {"domain": "media", "referent_type": "plex_movies"}
+    assert preflight_plan("Anything being added or looked for?", context) == [("investigate_downloads", {})]
 
 
 def test_current_news_followup_about_ai_uses_web():

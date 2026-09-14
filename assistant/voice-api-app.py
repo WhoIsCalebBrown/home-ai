@@ -194,7 +194,7 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "route_query": route_text,
         "resolved_domain": context.get("domain") or context.get("group") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
-        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query") if context.get(key)},
+        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
         "tool_results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in (results or [])],
@@ -555,7 +555,7 @@ def visual_question(text: str) -> bool:
 
 
 def front_door_presence_question(text: str) -> bool:
-    return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion)\b", text, re.I))
+    return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion|alert|alerts|detection|detected)\b", text, re.I))
 
 
 def dynamic_fact_question(text: str) -> bool:
@@ -894,8 +894,9 @@ def deterministic_plan(text: str) -> list[tuple[str, dict]]:
     return []
 
 
-def preflight_plan(text: str) -> list[tuple[str, dict]]:
+def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, dict]]:
     t = text.lower()
+    context = context or {}
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
@@ -913,12 +914,18 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
     remove_match = re.search(r"\b(?:remove|take)\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     if remove_match:
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
+    if context.get("latest_event_id") and re.search(r"\b(event|detection|image|snapshot|that)\b", t) and visual_question(text):
+        return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
+    if context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t):
+        status = next(value for value in ("running", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t))
+        return [("list_containers", {"status": status})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
             plan.append(("get_gpu_status", {}))
-        if re.search(r"\b(container|containers|docker|service|services)\b", t):
-            plan.append(("list_containers", {}))
+        if re.search(r"\b(container|containers|docker|service|services)\b", t) or (context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t)):
+            status = next((value for value in ("running", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t)), None)
+            plan.append(("list_containers", {"status": status} if status else {}))
         if plan:
             return plan
     if visual_question(text):
@@ -931,7 +938,7 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
         if re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t):
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
-    if re.search(r"\bweather\b", t):
+    if re.search(r"\b(weather|temperature|forecast|high|low|rain|precipitation|snow|humidity|conditions?)\b", t):
         location = weather_location_from_text(text)
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
@@ -956,6 +963,8 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
         if re.search(r"\b(state|status|adding|coming along|finish|finished|downloading|missing|albums?|music|stuff|pipeline)\b", t):
             focus = "missing" if re.search(r"\bmissing\b", t) else "status"
             return [("investigate_media_pipeline", {"entity_type": "artist", "query": artist, "focus": focus})]
+    if re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", t) and (context.get("referent_type") in {"plex_movies", "plex_library"} or re.search(r"\b(movie|movies|plex|radarr|media)\b", t)):
+        return [("investigate_downloads", {})]
     if re.search(r"what(?:'s| is) (?:currently )?downloading|anything (?:stalled|stuck)|what(?:'s| is) stuck", t):
         return [("investigate_downloads", {})]
     if re.search(r"(why|isn't|is not).*(plex|episode|show|movie).*(there|showing|visible|missing)|why.*in plex", t):
@@ -967,7 +976,7 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
     if re.search(r"\b(gpu|vram|3070|1660|graphics|video card)\b", t): plan.append(("get_gpu_status", {}))
     if re.search(r"\b(container|containers|docker|service|services|server health)\b", t): plan.append(("list_containers", {}))
     if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t): plan.append(("plex_library_counts" if re.search(r"\bhow many|counts?|libraries\b", t) else "plex_search", {"query": plex_query_from_speech(text)} if not re.search(r"\bhow many|counts?|libraries\b", t) else {}))
-    if front_door_presence_question(text):
+    if front_door_presence_question(text) or re.search(r"\b(front door|camera|detection|motion|alert|alerts|last thing detected|what happened)\b", t):
         plan.append(("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 10}))
     elif re.search(r"\b(camera|cameras|garage|frigate|person)\b", t):
         plan.append(("frigate_stats", {}))
@@ -1114,11 +1123,16 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         if last.get("tool", "").startswith("frigate"):
             events = result.get("events") or []
             camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
-            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None}
+            selected = events[0] if events else {}
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None, "latest_event_id": result.get("event_id") or selected.get("id"), "latest_event": selected or None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
             conversation_context[client_id] = {**prior_state, "domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
             conversation_context[client_id] = {**prior_state, "domain": "media", "kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
+        elif last.get("tool") == "list_containers":
+            conversation_context[client_id] = {**prior_state, "domain": "server", "kind": "server", "group": "server", "tools": tool_names, "referent_type": "containers"}
+        elif last.get("tool") == "plex_library_counts":
+            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "plex_library", "group": "plex", "tools": tool_names, "referent_type": "plex_movies"}
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
@@ -1164,6 +1178,8 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         location = candidate or (context.get("location") or "")
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
+    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(that|the|last|detection|event|image|snapshot|describe|show|look)\b", lowered):
+        return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
         explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
         followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
@@ -1173,6 +1189,12 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"current news today about {routing_aliases(text)}"
     if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
+    if context.get("domain") == "server" and context.get("referent_type") == "containers" and re.search(r"\b(how many|which|what|are|is)\b", lowered) and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", lowered):
+        return f"how many containers are {lowered}"
+    if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):
+        return "what movies are currently being acquired, queued, downloaded, or imported"
+    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(that|the|last|detection|event|image|snapshot|describe|show|look)\b", lowered):
+        return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     return text
 
 
@@ -1272,7 +1294,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
-        planned = preflight_plan(route_text)
+        planned = preflight_plan(route_text, context)
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]

@@ -15,6 +15,11 @@ def test_discovery_distinguishes_camera_capabilities():
     assert names("is the front door camera working")[:1] == ["frigate_stats"]
     assert names("was someone at the front door recently")[:1] == ["frigate_recent_events"]
     assert names("describe the front door right now")[:1] == ["frigate_snapshot"]
+    assert names("describe the image from that detection")[:1] == ["frigate_event_snapshot"]
+
+
+def test_discovery_alerts_are_events_not_camera_stats():
+    assert names("any alerts from the front camera")[:1] == ["frigate_recent_events"]
 
 
 def test_discovery_handles_local_aliases_and_utilities():

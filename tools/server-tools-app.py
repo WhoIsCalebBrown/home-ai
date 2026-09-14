@@ -31,6 +31,12 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
+WEATHER_LOCATION_HINTS = {}
+for _hint in os.getenv("WEATHER_LOCATION_HINTS", "").split(";"):
+    if "=" in _hint:
+        _name, _qualified = _hint.split("=", 1)
+        if _name.strip() and _qualified.strip():
+            WEATHER_LOCATION_HINTS[_name.strip().casefold()] = _qualified.strip()
 PROTECTED = {x.strip().lower() for x in os.getenv(
     "PROTECTED_CONTAINERS",
     "voice-api,voice-ollama,voice-whisper,voice-kokoro,voice-piper,Nginx-Proxy-Manager-Official,adguardhome,cloudflare-tunnel,mariadb,postgres,redis"
@@ -258,10 +264,19 @@ async def gpu_status(_: dict[str, Any]) -> dict[str, Any]:
 async def list_containers(args: dict[str, Any]) -> dict[str, Any]:
     rows = await docker_get("/containers/json", {"all": "1"})
     status = args.get("status")
-    items = [normalize_container(r) for r in rows]
+    all_items = [normalize_container(r) for r in rows]
+    summary = {
+        "total": len(all_items),
+        "running": sum(item["state"] == "running" for item in all_items),
+        "stopped": sum(item["state"] in {"exited", "created"} for item in all_items),
+        "paused": sum(item["state"] == "paused" for item in all_items),
+        "restarting": sum(item["state"] == "restarting" for item in all_items),
+        "dead": sum(item["state"] == "dead" for item in all_items),
+    }
+    items = all_items
     if status:
         items = [x for x in items if x["state"] == status or status.lower() in x["status"].lower()]
-    return {"count": len(items), "containers": items[:200]}
+    return {"count": len(items), "summary": summary, "status_filter": status or None, "containers": items[:200]}
 
 
 async def container_status(args: dict[str, Any]) -> dict[str, Any]:
@@ -408,8 +423,9 @@ async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
     if not location:
         return {"location_required": True, "message": "A city or location is required; no default home location is configured."}
     offset = max(0, min(7, int(args.get("days_from_now", 0))))
+    geocoder_location = WEATHER_LOCATION_HINTS.get(location.casefold(), location)
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        geo = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": location, "count": 1, "language": "en", "format": "json"})
+        geo = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": geocoder_location, "count": 1, "language": "en", "format": "json"})
         geo.raise_for_status(); places = geo.json().get("results") or []
         if not places: return {"location": location, "found": False}
         place = places[0]
@@ -642,6 +658,19 @@ async def frigate_snapshot(args: dict[str, Any]) -> dict[str, Any]:
             "image_base64": base64.b64encode(image).decode("ascii"), "vision_ready": True}
 
 
+async def frigate_event_snapshot(args: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(args.get("event_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", event_id):
+        return {"ok": False, "error": "event_id is required"}
+    image, content_type = await service_bytes("frigate", f"/api/events/{event_id}/snapshot.jpg")
+    if content_type not in {"image/jpeg", "image/png"}:
+        raise RuntimeError("Frigate event snapshot was not an image")
+    if len(image) > 8_000_000:
+        raise RuntimeError("Frigate event snapshot is too large")
+    return {"ok": True, "event_id": event_id, "content_type": content_type,
+            "image_base64": base64.b64encode(image).decode("ascii"), "vision_ready": True}
+
+
 async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
     params = {"limit": min(int(args.get("limit", 10)), 50)}
     if args.get("camera"): params["camera"] = args["camera"]
@@ -838,7 +867,7 @@ async def clear_completed_list_items(args: dict[str, Any]) -> dict[str, Any]:
 
 async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
     result = {}
-    calls = [("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)]
+    calls = [("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("radarr_missing_movies", lambda a: arr_missing("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)]
 
     async def run(name, fn):
         try:
@@ -964,6 +993,7 @@ REGISTRY = [
     ("frigate_stats", "Get current Frigate camera and detector stats; this does not contain visual content.", "read", "frigate", {}, frigate_stats),
     ("frigate_recent_events", "Get recent Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}}, frigate_events),
     ("frigate_snapshot", "Get one current Frigate camera frame for an explicitly requested vision analysis.", "read", "frigate", {"camera": {"type": "string", "required": True}}, frigate_snapshot),
+    ("frigate_event_snapshot", "Get the snapshot belonging to one specific Frigate event ID for grounded visual analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_snapshot),
     ("netdata_system_summary", "Get current Netdata host monitoring identity.", "read", "netdata", {}, netdata_summary),
     ("qbittorrent_summary", "Get current qBittorrent speeds, active downloads, stalls, and disk space.", "read", "qbittorrent", {}, qbittorrent_summary),
     ("qbittorrent_list", "List normalized qBittorrent items using a safe filter.", "read", "qbittorrent", {"filter": {"type": "string"}}, qbittorrent_list),
@@ -1011,6 +1041,7 @@ CAPABILITY_METADATA = {
     "frigate_stats": {"aliases": ["camera health", "fps", "detector"], "examples": ["is my camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
     "frigate_recent_events": {"aliases": ["motion", "person detected", "recent camera event"], "examples": ["was someone at the door recently"], "freshness": "current", "visual_evidence": False},
     "frigate_snapshot": {"aliases": ["see camera", "what does it look like", "current image"], "examples": ["describe the front door right now"], "freshness": "current", "visual_evidence": True},
+    "frigate_event_snapshot": {"aliases": ["event image", "detection image", "snapshot from that event"], "examples": ["describe the image from that detection"], "freshness": "event-scoped", "visual_evidence": True},
     "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline"], "examples": ["what is downloading", "is anything stuck"], "group": "downloads", "freshness": "current"},
     "investigate_media_pipeline": {"aliases": ["music pipeline", "missing media", "artist status"], "examples": ["what is going on with UTOPIA", "how is Travis Scott coming along"], "group": "media_pipeline", "freshness": "current"},
     "get_storage_status": {"aliases": ["disk space", "free space", "storage"], "examples": ["how much storage do I have left"], "freshness": "current"},
