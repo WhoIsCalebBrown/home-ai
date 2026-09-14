@@ -428,7 +428,7 @@ def visual_question(text: str) -> bool:
 
 
 def front_door_presence_question(text: str) -> bool:
-    return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|person|people|anything|there|now|motion)\b", text, re.I))
+    return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion)\b", text, re.I))
 
 
 def dynamic_fact_question(text: str) -> bool:
@@ -846,6 +846,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
+        if current_external_question(user_text):
+            search_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "web_search" and item.get("status") == "ok"), None)
+            first_url = next((item.get("url") for item in (search_result or {}).get("results", []) if item.get("url")), None)
+            if first_url:
+                live_results.append(await invoke_tool("web_fetch", {"url": first_url}, client_id, request_id))
         if live_results and re.search(r"\b(how many|count|storage|space|free|left|summary|overview)\b", user_text, re.I):
             if any(item.get("tool") in {"list_containers", "get_storage_status"} and item.get("status") == "ok" for item in live_results):
                 store_provenance(client_id, live_results)

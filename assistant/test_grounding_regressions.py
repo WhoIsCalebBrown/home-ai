@@ -54,6 +54,10 @@ def test_recent_frigate_event_does_not_prove_current_presence():
     assert "no longer active" in answer
 
 
+def test_somebody_front_door_phrase_uses_frigate_events():
+    assert preflight_plan("Is somebody at my front door?")[0][0] == "frigate_recent_events"
+
+
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
     assert "active person event" in grounded_camera_presence_answer(result)
