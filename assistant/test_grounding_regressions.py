@@ -160,6 +160,11 @@ def test_repair_preserves_weather_and_replaces_location():
     assert preflight_plan(repaired) == [("weather_forecast", {"location": "Welland", "days_from_now": 1})]
 
 
+def test_weather_location_ignores_repeated_whisper_question_tail():
+    assert weather_location_from_text("What is the weather in Toronto, what is the weather in Toronto, what is the weather in") == "Toronto"
+    assert weather_location_from_text("What is the weather in Toronto, Ontario, what is the weather in Toronto") == "Toronto, Ontario"
+
+
 def test_contextual_flux_resolution_is_not_global():
     assert contextual_entity_resolution("What is magnetic flux?")["text"] == "What is magnetic flux?"
     assert contextual_entity_resolution("What causes dental plaques?")["text"] == "What causes dental plaques?"

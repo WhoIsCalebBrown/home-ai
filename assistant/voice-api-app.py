@@ -684,6 +684,13 @@ def weather_location_from_text(text: str) -> str | None:
         match = re.search(pattern, text, re.I)
         if match:
             value = re.sub(r"^the\s+", "", match.group(1).strip(" .!?\t\r\n"), flags=re.I)
+            # Browser/Whisper sessions can repeat the prompt while the final
+            # audio buffer is being assembled (for example, "Toronto, what is
+            # the weather in Toronto...").  Preserve legitimate province/state
+            # commas, but discard the repeated question tail before routing.
+            value = re.split(r",\s*(?:what|how|is|the)\b", value, maxsplit=1, flags=re.I)[0]
+            value = re.split(r"\s+(?:what|how)\s+is\s+the\b", value, maxsplit=1, flags=re.I)[0]
+            value = value.strip(" ,.!?\t\r\n")
             if value and value.casefold() not in {"one", "it", "that"}:
                 return value
     return None
