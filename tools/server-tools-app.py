@@ -777,11 +777,18 @@ async def overseerr_recent_requests(_: dict[str, Any]) -> dict[str, Any]:
 
 async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
     result = {}
-    sources_checked = []
-    for name, fn in (("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)):
-        sources_checked.append(name)
+    calls = [("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)]
+
+    async def run(name, fn):
         try:
-            value = await fn({})
+            return name, await fn({})
+        except Exception as exc:
+            return name, {"error": f"{name} unavailable", "detail": type(exc).__name__}
+
+    values = dict(await asyncio.gather(*(run(name, fn) for name, fn in calls)))
+    for name, _ in calls:
+        value = values[name]
+        try:
             if name == "qbittorrent":
                 result[name] = {k: value.get(k) for k in ("torrent_count", "active_count", "stalled_count", "download_speed_bytes_s", "upload_speed_bytes_s", "stopped_downloads")}
                 result[name]["stopped_downloads"] = result[name].get("stopped_downloads", [])[:5]
@@ -797,7 +804,7 @@ async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
                 result[name] = value
         except Exception as exc:
             result[name] = {"error": f"{name} unavailable", "detail": type(exc).__name__}
-    return {"investigation": "downloads", "sources_checked": sources_checked, "sources": result}
+    return {"investigation": "downloads", "sources_checked": [name for name, _ in calls], "sources": result}
 
 
 async def investigation_step(parent: str, name: str, fn, args: dict[str, Any]):
@@ -827,23 +834,29 @@ async def investigate_media_pipeline(args: dict[str, Any]) -> dict[str, Any]:
              ("slskd", "slskd_downloads", slskd_downloads, {"query": query, "include_completed": True}),
              ("music_enricher", "music_enricher_quarantine", music_enricher_quarantine, {"query": query}),
              ("beets", "beets_recent_imports", beets_recent_imports, {}),
-             ("torbox", "torbox_status", torbox_status, {"query": query})]
+             ("torbox", "torbox_status", torbox_status, {"query": query}),
+             ("qbittorrent", "qbittorrent_list", lambda _: qbit_request("/api/v2/torrents/info", {"filter": "all"}), {})]
+    async def run_call(name, fn_name, fn, fn_args):
+        try:
+            return name, await investigation_step("investigate_media_pipeline", fn_name, fn, fn_args)
+        except Exception as exc:
+            return name, {"error": f"{name} unavailable", "detail": type(exc).__name__}
+
+    values = dict(await asyncio.gather(*(run_call(name, fn_name, fn, fn_args) for name, fn_name, fn, fn_args in calls)))
     for name, fn_name, fn, fn_args in calls:
         try:
-            value = await investigation_step("investigate_media_pipeline", fn_name, fn, fn_args)
+            value = values[name]
             if name == "beets":
                 value["items"] = [x for x in value.get("items", []) if query.casefold() in json.dumps(x).casefold()][:20]
                 value["count"] = len(value["items"])
+            elif name == "qbittorrent":
+                result[name] = {"items": [normalize_qbit(row) for row in value if query.casefold() in (row.get("name", "") + " " + row.get("category", "")).casefold()][:5]} if isinstance(value, list) else value
+                continue
             elif isinstance(value, dict) and isinstance(value.get("items"), list):
                 value["items"] = value["items"][:5]
             result[name] = value
         except Exception as exc:
             result[name] = {"error": f"{name} unavailable", "detail": type(exc).__name__}
-    try:
-        torrent_rows = await investigation_step("investigate_media_pipeline", "qbittorrent_list", lambda _: qbit_request("/api/v2/torrents/info", {"filter": "all"}), {})
-        result["qbittorrent"] = {"items": [normalize_qbit(row) for row in torrent_rows if query.casefold() in (row.get("name", "") + " " + row.get("category", "")).casefold()][:5]}
-    except Exception as exc:
-        result["qbittorrent"] = {"error": "qBittorrent unavailable", "detail": type(exc).__name__}
     return {"investigation": "music_pipeline", **result}
 
 

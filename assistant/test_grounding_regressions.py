@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -29,6 +29,9 @@ resolved_followup_text = namespace["resolved_followup_text"]
 conversation_context = namespace["conversation_context"]
 explicit_domain = namespace["explicit_domain"]
 social_acknowledgement = namespace["social_acknowledgement"]
+contextual_entity_resolution = namespace["contextual_entity_resolution"]
+is_repair_turn = namespace["is_repair_turn"]
+repair_route_text = namespace["repair_route_text"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -134,6 +137,31 @@ def test_media_correction_keeps_media_intent():
     corrected = routing_aliases("Yeah, I meant Lidarr and I also meant Plex, not flux")
     assert explicit_domain(corrected, conversation_context["scenario"]) == "media"
     assert preflight_plan(corrected)[0][0] == "investigate_media_pipeline"
+
+
+def test_generic_media_repair_reuses_previous_pipeline_request():
+    conversation_context.clear()
+    turn_context("scenario", "Is anything in litter going to Plex?")
+    conversation_context["scenario"]["last_route_text"] = "Is anything in Lidarr going to Plex?"
+    assert is_repair_turn("Yeah, I meant Lidarr.")
+    repaired = repair_route_text("Yeah, I meant Lidarr.", conversation_context["scenario"])
+    assert "Lidarr" in repaired and preflight_plan(repaired)[0][0] == "investigate_media_pipeline"
+
+
+def test_repair_preserves_weather_and_replaces_location():
+    conversation_context.clear()
+    turn_context("scenario", "Check tomorrow's weather in Toronto.")
+    conversation_context["scenario"]["last_route_text"] = "weather in Toronto tomorrow"
+    repaired = repair_route_text("Sorry, I meant Welland.", conversation_context["scenario"])
+    assert repaired == "weather in Welland tomorrow"
+    assert preflight_plan(repaired) == [("weather_forecast", {"location": "Welland", "days_from_now": 1})]
+
+
+def test_contextual_flux_resolution_is_not_global():
+    assert contextual_entity_resolution("What is magnetic flux?")["text"] == "What is magnetic flux?"
+    assert contextual_entity_resolution("What causes dental plaques?")["text"] == "What causes dental plaques?"
+    resolved = contextual_entity_resolution("What's new on flux?", {"domain": "media"})
+    assert "Plex" in resolved["text"]
 
 
 def test_social_acknowledgement_does_not_inherit_tools():

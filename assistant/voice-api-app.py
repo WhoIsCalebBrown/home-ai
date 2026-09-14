@@ -121,7 +121,7 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "normalized_utterance": routing_aliases(raw_text),
         "route_query": route_text,
         "resolved_domain": context.get("domain") or context.get("group") or "general",
-        "resolved_entities": context.get("entities") or context.get("location") or context.get("camera") or [],
+        "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
         "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
@@ -280,9 +280,11 @@ def record_tts_debug(request_id: str, original: str, normalized: str, adjusted: 
 
 
 async def prepare_tts_text(request_id: str, text: str) -> str:
+    started = time.perf_counter()
     async with normalizer_lock:
         original, normalized, adjusted = normalize_for_speech(text)
         record_tts_debug(request_id, original, normalized, adjusted)
+        print(f"TTS_TIMING request={request_id} event=normalization_done duration_ms={(time.perf_counter() - started) * 1000:.2f}", flush=True)
         return adjusted
 
 
@@ -292,6 +294,8 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
     primary = TTS_PROVIDER
     async with tts_lock:
         try:
+            tts_started = time.perf_counter()
+            print(f"TTS_TIMING request={request_id} event={primary}_request t={time.time():.6f}", flush=True)
             if primary == "chatterbox":
                 wav = await synthesize_chatterbox(text)
             elif primary == "kokoro":
@@ -299,6 +303,7 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
             else:
                 wav = await synthesize_piper(text)
             if wav:
+                print(f"TTS_TIMING request={request_id} event={primary}_complete duration_ms={(time.perf_counter() - tts_started) * 1000:.2f}", flush=True)
                 await send_wav(ws, request_id, wav)
             return
         except asyncio.CancelledError:
@@ -558,6 +563,7 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
+    started = time.perf_counter()
     discovery_audit({"event": "tool_call", "client_id": client_id, "request_id": request_id, "tool": name, "arguments": {k: v for k, v in arguments.items() if not any(secret in k.casefold() for secret in ("key", "token", "password", "secret"))}})
     try:
         async with httpx.AsyncClient(timeout=15) as http:
@@ -572,10 +578,10 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
             # Keep image evidence in the in-process result so evidence_message()
             # can attach it to Ollama's multimodal request. The audit record only
             # stores keys and provenance, never the image bytes themselves.
-            discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id, "tool": name, "status": payload.get("status"), "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [], "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
+            discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id, "tool": name, "status": payload.get("status"), "duration_ms": round((time.perf_counter() - started) * 1000, 2), "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [], "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
             return payload
     except Exception as exc:
-        return {"tool": name, "status": "error", "result": {"error": "Tool service unavailable", "detail": type(exc).__name__}}
+        return {"tool": name, "status": "error", "result": {"error": "Tool service unavailable", "detail": type(exc).__name__, "duration_ms": round((time.perf_counter() - started) * 1000, 2)}}
 
 
 ARTIST_ALIASES = {"travis": "Travis Scott", "travis scott": "Travis Scott"}
@@ -591,6 +597,79 @@ def routing_aliases(text: str) -> str:
     if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist)\b", text, re.I):
         text = re.sub(r"\blitter\b", "Lidarr", text, flags=re.I)
     return text
+
+
+DOMAIN_ENTITIES = {
+    "plex": "Plex", "plex music": "Plex Music", "plexium": "Plex",
+    "lidar": "Lidarr", "lidarr": "Lidarr", "litter": "Lidarr",
+    "sonarr": "Sonarr", "radarr": "Radarr", "frigate": "Frigate",
+    "unraid": "Unraid", "ollama": "Ollama", "qwen": "Qwen",
+    "kokoro": "Kokoro", "chatterbox": "Chatterbox", "whisper": "Whisper",
+    "qbittorrent": "qBittorrent", "slskd": "Slskd", "torbox": "Torbox",
+    "docker": "Docker", "gpu": "GPU", "gpus": "GPU", "vram": "VRAM",
+}
+
+
+def contextual_entity_resolution(text: str, context: dict | None = None) -> dict:
+    """Resolve only high-confidence local names; preserve the raw utterance."""
+    context = context or {}
+    routed = routing_aliases(text)
+    lowered = routed.casefold()
+    confidence: dict[str, str] = {}
+    entities: list[str] = []
+    for alias, canonical in sorted(DOMAIN_ENTITIES.items(), key=lambda item: -len(item[0])):
+        if re.search(rf"\b{re.escape(alias)}\b", lowered):
+            if canonical not in entities:
+                entities.append(canonical)
+            confidence[canonical] = "high"
+
+    # These are deliberately context-gated. "magnetic flux" and "dental plaque"
+    # remain untouched unless the current/previous request is clearly media-related.
+    media_context = context.get("domain") == "media" or bool(
+        re.search(r"\b(plex|lidarr|music|album|artist|download|media|pipeline)\b", lowered)
+    )
+    if media_context and re.search(r"\bflux\b", lowered):
+        routed = re.sub(r"\bflux\b", "Plex", routed, flags=re.I)
+        if "Plex" not in entities:
+            entities.append("Plex")
+        confidence["Plex"] = "medium"
+    if media_context and re.search(r"\bplaques?\b", lowered):
+        routed = re.sub(r"\bplaques?\b", "Plex", routed, flags=re.I)
+        if "Plex" not in entities:
+            entities.append("Plex")
+        confidence["Plex"] = "medium"
+    return {"text": routed, "entities": entities, "confidence": confidence}
+
+
+def is_repair_turn(text: str) -> bool:
+    if re.search(r"\b(restart|reboot|reload|turn|dim|set|add|remove|delete|clear)\b", text, re.I):
+        return False
+    return bool(re.search(
+        r"\b(?:i\s+meant|mean[t]?|sorry[,.]?\s+i\s+meant|actually|no[,.]?\s+(?:i\s+)?meant|not\s+[^,.!?]+,\s*\w+)\b",
+        text, re.I,
+    ))
+
+
+def repair_route_text(text: str, prior: dict) -> str:
+    """Patch the previous canonical request instead of creating a new intent."""
+    previous = str(prior.get("last_route_text") or prior.get("resolved_request", {}).get("route_query") or "")
+    if not previous or not is_repair_turn(text):
+        return text
+    resolved = contextual_entity_resolution(text, prior)
+    corrected_entities = resolved["entities"]
+    if prior.get("domain") == "weather":
+        match = re.search(r"\b(?:meant|mean|actually)\s+(?:the\s+)?(.+?)(?:[.!?]|$)", text, re.I)
+        location = (match.group(1).strip() if match else "").strip(" ,")
+        if location:
+            offset = " tomorrow" if re.search(r"\btomorrow\b", previous, re.I) else ""
+            return f"weather in {location}{offset}"
+    if corrected_entities:
+        patched = previous
+        for entity in corrected_entities:
+            if entity.casefold() not in patched.casefold():
+                patched = f"{patched} {entity}"
+        return patched
+    return previous
 
 
 def weather_location_from_text(text: str) -> str | None:
@@ -649,10 +728,17 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
 def turn_context(client_id: str, text: str) -> dict:
     """Apply explicit current-turn topic/entity state before discovery or tool execution."""
     prior = dict(conversation_context.get(client_id, {}))
+    repair = is_repair_turn(text) and bool(prior.get("last_route_text"))
     current = dict(prior)
     lowered = text.casefold()
     domain = explicit_domain(text, prior)
-    if domain == "weather":
+    # A correction without a new action is a patch to the immediately preceding
+    # resolved request. Do not let the corrected service name create a new intent.
+    if repair and not re.search(r"\b(?:weather|news|camera|front door|gpu|storage|download|restart|turn|dim)\b", lowered):
+        current = dict(prior)
+        current["repair"] = True
+        current["repair_text"] = text
+    elif domain == "weather":
         location = weather_location_from_text(text) or prior.get("location", "")
         current = {"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": location}
     elif domain == "web_research":
@@ -667,6 +753,8 @@ def turn_context(client_id: str, text: str) -> dict:
         current = {"domain": "general", "kind": "general", "group": "general", "tools": []}
     elif re.search(r"\b(what about|how about|tomorrow|there|they|them|that|it|look|wear|wearing|snapshot|describe)\b", lowered):
         current = prior
+    if repair:
+        current["repair"] = True
     conversation_context[client_id] = current
     return current
 
@@ -879,6 +967,7 @@ def evidence_message(results: list[dict]) -> list[dict]:
 
 
 def store_provenance(client_id: str, results: list[dict]) -> None:
+    prior_state = dict(conversation_context.get(client_id, {}))
     successful = [item for item in results if item.get("status") == "ok"]
     if successful:
         last = successful[-1]
@@ -887,13 +976,13 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         if last.get("tool", "").startswith("frigate"):
             events = result.get("events") or []
             camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
-            conversation_context[client_id] = {"kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None}
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
-            conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
+            conversation_context[client_id] = {**prior_state, "domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
-            conversation_context[client_id] = {"kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
+            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
-            conversation_context[client_id] = {"kind": "web_research", "group": "internet", "tools": tool_names}
+            conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         if result.get("sources_checked") or result.get("investigation"):
@@ -1004,11 +1093,21 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             return
         messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
         context = turn_context(client_id, user_text)
-        route_text = resolved_followup_text(client_id, user_text)
+        contextual = contextual_entity_resolution(user_text, context)
+        context["canonical_entities"] = contextual["entities"]
+        context["entity_confidence"] = contextual["confidence"]
+        route_text = repair_route_text(user_text, context)
+        route_text = resolved_followup_text(client_id, route_text)
+        route_text = contextual_entity_resolution(route_text, context)["text"]
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
         planned = preflight_plan(route_text)
+        context["last_route_text"] = route_text
+        context["last_user_text"] = user_text
+        context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
+        context["resolved_request"] = resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)
+        discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         for name, planned_args in planned:
             args = planned_args
@@ -1234,12 +1333,14 @@ async def websocket(ws: WebSocket):
             elif typ == "audio_end":
                 if not audio:
                     continue
+                speech_end = time.perf_counter()
+                discovery_audit({"event": "pipeline_stage", "client_id": client_id, "request_id": request_id, "stage": "speech_end", "monotonic": speech_end})
                 await ws.send_json({"type": "state", "state": "transcribing", "request_id": request_id})
                 try:
                     raw_audio_bytes = len(audio)
                     text = await transcribe(bytes(audio))
                     normalized_text = text.strip() if text else ""
-                    discovery_audit({"event": "stt", "client_id": client_id, "request_id": request_id, "raw_audio_bytes": raw_audio_bytes, "transcript": text or "", "normalized_transcript": normalized_text})
+                    discovery_audit({"event": "stt", "client_id": client_id, "request_id": request_id, "raw_audio_bytes": raw_audio_bytes, "transcript": text or "", "normalized_transcript": normalized_text, "duration_ms": round((time.perf_counter() - speech_end) * 1000, 2)})
                     text = normalized_text
                     if text:
                         old = active.pop(client_id, None)
