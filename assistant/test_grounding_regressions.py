@@ -170,6 +170,7 @@ def test_contextual_flux_resolution_is_not_global():
     assert contextual_entity_resolution("What causes dental plaques?")["text"] == "What causes dental plaques?"
     resolved = contextual_entity_resolution("What's new on flux?", {"domain": "media"})
     assert "Plex" in resolved["text"]
+    assert "Lidarr" in routing_aliases("Anything in litter eventually going to Plex?")
 
 
 def test_lists_use_bounded_deterministic_tools():

@@ -473,6 +473,8 @@ def unavailable_live_answer(text: str) -> str:
         return "I can't verify the current weather right now because no live weather result was available."
     if re.search(r"\b(lidarr|lidar)\b", text, re.I):
         return "I couldn't verify Lidarr's current status because its live status check was unavailable."
+    if re.search(r"\b(litter|plex|plexium|music|album|artist|media|download|downloads?)\b", text, re.I):
+        return "I couldn't verify the current media pipeline because its live results were unavailable."
     if current_external_question(text):
         return "I couldn't verify the current external information because live web research was unavailable."
     if re.search(r"\b(news|headline|technology|tech|ai|artificial intelligence|canada|canadian)\b", text, re.I):
@@ -596,7 +598,7 @@ def routing_aliases(text: str) -> str:
         text = re.sub(r"\bplexium\b", "Plex", text, flags=re.I)
     # Whisper occasionally renders Lidarr as "litter".  Accept it only when
     # unmistakably surrounded by the local media/Plex domain.
-    if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist)\b", text, re.I):
+    if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist|going\s+to|end\s+up|eventually|headed|added)\b", text, re.I):
         text = re.sub(r"\blitter\b", "Lidarr", text, flags=re.I)
     return text
 
