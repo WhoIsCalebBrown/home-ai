@@ -687,7 +687,8 @@ async def arr_queue(service: str, _: dict[str, Any]) -> dict[str, Any]:
 async def sonarr_search(args):
     rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": args["query"]})
     return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"),
-                          "seriesType": x.get("seriesType"), "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
+                          "seriesType": x.get("seriesType"), "genres": x.get("genres") or [],
+                          "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
 
 
 async def radarr_search(args):
@@ -1355,13 +1356,15 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         # heuristic (e.g. "Dragon Ball Z Kai" is anime even when the user does
         # not say the word "anime"). This selects the policy for a new item;
         # existing managed series retain their current profile.
-        if identity and str(identity.get("seriesType") or "").casefold() == "anime":
+        if identity and (str(identity.get("seriesType") or "").casefold() == "anime"
+                         or any(str(genre).casefold() == "anime" for genre in (identity.get("genres") or []))):
             kind = "anime"
             parts["media_type"] = "anime"
         plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
         if identity:
             plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"),
-                                           "tvdb_id": identity.get("tvdbId"), "series_type": identity.get("seriesType")}
+                                           "tvdb_id": identity.get("tvdbId"), "series_type": identity.get("seriesType"),
+                                           "genres": identity.get("genres") or []}
         plan["ambiguous"] = ambiguous
         if identity:
             plan["providers"]["plex"] = await plex_library_lookup({"query": identity.get("title", title), "library": "TV Shows"})
