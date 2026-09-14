@@ -646,7 +646,11 @@ def investigation_query_from_speech(text: str) -> str:
 
 
 def is_confirmation(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*(yes|yeah|yep|confirm|confirmed|do it|go ahead|proceed)\s*[.!]?\s*", text, re.I))
+    return bool(re.fullmatch(
+        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed))?|do it|go ahead|go for it|proceed)\s*[.!]?\s*",
+        text,
+        re.I,
+    ))
 
 
 def visible_model_text(text: str) -> str:
