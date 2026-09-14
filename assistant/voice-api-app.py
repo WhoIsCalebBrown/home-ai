@@ -637,9 +637,9 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
                 key = "stopped" if status_filter == "exited" else status_filter
                 expected = int(summary.get(key, result.get("count", 0)))
                 label = "stopped" if status_filter == "exited" else status_filter
-                return f"Your server currently has {expected} containers {label}."
+                return f"You've got {expected} containers {label}."
             expected = int(summary.get("total", result.get("count", 0)))
-            return f"Your server currently has {expected} containers in total, including {summary.get('running', 0)} running."
+            return f"You've got {expected} containers in total, including {summary.get('running', 0)} running."
     if any(item.get("tool") == "get_storage_status" and item.get("status") == "ok" for item in results):
         result = next(item.get("result", {}) for item in results if item.get("tool") == "get_storage_status")
         user_share = result.get("user_share", {})

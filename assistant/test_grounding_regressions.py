@@ -132,7 +132,7 @@ def test_container_summary_is_status_specific():
         }}],
         "server",
     )
-    assert answer == "Your server currently has 49 containers running."
+    assert answer == "You've got 49 containers running."
 
 
 def test_media_aliases_are_routing_only():
