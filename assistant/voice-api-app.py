@@ -34,6 +34,7 @@ CHATTERBOX_URL = os.getenv("CHATTERBOX_URL", "http://Chatterbox-Turbo:8088")
 CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", f"{CHATTERBOX_URL}/v1/audio/speech")
 CHATTERBOX_TIMEOUT = float(os.getenv("CHATTERBOX_TIMEOUT", "30"))
 MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
+LLM_CONTEXT = int(os.getenv("LLM_CONTEXT", "4096"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
 SAMPLES_DIR = Path(os.getenv("TTS_SAMPLES_DIR", "/app/tts-tests/kokoro-comparison")).resolve()
@@ -690,7 +691,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
     try:
         async with httpx.AsyncClient(timeout=None) as http:
             payload = {"model": MODEL, "messages": messages, "stream": True, "think": False,
-                       "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": 4096, "num_predict": 128}}
+                       "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
             async with http.stream("POST", f"{OLLAMA}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -724,7 +725,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
 async def generate_final(messages: list[dict]) -> str:
     async with httpx.AsyncClient(timeout=None) as http:
         payload = {"model": MODEL, "messages": messages, "stream": False, "think": False,
-                   "keep_alive": "10m", "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 160}}
+                   "keep_alive": "10m", "options": {"temperature": 0.1, "num_ctx": LLM_CONTEXT, "num_predict": 160}}
         response = await http.post(f"{OLLAMA}/api/chat", json=payload)
         response.raise_for_status()
         return visible_model_text(response.json().get("message", {}).get("content", "")).strip()
@@ -939,7 +940,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         for _ in range(4):
             async with httpx.AsyncClient(timeout=None) as http:
                 payload = {"model": MODEL, "messages": messages, "tools": tools, "stream": False, "think": False,
-                           "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": 4096, "num_predict": 128}}
+                           "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
                 response = await http.post(f"{OLLAMA}/api/chat", json=payload)
                 response.raise_for_status()
                 message = response.json().get("message", {})
