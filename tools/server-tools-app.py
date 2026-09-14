@@ -1127,7 +1127,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     title = re.sub(r"^\s*(?:get|find|add|request|do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     if kind in {"movie", "tv", "anime"}:
-        title = re.sub(r"\b(?:the )?(?:original )?(?:animated )?(?:version|movie|film|series|show)\b", " ", title, flags=re.I)
+        title = re.sub(r"\b(?:the|original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
             "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect"}
@@ -1142,7 +1142,21 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
               and (not artist_cf or artist_cf in json.dumps(m).casefold())]
     if len(exact) == 1:
         return exact[0], False
-    return (matches[0] if len(matches) == 1 else None), len(matches) > 1
+    wanted = set(re.findall(r"[a-z0-9]+", title_cf))
+    scored = []
+    for row in matches:
+        candidate = str(row.get("title") or row.get("artistName") or "").casefold()
+        tokens = set(re.findall(r"[a-z0-9]+", candidate))
+        score = len(wanted & tokens) / max(len(wanted), 1)
+        if artist_cf and artist_cf in json.dumps(row).casefold():
+            score += 1.0
+        scored.append((score, row))
+    scored.sort(key=lambda pair: -pair[0])
+    if len(scored) == 1:
+        return scored[0][1], False
+    # A strong top match is safe; a close tie remains a clarification case.
+    margin = scored[0][0] - scored[1][0]
+    return (scored[0][1], False) if scored[0][0] >= 0.75 and margin >= 0.25 else (None, True)
 
 
 async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
