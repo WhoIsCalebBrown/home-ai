@@ -690,6 +690,7 @@ async def arr_queue(service: str, _: dict[str, Any]) -> dict[str, Any]:
 async def sonarr_search(args):
     rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": args["query"]})
     return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"),
+                          "tmdbId": x.get("tmdbId"),
                           "seriesType": x.get("seriesType"), "genres": x.get("genres") or [],
                           "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
 
@@ -1379,7 +1380,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
         if identity:
             plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"),
-                                           "tvdb_id": identity.get("tvdbId"), "series_type": identity.get("seriesType"),
+                                           "tvdb_id": identity.get("tvdbId"), "tmdb_id": identity.get("tmdbId"), "series_type": identity.get("seriesType"),
                                            "genres": identity.get("genres") or []}
         plan["ambiguous"] = ambiguous
         if identity:
@@ -1396,7 +1397,8 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         plan["ambiguous"] = True
     identity = plan.get("canonical_identity") or {}
     plex_matches = (plan.get("providers", {}).get("plex_music") or plan.get("providers", {}).get("plex") or {}).get("matches", [])
-    if identity and any(str(m.get("title", "")).casefold() == str(identity.get("title", "")).casefold() for m in plex_matches):
+    has_requested_scope = bool(parts.get("season_scope") or parts.get("episode_scope"))
+    if identity and not has_requested_scope and any(str(m.get("title", "")).casefold() == str(identity.get("title", "")).casefold() for m in plex_matches):
         plan["current_state"] = "AVAILABLE_IN_PLEX"
     elif plan.get("ambiguous"):
         plan["current_state"] = "AMBIGUOUS_IDENTITY"
