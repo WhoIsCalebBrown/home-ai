@@ -245,6 +245,7 @@ async def transcribe(wav_bytes: bytes) -> str:
 
 async def send_wav(ws: WebSocket, request_id: str, wav: bytes) -> None:
     print(f"TTS_TIMING request={request_id} event=first_audio_sent t={time.time():.6f}", flush=True)
+    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "kokoro_or_buffered", "audio_format": "wav"})
     await ws.send_json({"type": "audio_start", "request_id": request_id})
     await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(wav).decode()})
     await ws.send_json({"type": "audio_end", "request_id": request_id})
@@ -292,10 +293,15 @@ async def stream_pocket(ws: WebSocket, request_id: str, text: str) -> None:
         async with http.stream("POST", POCKET_API_URL.rsplit("/", 1)[0] + "/stream", json={"input": text}) as response:
             response.raise_for_status()
             await ws.send_json({"type": "audio_start", "request_id": request_id})
+            first_chunk = True
             async for line in response.aiter_lines():
                 if not line:
                     continue
-                await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": json.loads(line)["audio"], "streaming": True})
+                payload = json.loads(line)
+                if first_chunk:
+                    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav"})
+                    first_chunk = False
+                await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": payload["audio"], "streaming": True})
             await ws.send_json({"type": "audio_end", "request_id": request_id})
 
 
@@ -386,6 +392,14 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
     if not prepared:
         text = await prepare_tts_text(request_id, text)
     primary = TTS_PROVIDER
+    discovery_audit({
+        "event": "tts_start",
+        "request_id": request_id,
+        "tts_provider_requested": primary,
+        "tts_provider_used": primary,
+        "tts_voice": "persisted_reference_state" if primary == "pocket" else (KOKORO_VOICE if primary == "kokoro" else None),
+        "fallback": False,
+    })
     async with tts_lock:
         try:
             tts_started = time.perf_counter()
@@ -409,6 +423,7 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
             if primary == TTS_FALLBACK_PROVIDER:
                 raise
             print(f"TTS fallback: provider={primary} fallback={TTS_FALLBACK_PROVIDER} error={type(exc).__name__}", flush=True)
+            discovery_audit({"event": "tts_fallback", "request_id": request_id, "tts_provider_requested": primary, "tts_provider_used": TTS_FALLBACK_PROVIDER, "tts_fallback_reason": type(exc).__name__})
             try:
                 if TTS_FALLBACK_PROVIDER == "kokoro":
                     wav = await synthesize_kokoro(text)
@@ -669,6 +684,46 @@ def grounded_camera_presence_answer(result: dict) -> str:
             when = f"about {round(age / 60)} minutes ago"
         return f"Yeah, someone was at the front door {when}, but they aren't there now."
     return "Someone was detected at the front door, but I can't tell if they're still there right now."
+
+
+def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
+    """Answer narrow, high-confidence single-source reads without a second LLM pass."""
+    successful = [item for item in live_results if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
+    if len(successful) != 1:
+        return None
+    item = successful[0]
+    tool = item.get("tool")
+    result = item["result"]
+    if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
+        offset = int(result.get("days_from_now") or 0)
+        unit = result.get("temperature_unit", "C")
+        suffix = "degrees Celsius" if unit == "C" else "degrees Fahrenheit"
+        if offset == 0 and result.get("current", {}).get("temperature_2m") is not None:
+            temperature = round(float(result["current"]["temperature_2m"]))
+            code = result.get("current", {}).get("weather_code")
+            condition = {0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "cloudy", 45: "foggy", 51: "light rain", 61: "rainy", 71: "snowy", 80: "showers"}.get(code)
+            place = result["location"].get("name") or result.get("resolved_location", "there")
+            return f"It's about {temperature} {suffix} in {place}" + (f" with {condition}." if condition else ".")
+        day = result.get("day", {})
+        high = day.get("temperature_2m_max")
+        low = day.get("temperature_2m_min")
+        place = result["location"].get("name") or result.get("resolved_location", "there")
+        when = "tomorrow" if offset == 1 else f"in {offset} days"
+        parts = []
+        if high is not None:
+            parts.append(f"a high around {round(float(high))} {suffix}")
+        if low is not None:
+            parts.append(f"a low around {round(float(low))} {suffix}")
+        return f"{when.capitalize()} in {place}, expect " + " and ".join(parts) + "." if parts else None
+    if tool == "plex_recently_added":
+        item_data = (result.get("items") or [None])[0]
+        if item_data and item_data.get("title"):
+            return f"The last thing added to Plex was {item_data['title']}."
+    if tool == "lidarr_missing_tracks":
+        count = result.get("count")
+        if count is not None:
+            return "Lidarr isn't looking for anything right now." if int(count) == 0 else f"Lidarr is currently looking for {int(count)} albums."
+    return None
 
 
 async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str | None = None, origin: str = "assistant") -> None:
@@ -1402,6 +1457,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        direct = direct_structured_answer(user_text, live_results)
+        if direct:
+            store_provenance(client_id, live_results)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_structured")
+            history.append({"role": "assistant", "content": direct})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         for result in live_results:
             if result.get("status") == "confirmation_required":
                 requested = next((args for name, args in planned if name == result.get("tool")), {})
@@ -1592,6 +1655,7 @@ async def websocket(ws: WebSocket):
                 audio.clear()
             elif typ == "playback_start":
                 print(f"TTS_TIMING request={data.get('request_id', request_id)} event=browser_playback_start t={time.time():.6f}", flush=True)
+                discovery_audit({"event": "browser_playback_start", "request_id": data.get("request_id", request_id), "timestamp": time.time()})
     except (WebSocketDisconnect, RuntimeError):
         old = active.pop(client_id, None)
         if old:

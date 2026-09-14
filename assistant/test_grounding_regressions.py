@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -37,6 +37,7 @@ rephrase_intent = namespace["rephrase_intent"]
 repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
 complete_speakable_sentence = namespace["complete_speakable_sentence"]
+direct_structured_answer = namespace["direct_structured_answer"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -97,6 +98,13 @@ def test_temperature_outside_routes_to_weather():
 
 def test_home_weather_can_use_configured_default():
     assert preflight_plan("What's the weather?") == [("weather_forecast", {"location": None, "days_from_now": 0})]
+
+
+def test_simple_structured_reads_bypass_synthesis_pass():
+    weather = {"source": "Open-Meteo", "days_from_now": 0, "temperature_unit": "C",
+               "location": {"name": "Welland"}, "current": {"temperature_2m": 20, "weather_code": 0}}
+    assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) == "It's about 20 degrees Celsius in Welland with clear skies."
+    assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
 
 
 def test_external_blackhawk_topic_overrides_camera_context():
