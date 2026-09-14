@@ -30,6 +30,7 @@ TOWER = os.getenv("TOWER_URL", "http://192.168.40.44")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
+LISTS_PATH = Path(os.getenv("LISTS_PATH", "/config/home-ai-lists.json"))
 PROTECTED = {x.strip().lower() for x in os.getenv(
     "PROTECTED_CONTAINERS",
     "voice-api,voice-ollama,voice-whisper,voice-kokoro,voice-piper,Nginx-Proxy-Manager-Official,adguardhome,cloudflare-tunnel,mariadb,postgres,redis"
@@ -775,6 +776,66 @@ async def overseerr_recent_requests(_: dict[str, Any]) -> dict[str, Any]:
     return {"count": len(rows), "requests": rows}
 
 
+def load_lists() -> dict[str, list[dict[str, Any]]]:
+    try:
+        data = json.loads(LISTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_lists(data: dict[str, list[dict[str, Any]]]) -> None:
+    LISTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = LISTS_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(LISTS_PATH)
+
+
+async def list_items(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("list", "grocery")).strip().casefold() or "grocery"
+    items = load_lists().get(name, [])
+    return {"list": name, "items": items, "count": len([item for item in items if not item.get("completed")])}
+
+
+async def add_list_items(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("list", "grocery")).strip().casefold() or "grocery"
+    values = args.get("items") or ([args.get("item")] if args.get("item") else [])
+    data = load_lists()
+    current = data.setdefault(name, [])
+    added = []
+    for value in values:
+        text = str(value).strip()
+        if text and not any(item.get("text", "").casefold() == text.casefold() and not item.get("completed") for item in current):
+            entry = {"text": text, "completed": False, "created_at": now()}
+            current.append(entry)
+            added.append(entry)
+    save_lists(data)
+    audit({**AUDIT_CONTEXT.get(), "tool": "list_add", "permission": "write_low", "status": "ok", "arguments": safe_args(args), "result_summary": {"list": name, "added": added}})
+    return {"list": name, "added": added, "items": current}
+
+
+async def remove_list_items(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("list", "grocery")).strip().casefold() or "grocery"
+    query = str(args.get("item", "")).strip().casefold()
+    data = load_lists()
+    current = data.setdefault(name, [])
+    removed = [item for item in current if query and query in item.get("text", "").casefold()]
+    data[name] = [item for item in current if item not in removed]
+    save_lists(data)
+    audit({**AUDIT_CONTEXT.get(), "tool": "list_remove", "permission": "write_low", "status": "ok", "arguments": safe_args(args), "result_summary": {"list": name, "removed": removed}})
+    return {"list": name, "removed": removed, "items": data[name]}
+
+
+async def clear_completed_list_items(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("list", "grocery")).strip().casefold() or "grocery"
+    data = load_lists()
+    current = data.setdefault(name, [])
+    removed = [item for item in current if item.get("completed")]
+    data[name] = [item for item in current if not item.get("completed")]
+    save_lists(data)
+    return {"list": name, "removed": removed, "items": data[name]}
+
+
 async def investigate_downloads(_: dict[str, Any]) -> dict[str, Any]:
     result = {}
     calls = [("qbittorrent", qbittorrent_summary), ("sonarr", lambda a: arr_queue("sonarr", a)), ("radarr", lambda a: arr_queue("radarr", a)), ("lidarr", lambda a: arr_queue("lidarr", a)), ("slskd", slskd_downloads), ("torbox", torbox_status)]
@@ -923,6 +984,10 @@ REGISTRY = [
     ("unit_convert", "Convert supported storage and temperature units deterministically.", "read", "utility", {"value": {"type": "number", "required": True}, "from_unit": {"type": "string", "required": True}, "to_unit": {"type": "string", "required": True}}, unit_convert),
     ("current_datetime", "Get the current date and time for a named IANA timezone.", "read", "utility", {"timezone": {"type": "string"}}, current_datetime),
     ("wikipedia_search", "Search Wikipedia for factual reference pages.", "read", "knowledge", {"query": {"type": "string", "required": True}}, wikipedia_search),
+    ("list_items", "Read a persistent personal list.", "read", "lists", {"list": {"type": "string"}}, list_items),
+    ("add_list_items", "Add one or more items to a persistent personal list.", "write_low", "lists", {"list": {"type": "string"}, "item": {"type": "string"}, "items": {"type": "array"}}, add_list_items),
+    ("remove_list_item", "Remove matching items from a persistent personal list.", "write_low", "lists", {"list": {"type": "string"}, "item": {"type": "string", "required": True}}, remove_list_items),
+    ("clear_completed_list_items", "Clear completed items from a persistent personal list.", "write_low", "lists", {"list": {"type": "string"}}, clear_completed_list_items),
     ("investigate_downloads", "Correlate qBittorrent, Sonarr, Radarr, Lidarr, Slskd, and Torbox download state.", "read", "media_pipeline", {}, investigate_downloads),
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
@@ -939,6 +1004,7 @@ GROUP_SERVICES = {
     "requests": {"overseerr"},
     "internet": {"internet", "weather", "knowledge"},
     "utilities": {"utility"},
+    "lists": {"lists"},
 }
 
 CAPABILITY_METADATA = {
@@ -955,6 +1021,10 @@ CAPABILITY_METADATA = {
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
     "wikipedia_search": {"aliases": ["wikipedia", "factual lookup", "encyclopedia"], "examples": ["look up this topic on Wikipedia"], "freshness": "reference"},
+    "list_items": {"aliases": ["list", "grocery list", "packing list", "to do"], "examples": ["what's on my grocery list"], "group": "lists", "freshness": "current"},
+    "add_list_items": {"aliases": ["add to list", "grocery list", "packing list"], "examples": ["put milk on my grocery list"], "group": "lists", "freshness": "current"},
+    "remove_list_item": {"aliases": ["remove from list", "take off list"], "examples": ["remove milk from my grocery list"], "group": "lists", "freshness": "current"},
+    "clear_completed_list_items": {"aliases": ["clear completed", "clean up list"], "examples": ["clear completed items"], "group": "lists", "freshness": "current"},
     "web_search": {"aliases": ["internet", "search online", "news", "documentation"], "examples": ["search the web for current release notes"], "freshness": "current", "untrusted": True},
     "web_fetch": {"aliases": ["open webpage", "read page"], "examples": ["fetch the official documentation"], "freshness": "current", "untrusted": True},
 }
@@ -964,7 +1034,7 @@ def capability_record(item):
     name, desc, permission, service, _, _ = item
     meta = CAPABILITY_METADATA.get(name, {})
     words = [name.replace("_", " "), desc, service, meta.get("group", service), *meta.get("aliases", []), *meta.get("examples", [])]
-    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission != "read", "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "search_text": " ".join(words)}}
+    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission in {"confirm", "destructive"}, "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "search_text": " ".join(words)}}
 
 def _search_tokens(value: str) -> set[str]:
     stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can"}
@@ -1048,7 +1118,7 @@ async def invoke(req: Invoke):
     if not item:
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
-    if permission != "read" and not req.confirmed:
+    if permission in {"confirm", "destructive"} and not req.confirmed:
         action_id = str(uuid.uuid4())
         audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": "confirmation_required", "action_id": action_id})
         return {"tool": req.name, "service": service, "permission": permission, "status": "confirmation_required", "action_id": action_id, "result": {"message": "This action requires explicit confirmation before execution."}}

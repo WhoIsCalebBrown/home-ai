@@ -167,6 +167,12 @@ def test_contextual_flux_resolution_is_not_global():
     assert "Plex" in resolved["text"]
 
 
+def test_lists_use_bounded_deterministic_tools():
+    assert preflight_plan("Put milk on my grocery list") == [("add_list_items", {"list": "grocery", "item": "milk"})]
+    assert preflight_plan("What's on my grocery list?") == [("list_items", {"list": "grocery"})]
+    assert preflight_plan("Remove milk from my grocery list") == [("remove_list_item", {"list": "grocery", "item": "milk"})]
+
+
 def test_social_acknowledgement_does_not_inherit_tools():
     assert social_acknowledgement("Thank you.")
     conversation_context.clear()

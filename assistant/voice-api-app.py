@@ -424,6 +424,8 @@ async def capability_summary() -> str:
         groups.append("download and media-pipeline investigations")
     if names & {"frigate_stats", "frigate_recent_events", "frigate_snapshot"}:
         groups.append("camera status and Frigate events")
+    if names & {"list_items", "add_list_items", "remove_list_item"}:
+        groups.append("persistent personal lists")
     if names & {"web_search", "web_fetch"}:
         groups.append("public web search and webpage fetching")
     if "restart_container" in names:
@@ -782,6 +784,16 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    list_match = re.search(r"\b(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
+    list_name = (list_match.group(0).rsplit(" ", 1)[0].casefold() if list_match else "grocery")
+    if re.search(r"\b(?:what(?:'s| is)|show|read)\b.*\blist\b", text, re.I):
+        return [("list_items", {"list": list_name})]
+    add_match = re.search(r"\b(?:add|put|include)\s+(.+?)\s+(?:on|to|onto)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
+    if add_match:
+        return [("add_list_items", {"list": list_name, "item": add_match.group(1).strip(" .?!")})]
+    remove_match = re.search(r"\b(?:remove|take)\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
+    if remove_match:
+        return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
