@@ -1130,7 +1130,11 @@ def evidence_message(results: list[dict]) -> list[dict]:
 
 def store_provenance(client_id: str, results: list[dict]) -> None:
     prior_state = dict(conversation_context.get(client_id, {}))
-    successful = [item for item in results if item.get("status") == "ok"]
+    successful = [
+        item for item in results
+        if item.get("status") == "ok"
+        and not (isinstance(item.get("result"), dict) and item["result"].get("ok") is False)
+    ]
     if results:
         conversation_context.setdefault(client_id, {})["latest_tool_result"] = {
             "tools": [item.get("tool") for item in results],
@@ -1199,7 +1203,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         location = candidate or (context.get("location") or "")
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
-    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(that|the|last|detection|event|image|snapshot|describe|show|look)\b", lowered):
+    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour)\b", lowered):
         return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
         explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
@@ -1214,7 +1218,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"how many containers are {lowered}"
     if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):
         return "what movies are currently being acquired, queued, downloaded, or imported"
-    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(that|the|last|detection|event|image|snapshot|describe|show|look)\b", lowered):
+    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour)\b", lowered):
         return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     return text
 

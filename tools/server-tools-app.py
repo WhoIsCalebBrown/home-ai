@@ -660,7 +660,9 @@ async def frigate_snapshot(args: dict[str, Any]) -> dict[str, Any]:
 
 async def frigate_event_snapshot(args: dict[str, Any]) -> dict[str, Any]:
     event_id = str(args.get("event_id", "")).strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", event_id):
+    # Frigate event IDs commonly contain a fractional timestamp, e.g.
+    # 1789405759.934032-ppqizx. Keep this bounded to identifier characters.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", event_id):
         return {"ok": False, "error": "event_id is required"}
     image, content_type = await service_bytes("frigate", f"/api/events/{event_id}/snapshot.jpg")
     if content_type not in {"image/jpeg", "image/png"}:
