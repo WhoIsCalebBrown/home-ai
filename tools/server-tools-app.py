@@ -1424,7 +1424,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                     "monitored": True,
                     "addOptions": {"searchForMissingEpisodes": False, "searchForCutoffUnmetEpisodes": False}}},
                 {"operation": "POST /api/v3/command", "arguments": {
-                    "name": "SeriesSearch", "seriesId": ["newly-created-sonarr-series-id"]}},
+                    "name": "SeriesSearch", "seriesId": "newly-created-sonarr-series-id"}},
             ]
         elif kind == "album":
             plan["bounded_write_plan"] = [
