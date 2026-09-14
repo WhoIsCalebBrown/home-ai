@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -36,6 +36,7 @@ repeat_intent = namespace["repeat_intent"]
 rephrase_intent = namespace["rephrase_intent"]
 repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
+complete_speakable_sentence = namespace["complete_speakable_sentence"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -224,6 +225,14 @@ def test_decimal_spacing_repair_preserves_versions_and_ips():
 def test_weather_rounding_is_spoken_only_and_exact_requests_are_preserved():
     assert round_weather_temperatures("It is 18.9 degrees in Welland.", "What's the weather in Welland?") == "It is 19 degrees in Welland."
     assert round_weather_temperatures("It is 18.9 degrees.", "What's the exact temperature?") == "It is 18.9 degrees."
+
+
+def test_streaming_does_not_split_numeric_periods():
+    assert not complete_speakable_sentence("The temperature is 18.")
+    assert not complete_speakable_sentence("Version 7.3.")
+    assert not complete_speakable_sentence("The host is 192.168.40.44.")
+    assert complete_speakable_sentence("The temperature is 18.9 degrees.")
+    assert complete_speakable_sentence("Tomorrow will be warmer.")
 
 
 if __name__ == "__main__":

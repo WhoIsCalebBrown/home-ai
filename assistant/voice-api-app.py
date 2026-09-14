@@ -120,6 +120,13 @@ def round_weather_temperatures(text: str, user_text: str) -> str:
     return re.sub(r"(-?\d+(?:\.\s*\d+)?)\s*degrees", rounded, repair_decimal_spacing(text), flags=re.I)
 
 
+def complete_speakable_sentence(text: str) -> bool:
+    """Return true only for a sentence boundary, not a numeric decimal point."""
+    if not re.search(r"[.!?](?:['\"])?\s*$", text):
+        return False
+    return not bool(re.search(r"\d\.\s*$", text))
+
+
 @app.on_event("startup")
 async def initialize_speech_frontend() -> None:
     global speech_normalizer, pronunciation_entries, normalization_init_seconds
@@ -1044,7 +1051,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
                     if not full and not sentence:
                         print(f"TTS_TIMING request={request_id} event=first_qwen_token t={time.time():.6f}", flush=True)
                     sentence += token
-                    if re.search(r"[.!?](?:['\"])?\s*$", sentence) and len(sentence.strip()) >= 12:
+                    if complete_speakable_sentence(sentence) and len(sentence.strip()) >= 12:
                         await emit_sentence(sentence)
                         sentence = ""
                     if data.get("done"):
