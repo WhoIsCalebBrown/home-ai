@@ -85,6 +85,32 @@ def test_media_plan_is_read_only_and_idempotent(monkeypatch, tmp_path):
     first = asyncio.run(module.media_plan_goal({"goal": "Get Rodeo by Travis Scott"}))
     second = asyncio.run(module.media_plan_goal({"goal": "Get Rodeo by Travis Scott"}))
     assert first["plan_only"] is True
-    assert first["writes_required"][0]["status"] == "NOT_EXECUTED"
+    assert first["writes_required"][0]["status"] in {"NOT_EXECUTED", "BLOCKED_POLICY"}
     assert first["workflow_id"] == second["workflow_id"]
     assert len(module._media_workflows()) == 1
+
+
+def test_media_policy_is_centralized_and_fails_closed():
+    assert module.MEDIA_POLICY["music"]["root_folder"] == "/data/media/music"
+    assert module.MEDIA_POLICY["music"]["quality_profile_id"] == 2
+    assert module.MEDIA_POLICY["movies"]["quality_profile_id"] is None
+    assert module.MEDIA_POLICY["anime"]["quality_profile_id"] is None
+
+
+def test_media_confirmation_binds_session_plan_and_expiry():
+    from datetime import datetime, timedelta, timezone
+
+    plan = {"canonical_identity": {"media_type": "movie", "title": "The Hobbit", "tmdb_id": 1362}}
+    record = module.media_confirmation_record(
+        workflow_id="wf-hobbit",
+        plan=plan,
+        session_id="session-a",
+        operation="radarr.add_movie",
+        arguments={"tmdb_id": 1362, "quality_profile_id": 11},
+    )
+    assert module.validate_media_confirmation(record, session_id="session-a", current_plan=plan)[0]
+    assert module.validate_media_confirmation(record, session_id="session-b", current_plan=plan)[1] == "SESSION_MISMATCH"
+    changed = {**plan, "canonical_identity": {**plan["canonical_identity"], "tmdb_id": 999}}
+    assert module.validate_media_confirmation(record, session_id="session-a", current_plan=changed)[1] == "PLAN_CHANGED"
+    expired = datetime.now(timezone.utc) + timedelta(minutes=5)
+    assert module.validate_media_confirmation(record, session_id="session-a", current_plan=plan, now_value=expired)[1] == "EXPIRED"

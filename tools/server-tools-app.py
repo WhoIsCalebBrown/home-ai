@@ -3,6 +3,7 @@ import ast
 import base64
 import contextvars
 import html
+import hashlib
 import ipaddress
 import json
 import os
@@ -1090,6 +1091,138 @@ MEDIA_LIFECYCLE = ["UNKNOWN", "IDENTIFIED", "ALREADY_AVAILABLE", "WANTED", "REQU
                    "CANDIDATE_FOUND", "QUEUED", "ACQUIRING", "DOWNLOADED", "PENDING_IMPORT", "IMPORTED",
                    "ENRICHING", "AVAILABLE_IN_PLEX", "FAILED", "BLOCKED", "NOT_FOUND"]
 
+# Central, planner-owned policy.  Provider IDs and paths are never selected by
+# Qwen.  A null policy is intentional: planning must fail closed until the
+# operator chooses a deterministic convention for that media class.
+MEDIA_POLICY = {
+    "music": {
+        "manager": "lidarr",
+        "root_folder": "/data/media/music",
+        "quality_profile_id": 2,
+        "metadata_profile_id": 1,
+        "new_artist_monitor": "none",
+        "target_monitor": "explicit_album_only",
+        "series_type": None,
+    },
+    "movies": {
+        "manager": "radarr",
+        "root_folder": "/data/media/movies",
+        "quality_profile_id": None,
+        "minimum_availability": "released",
+    },
+    "tv": {
+        "manager": "sonarr",
+        "root_folder": "/data/media/tv",
+        "quality_profile_id": 9,
+        "series_type": "standard",
+        "season_folder": False,
+    },
+    "anime": {
+        "manager": "sonarr",
+        "root_folder": "/data/media/anime",
+        "quality_profile_id": None,
+        "series_type": "anime",
+        "season_folder": True,
+    },
+}
+
+
+def media_policy_for(media_type: str) -> dict[str, Any]:
+    """Return a copy so callers cannot mutate the process-wide policy."""
+    key = {"album": "music", "music_artist": "music", "track": "music",
+           "movie": "movies", "series": "tv"}.get(media_type, media_type)
+    return dict(MEDIA_POLICY.get(key, {}))
+
+
+def media_confirmation_record(*, workflow_id: str, plan: dict[str, Any], session_id: str,
+                              operation: str, arguments: dict[str, Any], ttl_seconds: int = 120) -> dict[str, Any]:
+    """Build a confirmation that is bound to one exact media operation."""
+    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    args_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    created = datetime.now(timezone.utc)
+    return {
+        "confirmation_id": str(uuid.uuid4()),
+        "workflow_id": workflow_id,
+        "plan_version_hash": plan_hash,
+        "session_id": session_id,
+        "canonical_media_type": plan.get("canonical_identity", {}).get("media_type"),
+        "canonical_external_id": (plan.get("canonical_identity", {}).get("foreign_album_id")
+                                   or plan.get("canonical_identity", {}).get("tmdb_id")
+                                   or plan.get("canonical_identity", {}).get("tvdb_id")),
+        "title": plan.get("canonical_identity", {}).get("title"),
+        "manager": operation.split(".", 1)[0],
+        "operation": operation,
+        "arguments": arguments,
+        "arguments_hash": args_hash,
+        "created_at": created.isoformat(),
+        "expires_at": (created + timedelta(seconds=ttl_seconds)).isoformat(),
+        "status": "PENDING",
+    }
+
+
+def validate_media_confirmation(record: dict[str, Any], *, session_id: str,
+                                current_plan: dict[str, Any], now_value: datetime | None = None) -> tuple[bool, str]:
+    """Validate identity, session, plan, and expiry without executing anything."""
+    if record.get("status") != "PENDING":
+        return False, "NOT_PENDING"
+    if record.get("session_id") != session_id:
+        return False, "SESSION_MISMATCH"
+    current_hash = hashlib.sha256(json.dumps(current_plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    if record.get("plan_version_hash") != current_hash:
+        return False, "PLAN_CHANGED"
+    current = now_value or datetime.now(timezone.utc)
+    try:
+        expires = datetime.fromisoformat(str(record["expires_at"]))
+    except (KeyError, TypeError, ValueError):
+        return False, "INVALID_EXPIRY"
+    if current >= expires:
+        return False, "EXPIRED"
+    return True, "VALID"
+
+
+async def validate_media_policy(media_type: str) -> dict[str, Any]:
+    """Read-only validation against the live manager configuration."""
+    policy = media_policy_for(media_type)
+    if not policy:
+        return {"valid": False, "reason": "NO_POLICY", "media_type": media_type}
+    manager = policy["manager"]
+    prefix = "api/v1" if manager == "lidarr" else "api/v3"
+    try:
+        root_rows = await arr_get(manager, f"/{prefix}/rootfolder", {})
+    except Exception as exc:
+        return {"valid": False, "reason": "MANAGER_UNAVAILABLE", "media_type": media_type,
+                "manager": manager, "error_type": type(exc).__name__}
+    roots = {row.get("path"): row for row in root_rows if isinstance(row, dict)}
+    if policy.get("root_folder") not in roots:
+        return {"valid": False, "reason": "ROOT_FOLDER_MISSING", "media_type": media_type,
+                "policy": policy, "available_roots": sorted(roots)}
+    profile_id = policy.get("quality_profile_id")
+    if profile_id is None:
+        return {"valid": False, "reason": "PROFILE_POLICY_UNSET", "media_type": media_type,
+                "policy": policy}
+    try:
+        profiles = await arr_get(manager, f"/{prefix}/qualityprofile", {})
+    except Exception as exc:
+        return {"valid": False, "reason": "MANAGER_UNAVAILABLE", "media_type": media_type,
+                "manager": manager, "error_type": type(exc).__name__}
+    profile = next((row for row in profiles if row.get("id") == profile_id), None)
+    if profile is None:
+        return {"valid": False, "reason": "QUALITY_PROFILE_MISSING", "media_type": media_type,
+                "policy": policy, "available_profiles": [row.get("id") for row in profiles]}
+    if manager == "lidarr":
+        try:
+            metadata = await arr_get(manager, "/api/v1/metadataprofile", {})
+        except Exception as exc:
+            return {"valid": False, "reason": "MANAGER_UNAVAILABLE", "media_type": media_type,
+                    "manager": manager, "error_type": type(exc).__name__}
+        if not any(row.get("id") == policy.get("metadata_profile_id") for row in metadata):
+            return {"valid": False, "reason": "METADATA_PROFILE_MISSING", "media_type": media_type,
+                    "policy": policy}
+    return {"valid": True, "media_type": media_type, "policy": policy,
+            "profile": {"id": profile.get("id"), "name": profile.get("name")},
+            "root_folder": roots[policy["root_folder"]].get("path")}
+
 
 def _media_workflows() -> list[dict[str, Any]]:
     try:
@@ -1250,7 +1383,16 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                 plan["writes_required"] = [{"owner": owner, "capability": "media.request", "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
                 plan["confirmation_required"] = True
     if plan.get("writes_required"):
-        plan["steps"].append({"capability": "media.request", "owner": plan["writes_required"][0]["owner"], "reason": "item is identified but not yet managed; execution is disabled in plan mode"})
+        policy_type = "music" if kind == "album" else "movies" if kind == "movie" else kind
+        policy_status = await validate_media_policy(policy_type)
+        plan["policy"] = policy_status
+        if not policy_status.get("valid"):
+            plan["writes_required"][0]["status"] = "BLOCKED_POLICY"
+            plan["confirmation_required"] = False
+            plan["blocked_reason"] = policy_status.get("reason")
+        plan["steps"].append({"capability": "media.request", "owner": plan["writes_required"][0]["owner"],
+                               "reason": "item is identified but not yet managed; execution is disabled in plan mode",
+                               "policy_status": policy_status.get("reason", "VALID")})
     plan["lifecycle_states"] = MEDIA_LIFECYCLE
     plan["recommended_workflow"] = " / ".join(step["capability"] for step in plan["steps"])
     rows = _media_workflows()
@@ -1270,6 +1412,13 @@ async def media_get_workflow(args: dict[str, Any]) -> dict[str, Any]:
     workflow_id = str(args.get("workflow_id", ""))
     row = next((item for item in _media_workflows() if item.get("workflow_id") == workflow_id), None)
     return {"found": bool(row), "workflow": row}
+
+
+async def media_policy_status(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only policy/config validation; never changes a manager."""
+    requested = str(args.get("media_type", "all")).casefold()
+    types = [requested] if requested != "all" else ["music", "movies", "tv", "anime"]
+    return {"policies": [await validate_media_policy(media_type) for media_type in types]}
 
 
 REGISTRY = [
@@ -1334,6 +1483,7 @@ REGISTRY = [
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
     ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
+    ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
