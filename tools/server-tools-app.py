@@ -1078,6 +1078,8 @@ MEDIA_CAPABILITY_REGISTRY = {
                "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.request", "media.import.read"}, "risk": "CONFIRMATION_REQUIRED"},
     "sonarr": {"owner": "sonarr", "media_types": ["tv", "anime"],
                "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.request", "media.import.read"}, "risk": "CONFIRMATION_REQUIRED"},
+    "cli_debrid": {"owner": "cli_debrid", "media_types": ["movie", "tv", "anime"],
+                   "capabilities": {"media.request", "media.search", "media.acquire", "media.queue.read", "media.verify"}, "risk": "CONFIRMATION_REQUIRED"},
     "lidarr": {"owner": "lidarr", "media_types": ["music_artist", "album", "track"],
                 "capabilities": {"media.identify", "media.wanted.read", "media.queue.read", "media.import.read", "media.request"}, "risk": "CONFIRMATION_REQUIRED"},
     "torbox-client": {"owner": "torbox-client", "media_types": ["movie", "tv", "anime", "album"],
