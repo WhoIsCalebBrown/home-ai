@@ -762,7 +762,7 @@ async def arr_missing(service: str, _: dict[str, Any]) -> dict[str, Any]:
     path = {"sonarr": "/api/v3/wanted/missing", "radarr": "/api/v3/wanted/missing", "lidarr": "/api/v1/wanted/missing"}[service]
     data = await arr_get(service, path, {"page": 1, "pageSize": 50})
     records = data.get("records", []) if isinstance(data, dict) else []
-    return {"service": service, "count": data.get("totalRecords", len(records)), "items": [{"id": x.get("id"), "album_id": x.get("albumId"), "title": x.get("title"), "series": x.get("series", {}).get("title") if isinstance(x.get("series"), dict) else None, "artist": x.get("artist", {}).get("artistName") if isinstance(x.get("artist"), dict) else None, "season": x.get("seasonNumber"), "episode": x.get("episodeNumber")} for x in records[:50]]}
+    return {"service": service, "count": data.get("totalRecords", len(records)), "items": [{"id": x.get("id"), "album_id": x.get("albumId") or x.get("id"), "title": x.get("title"), "series": x.get("series", {}).get("title") if isinstance(x.get("series"), dict) else None, "artist": x.get("artist", {}).get("artistName") if isinstance(x.get("artist"), dict) else None, "season": x.get("seasonNumber"), "episode": x.get("episodeNumber")} for x in records[:50]]}
 
 
 async def netdata_summary(_: dict[str, Any]) -> dict[str, Any]:

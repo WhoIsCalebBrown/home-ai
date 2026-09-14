@@ -36,3 +36,14 @@ def test_calculator_and_units_are_deterministic():
 
 def test_discovery_is_bounded():
     assert len(module.discover_capabilities("server media camera internet", 8)) <= 8
+
+
+def test_lidarr_missing_tracks_preserves_album_identifier(monkeypatch):
+    import asyncio
+
+    async def fake_arr_get(service, path, args=None):
+        return {"totalRecords": 1, "records": [{"id": 395, "title": "HOOD POET", "artist": {"artistName": "Polo G"}}]}
+
+    monkeypatch.setattr(module, "arr_get", fake_arr_get)
+    result = asyncio.run(module.arr_missing("lidarr", {}))
+    assert result["items"][0]["album_id"] == 395
