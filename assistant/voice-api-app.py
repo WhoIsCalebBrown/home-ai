@@ -41,6 +41,7 @@ COMPARISON_DIR = Path(os.getenv("TTS_COMPARISON_DIR", "/app/tts-tests/chatterbox
 PRONUNCIATION_LEXICON = Path(os.getenv("PRONUNCIATION_LEXICON", "/app/pronunciation/approved-pronunciation-lexicon.yaml")).resolve()
 NEMO_CACHE_DIR = Path(os.getenv("NEMO_CACHE_DIR", "/app/pronunciation/nemo-cache")).resolve()
 TTS_DEBUG_LOG = os.getenv("TTS_DEBUG_LOG", "/app/pronunciation/tts-debug.jsonl")
+DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/discovery-debug.jsonl")
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
@@ -103,7 +104,9 @@ observed, checked, executed, seen, detected, verified, or learned a dynamic fact
 appropriate tool result in this conversation supports that exact claim. A user assertion is
 context, not independent verification. For investigations, every concrete count, status,
 cause, failure, relationship, or service attribution must be directly supported by a field in
-the current tool result. If services disagree, report the disagreement instead of guessing.
+the current tool result. If services disagree, report the disagreement instead of guessing. Before
+saying that a capability is unavailable, rely on the current capability discovery result and the
+current tool execution status; never infer tool absence from memory or from the user's wording.
 An empty destination library does not mean the acquisition pipeline is empty."""
 PLEX_RULE = "Plex library names are exact live data. When a Plex result contains library_title, copy those strings exactly, including hyphens and capitalization. Never infer or shorten a library name from media type. If results span multiple libraries, name each exact library title in the spoken answer."
 INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language."""
@@ -353,15 +356,33 @@ def tool_groups(text: str) -> set[str]:
 
 
 async def tool_registry(user_text: str = "") -> list[dict]:
+    tools, _, _ = await discover_tools(user_text, {})
+    return tools
+
+
+async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], list[dict], float | None]:
     try:
         async with httpx.AsyncClient(timeout=3) as http:
             endpoint = "/registry" if not user_text.strip() else "/discover"
-            params = {} if not user_text.strip() else {"query": user_text, "max_results": 8}
+            params = {} if not user_text.strip() else {"query": user_text, "max_results": 5, "context_json": json.dumps(context, separators=(",", ":"))}
+            started = time.perf_counter()
             response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
             response.raise_for_status()
-            return [item["function"] for item in response.json().get("tools", [])]
+            payload = response.json()
+            entries = payload.get("tools", [])
+            return [item["function"] for item in entries], [item.get("metadata", {}) for item in entries], round((time.perf_counter() - started) * 1000, 2)
     except Exception:
-        return []
+        return [], [], None
+
+
+def discovery_audit(entry: dict) -> None:
+    try:
+        path = Path(DISCOVERY_AUDIT_LOG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"timestamp": time.time(), **entry}, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
 
 
 async def capability_summary() -> str:
@@ -403,7 +424,7 @@ def provenance_question(text: str) -> bool:
 
 
 def visual_question(text: str) -> bool:
-    return bool(re.search(r"\b(wearing|wear|shirt|hat|hoodie|clothes?|color|colour|look like|see)\b", text, re.I))
+    return bool(re.search(r"\b(wearing|wear|shirt|hat|hoodie|clothes?|color|colour|look like|see|screenshot|snapshot|photo|image|describe)\b", text, re.I))
 
 
 def front_door_presence_question(text: str) -> bool:
@@ -411,7 +432,13 @@ def front_door_presence_question(text: str) -> bool:
 
 
 def dynamic_fact_question(text: str) -> bool:
-    return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline)\b", text, re.I))
+    return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline|news|policy|policies|president|version|release|product)\b", text, re.I))
+
+
+def current_external_question(text: str) -> bool:
+    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this week|breaking|updated|update|release|version)\b"
+    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|policy|policies|news|headline|ollama|software|release|product|documentation|rules|bug|issue)\b"
+    return bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I)) or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
 
 
 def unavailable_live_answer(text: str) -> str:
@@ -419,6 +446,8 @@ def unavailable_live_answer(text: str) -> str:
         return "I can't verify the current weather right now because no live weather result was available."
     if re.search(r"\b(lidarr|lidar)\b", text, re.I):
         return "I couldn't verify Lidarr's current status because its live status check was unavailable."
+    if current_external_question(text):
+        return "I couldn't verify that current external information because live web research was unavailable."
     return "I couldn't verify that current server information because the required live tool result was unavailable."
 
 
@@ -475,6 +504,23 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict]) 
     return answer
 
 
+def grounded_camera_presence_answer(result: dict) -> str:
+    events = [event for event in result.get("events", []) if event.get("label") == "person"]
+    if not events:
+        return "I don't have a current Frigate person detection at the front door."
+    event = events[0]
+    age = event.get("age_seconds")
+    if event.get("active") or (isinstance(age, (int, float)) and age <= 10):
+        return "Frigate currently shows an active person event at the front door."
+    if isinstance(age, (int, float)):
+        if age < 120:
+            when = f"about {round(age)} seconds ago"
+        else:
+            when = f"about {round(age / 60)} minutes ago"
+        return f"Frigate detected a person at the front door {when}, but that event is no longer active."
+    return "Frigate detected a person at the front door, but the event time was unavailable, so I can't say they are there right now."
+
+
 async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
@@ -483,6 +529,7 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str) -> None:
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
+    discovery_audit({"event": "tool_call", "client_id": client_id, "request_id": request_id, "tool": name, "arguments": {k: v for k, v in arguments.items() if not any(secret in k.casefold() for secret in ("key", "token", "password", "secret"))}})
     try:
         async with httpx.AsyncClient(timeout=15) as http:
             response = await http.post(f"{TOOLS_URL}/invoke", json={
@@ -491,7 +538,12 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
             if response.status_code == 404:
                 return {"tool": name, "status": "error", "result": {"error": "That tool is not enabled."}}
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            result = payload.get("result") if isinstance(payload, dict) else {}
+            if isinstance(result, dict):
+                result = {key: value for key, value in result.items() if key not in {"image_base64"}}
+            discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id, "tool": name, "status": payload.get("status"), "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [], "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
+            return payload
     except Exception as exc:
         return {"tool": name, "status": "error", "result": {"error": "Tool service unavailable", "detail": type(exc).__name__}}
 
@@ -539,6 +591,8 @@ def preflight_plan(text: str) -> list[tuple[str, dict]]:
             location = match.group(1).strip()
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
+    if current_external_question(text):
+        return [("web_search", {"query": text.strip()})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(status|state|health|online|offline|working|running)\b", t):
         return [("get_container_status", {"name": "lidarr"}), ("lidarr_health", {})]
     if re.search(r"\b(summary|overview)\b", t) and re.search(r"\b(server|media server)\b", t):
@@ -692,14 +746,26 @@ def evidence_message(results: list[dict]) -> list[dict]:
 
 
 def store_provenance(client_id: str, results: list[dict]) -> None:
+    successful = [item for item in results if item.get("status") == "ok"]
+    if successful:
+        last = successful[-1]
+        tool_names = [item.get("tool") for item in successful if item.get("tool")]
+        result = last.get("result") if isinstance(last.get("result"), dict) else {}
+        if last.get("tool", "").startswith("frigate"):
+            events = result.get("events") or []
+            camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
+            conversation_context[client_id] = {"kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None}
+        elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
+            conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
+        elif result.get("investigation"):
+            conversation_context[client_id] = {"kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
     for item in reversed(results):
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         if result.get("sources_checked") or result.get("investigation"):
             provenance[client_id] = {"tool": item.get("tool"), "sources_checked": result.get("sources_checked", []), "result": result}
-            conversation_context[client_id] = {"kind": result.get("investigation", "investigation"), "query": result.get("query", ""), "tool": item.get("tool")}
             return
         if item.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
-            conversation_context[client_id] = {"kind": "weather", "location": result.get("location", {}).get("name", ""), "tool": item.get("tool")}
+            conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": [item.get("tool")], "location": result.get("location", {}).get("name", "")}
 
 
 def resolved_followup_text(client_id: str, text: str) -> str:
@@ -707,9 +773,15 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     context = conversation_context.get(client_id, {})
     lowered = text.casefold()
     if context.get("kind") == "weather" and re.search(r"\b(what about|how about|and)\b", lowered):
-        location = context.get("location") or ""
+        explicit = re.search(r"\b(?:what|how) about\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:today|tomorrow|now)\b|[?.!]|$)", text, re.I)
+        location = explicit.group(1).strip() if explicit else (context.get("location") or "")
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
+    if context.get("group") == "cameras":
+        explicit_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr)\b", lowered)
+        followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
+        if followup and not explicit_topic:
+            return f"front door camera current snapshot person {text}"
     if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
     return text
@@ -764,7 +836,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             return
         messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
         route_text = resolved_followup_text(client_id, user_text)
-        tools = await tool_registry(route_text)
+        context = conversation_context.get(client_id, {})
+        tools, candidates, discovery_latency = await discover_tools(route_text, context)
+        discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
         planned = preflight_plan(route_text)
         for name, planned_args in planned:
@@ -797,6 +871,16 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
+        if live_results and front_door_presence_question(user_text):
+            event_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "frigate_recent_events" and item.get("status") == "ok"), None)
+            if event_result is not None:
+                store_provenance(client_id, live_results)
+                full = grounded_camera_presence_answer(event_result)
+                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_answer(ws, request_id, full)
+                history.append({"role": "assistant", "content": full})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
         if live_results and any(item.get("tool") == "investigate_media_pipeline" and item.get("status") == "ok" for item in live_results):
             investigation = next(item.get("result", {}) for item in live_results if item.get("tool") == "investigate_media_pipeline")
             direct = grounded_investigation_answer(investigation, user_text)

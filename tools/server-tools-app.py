@@ -60,6 +60,17 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def event_time(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def safe_args(args: dict[str, Any]) -> dict[str, Any]:
     return {k: ("[redacted]" if any(s in k.lower() for s in ("key", "token", "password", "secret")) else v) for k, v in args.items()}
 
@@ -635,7 +646,18 @@ async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("camera"): params["camera"] = args["camera"]
     if args.get("label"): params["label"] = args["label"]
     rows = await get_json("frigate", "/api/events", params)
-    return {"events": [{"id": x.get("id"), "camera": x.get("camera"), "label": x.get("label"), "start_time": x.get("start_time"), "end_time": x.get("end_time"), "has_clip": x.get("has_clip"), "has_snapshot": x.get("has_snapshot")} for x in rows[:50]]}
+    retrieved = time.time()
+    events = []
+    for x in rows[:50]:
+        start = event_time(x.get("start_time"))
+        end = event_time(x.get("end_time"))
+        age = max(0, retrieved - start) if start is not None else None
+        events.append({"id": x.get("id"), "camera": x.get("camera"), "label": x.get("label"),
+                       "start_time": x.get("start_time"), "end_time": x.get("end_time"),
+                       "age_seconds": round(age, 1) if age is not None else None,
+                       "active": end is None, "has_clip": x.get("has_clip"),
+                       "has_snapshot": x.get("has_snapshot")})
+    return {"events": events, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat()}
 
 
 async def arr_missing(service: str, _: dict[str, Any]) -> dict[str, Any]:
@@ -935,9 +957,13 @@ def _search_tokens(value: str) -> set[str]:
     stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can"}
     return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 1 and token not in stop}
 
-def discover_capabilities(query: str, max_results: int = 8) -> list[dict]:
+def discover_capabilities(query: str, max_results: int = 8, context: dict[str, Any] | None = None) -> list[dict]:
     q = _search_tokens(query)
     lowered = query.casefold()
+    context = context or {}
+    prior_group = str(context.get("group", "")).casefold()
+    prior_tools = {str(item).casefold() for item in context.get("tools", [])}
+    referents = _search_tokens(" ".join(str(item) for item in context.get("referents", [])))
     ranked = []
     for item in REGISTRY:
         record = capability_record(item)
@@ -948,9 +974,15 @@ def discover_capabilities(query: str, max_results: int = 8) -> list[dict]:
         example = sum(2 for example in meta["examples"] if any(token in q for token in _search_tokens(example)))
         score = overlap + exact + example
         if name := meta["canonical_name"]:
+            if name in {"web_search", "web_fetch"} and re.search(r"\b(new|newest|latest|current|today|ongoing|news|policy|policies|version|release)\b", lowered): score += 7
+            if name == "web_search" and not re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
+            if name == "web_fetch" and re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
             if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
             if name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
             if name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
+            if prior_group == "cameras" and meta.get("group") == "frigate": score += 5
+            if name.casefold() in prior_tools: score += 4
+            if referents & terms: score += 2
         if score: ranked.append((score, record))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]["metadata"]["canonical_name"]))
     return [{**record, "metadata": {**record["metadata"], "rank": index + 1, "score": score}} for index, (score, record) in enumerate(ranked[:max(1, min(max_results, 8))])]
@@ -986,9 +1018,14 @@ async def registry(groups: str = ""):
 
 
 @app.get("/discover")
-async def discover(query: str, max_results: int = 8):
+async def discover(query: str, max_results: int = 8, context_json: str = ""):
     started = time.perf_counter()
-    results = discover_capabilities(query, max_results)
+    try:
+        context = json.loads(context_json) if context_json else {}
+        if not isinstance(context, dict): context = {}
+    except json.JSONDecodeError:
+        context = {}
+    results = discover_capabilities(query, max_results, context)
     return {"tools": results, "query": query, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "total_enabled": len(REGISTRY)}
 
 
