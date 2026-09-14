@@ -686,7 +686,8 @@ async def arr_queue(service: str, _: dict[str, Any]) -> dict[str, Any]:
 
 async def sonarr_search(args):
     rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": args["query"]})
-    return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"), "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
+    return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"),
+                          "seriesType": x.get("seriesType"), "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
 
 
 async def radarr_search(args):
@@ -1350,9 +1351,17 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         lookup = await sonarr_search({"query": title})
         matches = lookup.get("matches", [])
         identity, ambiguous = _pick_match(matches, title)
+        # Sonarr's canonical lookup classification outranks the loose language
+        # heuristic (e.g. "Dragon Ball Z Kai" is anime even when the user does
+        # not say the word "anime"). This selects the policy for a new item;
+        # existing managed series retain their current profile.
+        if identity and str(identity.get("seriesType") or "").casefold() == "anime":
+            kind = "anime"
+            parts["media_type"] = "anime"
         plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
         if identity:
-            plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"), "tvdb_id": identity.get("tvdbId")}
+            plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"),
+                                           "tvdb_id": identity.get("tvdbId"), "series_type": identity.get("seriesType")}
         plan["ambiguous"] = ambiguous
         if identity:
             plan["providers"]["plex"] = await plex_library_lookup({"query": identity.get("title", title), "library": "TV Shows"})
@@ -1404,6 +1413,22 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         rows.append(workflow)
     _save_media_workflows(rows)
     plan["workflow_id"] = workflow["workflow_id"]
+    if plan.get("confirmation_required"):
+        # Dry-run output exposes the exact binding that a future write executor
+        # would persist. It is never consumed or authorized by this planner.
+        confirmation_plan = dict(plan)
+        confirmation_plan.pop("confirmation_record", None)
+        plan["confirmation_record"] = media_confirmation_record(
+            workflow_id=workflow["workflow_id"],
+            plan=confirmation_plan,
+            session_id=str(args.get("session_id") or "plan-only"),
+            canonical_media_type=identity.get("media_type"),
+            canonical_external_id=str(identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or ""),
+            title=str(identity.get("title") or ""),
+            manager=str(plan["writes_required"][0].get("owner") or ""),
+            operation="media_execute_goal",
+            arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run", "canonical_identity": identity},
+        )
     plan["idempotent"] = True
     return plan
 
