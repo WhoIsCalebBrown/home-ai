@@ -1422,11 +1422,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             workflow_id=workflow["workflow_id"],
             plan=confirmation_plan,
             session_id=str(args.get("session_id") or "plan-only"),
-            canonical_media_type=identity.get("media_type"),
-            canonical_external_id=str(identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or ""),
-            title=str(identity.get("title") or ""),
-            manager=str(plan["writes_required"][0].get("owner") or ""),
-            operation="media_execute_goal",
+            operation=f"{plan['writes_required'][0].get('owner')}.media_execute_goal",
             arguments={"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run", "canonical_identity": identity},
         )
     plan["idempotent"] = True
