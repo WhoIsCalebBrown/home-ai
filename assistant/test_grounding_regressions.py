@@ -99,6 +99,14 @@ def test_weather_followup_keeps_location_without_topic_contamination():
     assert preflight_plan("What is the weather tomorrow?") == [("weather_forecast", {"location": None, "days_from_now": 1})]
 
 
+def test_noisy_weather_followup_preserves_active_location():
+    plan = preflight_plan(
+        "Yeah, just what time with the weather isn't well in Ontario",
+        {"domain": "weather", "kind": "weather", "location": "Welland, Ontario"},
+    )
+    assert plan == [("weather_forecast", {"location": "Welland, Ontario", "days_from_now": 0})]
+
+
 def test_media_aliases_are_routing_only():
     text = routing_aliases("Is there anything on LiDAR that's going to be added to Plexium?")
     assert "Lidarr" in text and "Plex" in text

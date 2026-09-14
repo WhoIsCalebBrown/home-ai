@@ -939,7 +939,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
     if re.search(r"\b(weather|temperature|forecast|high|low|rain|precipitation|snow|humidity|conditions?)\b", t):
+        # A noisy follow-up may mention only a province/region.  Preserve the
+        # immediately active weather location rather than letting geocoding
+        # choose an unrelated homonym (for example Ontario, California).
         location = weather_location_from_text(text)
+        # A province-only fragment in a repair/noisy follow-up is not a new
+        # city. Keep the active qualified city when the current turn does not
+        # identify a stronger replacement.
+        active_location = context.get("location")
+        if active_location and (not location or location.casefold() in {"ontario", "canada"}):
+            location = active_location
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if current_external_question(text):
