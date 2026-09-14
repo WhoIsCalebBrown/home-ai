@@ -1135,7 +1135,14 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             }
             return
         if item.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
-            conversation_context[client_id] = {"kind": "weather", "group": "internet", "tools": [item.get("tool")], "location": result.get("location", {}).get("name", "")}
+            conversation_context[client_id] = {
+                **prior_state,
+                "domain": "weather",
+                "kind": "weather",
+                "group": "internet",
+                "tools": [item.get("tool")],
+                "location": result.get("location", {}).get("name", ""),
+            }
 
 
 def resolved_followup_text(client_id: str, text: str) -> str:
