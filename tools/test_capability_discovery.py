@@ -287,3 +287,23 @@ def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow
     result = asyncio.run(module.media_status({"workflow_id": "wf-hobbit"}))
     assert result["canonical_state"] == "ACQUIRED_NOT_VISIBLE"
     assert result["source_workflow_state"] == "SEARCHING"
+
+
+def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypatch, tmp_path):
+    import asyncio
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+
+    async def no_movie(_):
+        return {"matches": []}
+
+    async def tv_candidate(_):
+        return {"matches": [{"title": "The 10th Kingdom", "year": 2000, "tmdbId": 40546, "tvdbId": 78886, "seriesType": "standard"}]}
+
+    monkeypatch.setattr(module, "radarr_search", no_movie)
+    monkeypatch.setattr(module, "sonarr_search", tv_candidate)
+    result = asyncio.run(module.media_plan_goal({"goal": "Please request the 10th Kingdom movie."}))
+    assert result["canonical_identity"] is None
+    assert result["ambiguity_reason"] == "CROSS_DOMAIN_CANDIDATE"
+    assert result["candidates"][0]["tmdb_id"] == 40546
+    assert result["writes_required"] == []
+    assert result["confirmation_required"] is False

@@ -847,6 +847,9 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
                 if title:
                     labels.append(f"{title} ({year})" if year else str(title))
             if labels:
+                if result.get("ambiguity_reason") == "CROSS_DOMAIN_CANDIDATE" and len(candidates) == 1:
+                    candidate = candidates[0]
+                    return f"I found {labels[0]}, but it is a TV series rather than a movie. Do you want that series?"
                 return "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
         return "I couldn't identify a confident media match without changing anything."
     # Only plans with an explicit bounded write are actionable.  This keeps

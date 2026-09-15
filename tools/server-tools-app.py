@@ -1586,6 +1586,18 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                               and str(row.get("year", "")).isdigit() and int(row.get("year")) <= 1985), None)
             if preferred:
                 identity, ambiguous = preferred, False
+        # If a request explicitly says movie but Radarr has no canonical
+        # result, perform one bounded cross-domain lookup.  This does not
+        # change state; it prevents a TV title from being silently treated as
+        # an unresolved movie and later described as if a request started.
+        if not identity:
+            tv_lookup = await sonarr_search({"query": title})
+            tv_match, tv_ambiguous = _pick_match(tv_lookup.get("matches", []), title)
+            if tv_match:
+                plan["candidates"] = [{"title": tv_match.get("title"), "year": tv_match.get("year"),
+                                       "media_type": "tv", "tmdb_id": tv_match.get("tmdbId"), "tvdb_id": tv_match.get("tvdbId")}]
+                plan["ambiguity_reason"] = "CROSS_DOMAIN_CANDIDATE"
+                ambiguous = True
         plan["steps"].append({"capability": "media.identify", "owner": "radarr", "reason": "canonical movie identity required"})
         if identity:
             plan["canonical_identity"] = {"media_type": "movie", "title": identity.get("title"), "year": identity.get("year"), "tmdb_id": identity.get("tmdbId")}
