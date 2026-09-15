@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -24,6 +24,8 @@ preflight_plan = namespace["preflight_plan"]
 visual_question = namespace["visual_question"]
 grounded_camera_presence_answer = namespace["grounded_camera_presence_answer"]
 grounded_recent_activity_answer = namespace["grounded_recent_activity_answer"]
+historical_timing_question = namespace["historical_timing_question"]
+grounded_event_timing_answer = namespace["grounded_event_timing_answer"]
 routing_aliases = namespace["routing_aliases"]
 weather_location_from_text = namespace["weather_location_from_text"]
 turn_context = namespace["turn_context"]
@@ -353,6 +355,19 @@ def test_latest_activity_answer_separates_age_from_duration():
     assert "about 10 minutes ago" in answer
     assert "8" not in answer  # the concise GenAI summary is used here
     assert "10 minutes" not in answer.split("for")[-1]
+
+
+def test_historical_clock_answer_uses_event_normalized_time():
+    assert historical_timing_question("What time was that?")
+    answer = grounded_event_timing_answer({
+        "events": [{"time": {
+            "start": {"display": "2026-09-15 03:23:40 PM"},
+            "end": {"display": "2026-09-15 03:23:51 PM"},
+        }}],
+        "genai": {"scene": "around 02:23 PM"},
+    })
+    assert "03:23:40 PM" in answer
+    assert "02:23 PM" not in answer
 
 
 def test_resolved_event_activity_followup_beats_historical_search():
