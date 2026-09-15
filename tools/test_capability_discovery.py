@@ -124,6 +124,34 @@ def test_standard_bridge_rejects_destination_override():
     assert result["reason"] == "UNEXPECTED_ARGUMENT"
 
 
+def test_canonical_plex_match_rejects_hobbit_trilogy_for_1977():
+    requested = {"title": "The Hobbit", "year": 1977, "external_ids": {"tmdb": "1362"}}
+    trilogy = [
+        {"title": "The Hobbit: An Unexpected Journey", "year": 2012, "external_ids": {"tmdb": " Hobbit-2012 "}},
+        {"title": "The Hobbit: The Desolation of Smaug", "year": 2013, "external_ids": {"tmdb": "1170358"}},
+        {"title": "The Hobbit: The Battle of the Five Armies", "year": 2014, "external_ids": {"tmdb": "2310332"}},
+    ]
+    assert all(module._evaluate_plex_candidate(row, requested).get("rejected_reason") == "canonical_identity_mismatch"
+               for row in trilogy)
+
+
+def test_canonical_plex_match_remake_and_exact_positive_cases():
+    for title, year, requested_id, other_id in [
+        ("Dune", 1984, "841", "438631"),
+        ("The Lion King", 1994, "8587", "420818"),
+        ("Suspiria", 1977, "11906", "361292"),
+    ]:
+        requested = {"title": title, "year": year, "external_ids": {"tmdb": requested_id}}
+        assert module._evaluate_plex_candidate({"title": title, "year": year, "external_ids": {"tmdb": other_id}}, requested)["rejected_reason"] == "canonical_identity_mismatch"
+        assert module._evaluate_plex_candidate({"title": title, "year": year, "external_ids": {"tmdb": requested_id}}, requested)["match_method"] == "tmdb"
+
+
+def test_canonical_plex_match_falls_back_only_to_exact_title_year():
+    requested = {"title": "The Hobbit", "year": 1977, "external_ids": {"tmdb": "1362"}}
+    assert module._evaluate_plex_candidate({"title": "The Hobbit", "year": 1977, "external_ids": {}}, requested)["match_method"] == "title_year"
+    assert module._evaluate_plex_candidate({"title": "The Hobbit", "year": 2012, "external_ids": {}}, requested)["rejected_reason"] == "year_mismatch"
+
+
 def test_media_confirmation_binds_session_plan_and_expiry():
     from datetime import datetime, timedelta, timezone
 

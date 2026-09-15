@@ -576,6 +576,116 @@ async def plex_library_lookup(args: dict[str, Any]) -> dict[str, Any]:
     return {"query": query, "available": bool(matches), "matches": matches[:20], "source": "Plex"}
 
 
+def _normalize_identity_title(value: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _plex_external_ids(*sources: Any) -> dict[str, str]:
+    """Extract stable IDs from Plex GUID variants without exposing raw GUIDs."""
+    ids: dict[str, str] = {}
+    for source in sources:
+        values = []
+        if isinstance(source, dict):
+            values.extend(source.get(key) for key in ("guid", "guid_id"))
+            values.extend(source.get("guid_ids", []))
+        elif isinstance(source, str):
+            values.append(source)
+        for value in values:
+            for kind, identifier in re.findall(r"(?:^|[^a-z])(tmdb|imdb|tvdb)://([^?&#/]+)", str(value), re.I):
+                ids[kind.casefold()] = identifier
+    return ids
+
+
+def _evaluate_plex_candidate(candidate: dict[str, Any], requested: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate one discovered item; search similarity never implies identity."""
+    requested_ids = requested.get("external_ids", {})
+    candidate_ids = candidate.get("external_ids", {})
+    stable_requested = {k: v for k, v in requested_ids.items() if k in {"tmdb", "imdb", "tvdb"}}
+    stable_candidate = {k: v for k, v in candidate_ids.items() if k in {"tmdb", "imdb", "tvdb"}}
+    matched_key = next((k for k, v in stable_requested.items() if stable_candidate.get(k) == v), None)
+    conflicting_key = next((k for k, v in stable_requested.items()
+                            if k in stable_candidate and stable_candidate[k] != v), None)
+    if matched_key:
+        return {**candidate, "match_method": matched_key, "confidence": 1.0}
+    if conflicting_key or (stable_candidate and stable_requested):
+        return {**candidate, "rejected_reason": "canonical_identity_mismatch"}
+    if _normalize_identity_title(candidate.get("title")) != _normalize_identity_title(requested.get("title")):
+        return {**candidate, "rejected_reason": "title_mismatch"}
+    if requested.get("year") is not None and candidate.get("year") != requested.get("year"):
+        return {**candidate, "rejected_reason": "year_mismatch"}
+    return {**candidate, "match_method": "title_year", "confidence": 0.85}
+
+
+async def plex_match_canonical_media(args: dict[str, Any]) -> dict[str, Any]:
+    """Canonical Plex matcher: search discovers candidates; IDs decide identity."""
+    token = xml_value(Path("/config") / SERVICES["plex"][1], "PlexOnlineToken")
+    base, _ = SERVICES["plex"]
+    media_type = str(args.get("media_type", "movie")).casefold()
+    title = str(args.get("title", "")).strip()
+    year = args.get("year")
+    requested_ids = {key.replace("_id", "").casefold(): str(value)
+                     for key, value in (args.get("canonical_external_ids") or {}).items()
+                     if value not in (None, "")}
+    requested = {"media_type": media_type, "title": title, "year": year, "external_ids": requested_ids}
+    if not token or not title:
+        return {"matched": False, "match_method": None, "confidence": 0, "requested": requested,
+                "candidates": [], "error": "Plex lookup unavailable"}
+
+    async with httpx.AsyncClient(timeout=8) as client:
+        response = await client.get(base + "/search", params={"query": title, "X-Plex-Token": token})
+        response.raise_for_status()
+        search_root = ET.fromstring(response.text)
+        sections = await client.get(base + "/library/sections", params={"X-Plex-Token": token})
+        sections.raise_for_status()
+        section_root = ET.fromstring(sections.text)
+        section_names = {str(x.attrib.get("key")): x.attrib.get("title", "") for x in section_root}
+        wanted_library = str(args.get("library", "")).casefold()
+        candidates = []
+        for item in search_root:
+            attrs = dict(item.attrib)
+            if attrs.get("type") != media_type or not attrs.get("ratingKey"):
+                continue
+            library = attrs.get("librarySectionTitle") or section_names.get(str(attrs.get("librarySectionKey")), "")
+            if wanted_library and library.casefold() != wanted_library:
+                continue
+            detail_attrs = attrs
+            detail_guid_ids = []
+            try:
+                detail = await client.get(base + f"/library/metadata/{attrs['ratingKey']}", params={"X-Plex-Token": token})
+                detail.raise_for_status()
+                detail_root = ET.fromstring(detail.text)
+                detail_item = next(iter(detail_root), None)
+                if detail_item is not None:
+                    detail_attrs = {**attrs, **detail_item.attrib}
+                    detail_guid_ids = [g.attrib.get("id") for g in detail_item.findall(".//Guid") if g.attrib.get("id")]
+            except Exception:
+                detail_guid_ids = []
+            external_ids = _plex_external_ids(detail_attrs, {"guid_ids": detail_guid_ids})
+            candidate = {
+                "title": detail_attrs.get("title"),
+                "year": int(detail_attrs["year"]) if str(detail_attrs.get("year", "")).isdigit() else detail_attrs.get("year"),
+                "media_type": detail_attrs.get("type"),
+                "plex_rating_key": detail_attrs.get("ratingKey"),
+                "library": library,
+                "external_ids": external_ids,
+            }
+            candidates.append(_evaluate_plex_candidate(candidate, requested))
+
+    positives = [x for x in candidates if x.get("match_method")]
+    if len(positives) == 1:
+        match = positives[0]
+        return {"matched": True, "match_method": match["match_method"], "confidence": match["confidence"],
+                "requested": requested, "match": match, "candidates": candidates}
+    if len(positives) > 1:
+        for item in positives:
+            item["rejected_reason"] = "ambiguous_library_match"
+            item.pop("match_method", None)
+        return {"matched": False, "match_method": None, "confidence": 0, "reason": "AMBIGUOUS_LIBRARY_MATCH",
+                "requested": requested, "candidates": candidates}
+    return {"matched": False, "match_method": None, "confidence": 0, "requested": requested,
+            "candidates": candidates}
+
+
 async def plex_artist_library(args: dict[str, Any]) -> dict[str, Any]:
     """Return the actual albums/tracks already present under an exact Plex Music artist."""
     token = xml_value(Path("/config") / SERVICES["plex"][1], "PlexOnlineToken")
@@ -1404,7 +1514,15 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         if identity:
             plan["canonical_identity"] = {"media_type": "movie", "title": identity.get("title"), "year": identity.get("year"), "tmdb_id": identity.get("tmdbId")}
         plan["ambiguous"] = ambiguous
-        plan["providers"]["plex"] = await plex_library_lookup({"query": title, "library": "Movies"})
+        plex_identity = {"tmdb_id": identity.get("tmdbId")} if identity else {}
+        permanent_match = await plex_match_canonical_media({"media_type": "movie", "title": identity.get("title", title),
+                                                            "year": identity.get("year"), "canonical_external_ids": plex_identity,
+                                                            "library": "Movies"}) if identity else {"matched": False, "candidates": []}
+        standard_match = await plex_match_canonical_media({"media_type": "movie", "title": identity.get("title", title),
+                                                           "year": identity.get("year"), "canonical_external_ids": plex_identity,
+                                                           "library": "Movies-DB"}) if identity else {"matched": False, "candidates": []}
+        plan["providers"]["plex"] = {"permanent": permanent_match, "standard": standard_match,
+                                      "available": bool(permanent_match.get("matched") or standard_match.get("matched"))}
         plan["steps"].append({"capability": "media.library.check", "owner": "plex", "reason": "avoid duplicate acquisition"})
         if identity:
             managed = await arr_get("radarr", "/api/v3/movie", {})
@@ -1429,7 +1547,10 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                            "genres": identity.get("genres") or []}
         plan["ambiguous"] = ambiguous
         if identity:
-            plan["providers"]["plex"] = await plex_library_lookup({"query": identity.get("title", title), "library": "TV Shows"})
+            plex_identity = {key: identity.get(key) for key in ("tmdb_id", "tvdb_id") if identity.get(key)}
+            plan["providers"]["plex"] = await plex_match_canonical_media({"media_type": "show", "title": identity.get("title", title),
+                                                                             "year": identity.get("year"), "canonical_external_ids": plex_identity,
+                                                                             "library": "TV Shows"})
             managed = await arr_get("sonarr", "/api/v3/series", {})
             owned = next((row for row in managed if str(row.get("tvdbId")) == str(identity.get("tvdb_id"))), None) if isinstance(managed, list) else None
             plan["providers"]["sonarr"] = {"managed": bool(owned), "series_id": owned.get("id") if owned else None,
@@ -1441,9 +1562,15 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     else:
         plan["ambiguous"] = True
     identity = plan.get("canonical_identity") or {}
-    plex_matches = (plan.get("providers", {}).get("plex_music") or plan.get("providers", {}).get("plex") or {}).get("matches", [])
+    plex_provider = plan.get("providers", {}).get("plex") or {}
+    if kind == "movie" and "permanent" in plex_provider:
+        plex_available = bool(plex_provider.get("permanent", {}).get("matched") or plex_provider.get("standard", {}).get("matched"))
+        plex_matches = []
+    else:
+        plex_available = bool(plex_provider.get("matched"))
+        plex_matches = plex_provider.get("matches", [])
     has_requested_scope = bool(parts.get("season_scope") or parts.get("episode_scope"))
-    if identity and not has_requested_scope and any(str(m.get("title", "")).casefold() == str(identity.get("title", "")).casefold() for m in plex_matches):
+    if identity and not has_requested_scope and plex_available:
         plan["current_state"] = "AVAILABLE_IN_PLEX"
     elif plan.get("ambiguous"):
         plan["current_state"] = "AMBIGUOUS_IDENTITY"
@@ -1719,17 +1846,23 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     if title and not payload.get("seasons"):
         permanent_library = storage_policy["permanent"]["library"]
         standard_library = storage_policy["standard"]["library"]
-        permanent = await plex_library_lookup({"query": title, "library": permanent_library})
-        standard = await plex_library_lookup({"query": title, "library": standard_library})
-        if permanent.get("available") and standard.get("available"):
+        identity = workflow.get("canonical_identity", {})
+        canonical_ids = {key: identity.get(key) for key in ("tmdb_id", "tvdb_id", "imdb_id") if identity.get(key)}
+        permanent = await plex_match_canonical_media({"media_type": "movie" if payload["mediaType"] == "movie" else "show",
+                                                       "title": title, "year": identity.get("year"),
+                                                       "canonical_external_ids": canonical_ids, "library": permanent_library})
+        standard = await plex_match_canonical_media({"media_type": "movie" if payload["mediaType"] == "movie" else "show",
+                                                      "title": title, "year": identity.get("year"),
+                                                      "canonical_external_ids": canonical_ids, "library": standard_library})
+        if permanent.get("matched") and standard.get("matched"):
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "both"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES", "write_executed": False, "workflow_id": workflow_id}
-        if permanent.get("available"):
+        if permanent.get("matched"):
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "permanent_local"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_PERMANENTLY", "write_executed": False, "workflow_id": workflow_id}
-        if standard.get("available"):
+        if standard.get("matched"):
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "debrid"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_STANDARD", "write_executed": False, "workflow_id": workflow_id}
