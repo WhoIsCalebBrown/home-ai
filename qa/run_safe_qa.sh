@@ -6,7 +6,7 @@ set -euo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 image_name=${HOME_AI_QA_IMAGE:-home-ai-hardening-test:py312}
 
-docker build -f "$repo_dir/tools/Dockerfile" -t "$image_name" "$repo_dir" >/dev/null
+docker build -f "$repo_dir/qa/Dockerfile" -t "$image_name" "$repo_dir" >/dev/null
 docker run --rm --network none \
   -v "$repo_dir:/repo:ro" -w /repo "$image_name" \
-  sh -lc 'pip install -q pytest==8.3.5 && pytest -p no:cacheprovider -q assistant/test_grounding_regressions.py tools/test_capability_discovery.py qa'
+  pytest -p no:cacheprovider -q assistant/test_grounding_regressions.py tools/test_capability_discovery.py qa
