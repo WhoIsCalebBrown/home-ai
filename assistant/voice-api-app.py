@@ -592,7 +592,10 @@ CONTAINER_DISPLAY_NAMES = {
 
 
 def provenance_question(text: str) -> bool:
-    return bool(re.search(r"\b(what|which|where).{0,30}\b(check|checked|services?|came from|get that|source|sources)\b|\bwhat did you check\b", text, re.I))
+    # Do not treat a normal server question such as “What Docker services are
+    # up?” as a provenance request.  Provenance requires an explicit checked/
+    # source/came-from frame; the bare noun “service” is not sufficient.
+    return bool(re.search(r"\b(what|which|where).{0,30}\b(?:check(?:ed)?|came from|get that|source|sources)\b|\bwhat did you check\b", text, re.I))
 
 
 def visual_question(text: str) -> bool:
