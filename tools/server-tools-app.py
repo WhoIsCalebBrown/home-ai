@@ -39,10 +39,18 @@ CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv(
     "CLIDEBRID_BRIDGE_TOKEN_FILE",
     "/config/cli_debrid/config/cli_debrid_bridge_token",
 )
+CLIDEBRID_DB_PATH = os.getenv(
+    "CLIDEBRID_DB_PATH",
+    "/config/cli_debrid/db_content/media_items.db",
+)
 STANDARD_MEDIA_WRITES_ENABLED = os.getenv("STANDARD_MEDIA_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_MOVIE_WRITES_ENABLED = os.getenv("STANDARD_MOVIE_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_SEASON_WRITES_ENABLED = os.getenv("STANDARD_SEASON_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_EPISODE_WRITES_ENABLED = os.getenv("STANDARD_EPISODE_WRITES_ENABLED", "false").casefold() == "true"
+# The bridge is deliberately closed until the live cli_debrid ingestion
+# acknowledgement path has been validated.  This is independent of the
+# per-capability gates so a stale environment cannot reopen writes.
+STANDARD_MEDIA_BACKEND_READY = os.getenv("STANDARD_MEDIA_BACKEND_READY", "false").casefold() == "true"
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
 MEDIA_WORKFLOWS_PATH = Path(os.getenv("MEDIA_WORKFLOWS_PATH", "/data/media-workflows.json"))
@@ -1670,13 +1678,20 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                      (row.get("dedupe_key") == legacy_key and row.get("mode", "standard") == parts.get("mode", "standard"))), None)
     workflow = existing or {"workflow_id": str(uuid.uuid4()), "dedupe_key": key, "created_at": now(), "action_history": []}
     active_states = {"REQUESTED", "SEARCHING", "ACQUIRING", "VERIFYING", "ACQUIRED", "AVAILABLE_IN_PLEX"}
-    preserved_state = existing.get("current_state") if existing and existing.get("current_state") in active_states else plan["current_state"]
+    failed_states = {"FAILED", "FAILED_INGESTION", "BLOCKED"}
+    preserved_state = (existing.get("current_state")
+                       if existing and existing.get("current_state") in active_states | failed_states
+                       else plan["current_state"])
     workflow.update({"media_type": kind, "canonical_identity": identity, "desired_goal": parts["action"], "mode": parts.get("mode", "standard"),
                      "current_state": preserved_state, "last_checked": now(), "plan_only": True})
     if not existing:
         rows.append(workflow)
     _save_media_workflows(rows)
     plan["workflow_id"] = workflow["workflow_id"]
+    if existing and preserved_state == "FAILED_INGESTION":
+        plan["current_state"] = "FAILED_INGESTION"
+        plan["retry_available"] = True
+        plan["retry_reason"] = existing.get("failure_reason", "PREVIOUS_INGESTION_FAILED")
     if plan.get("confirmation_required"):
         # Dry-run output exposes the exact binding that a future write executor
         # would persist. It is never consumed or authorized by this planner.
@@ -1771,6 +1786,68 @@ def _standard_argument_binding(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_cli_debrid_overseerr_webhook(args: dict[str, Any], workflow_id: str) -> dict[str, Any]:
+    """Build the supported private webhook shape without exposing provider fields."""
+    media_type = str(args.get("media_type", "")).casefold()
+    media_id = int(args.get("canonical_external_id"))
+    seasons = [int(value) for value in (args.get("season_scope") or [])]
+    payload: dict[str, Any] = {
+        "notification_type": "MEDIA_PENDING",
+        "subject": f"Home-AI standard request {media_type}",
+        "request": {
+            "request_id": f"home_ai_{workflow_id}",
+            "requestedBy_username": "Home-AI",
+            "requestedBy_email": "home-ai@system",
+        },
+        "media": {
+            "media_type": media_type,
+            "tmdbId": media_id,
+            "from_overseerr": True,
+        },
+    }
+    if media_type == "tv" and seasons:
+        payload["media"]["requested_seasons"] = seasons
+        payload["extra"] = [{"name": "Requested Seasons", "value": ",".join(map(str, seasons))}]
+    return payload
+
+
+def _cli_debrid_exact_item_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read-only acknowledgement check; title matching is never used."""
+    media_id = int(payload["media"]["tmdbId"])
+    media_type = str(payload["media"]["media_type"])
+    result: dict[str, Any] = {"matched": False, "media_type": media_type, "tmdb_id": media_id, "rows": []}
+    try:
+        connection = sqlite3.connect(CLIDEBRID_DB_PATH, timeout=1)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT id, tmdb_id, title, year, state, type, requested_season, location_on_disk, plex_verified "
+            "FROM media_items WHERE tmdb_id = ? AND type = ? ORDER BY id DESC LIMIT 10",
+            (media_id, media_type),
+        ).fetchall()
+        connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        result["error"] = type(exc).__name__
+        return result
+    result["rows"] = [dict(row) for row in rows]
+    requested_seasons = {int(value) for value in (payload["media"].get("requested_seasons") or [])}
+    if not requested_seasons:
+        result["matched"] = bool(rows)
+        return result
+    # A TV acknowledgement must retain the requested season scope.  If the
+    # current schema exposes requested_season, accept only an intersecting row;
+    # otherwise fail closed instead of claiming a whole-series acknowledgement.
+    scoped_rows = [row for row in rows if row["requested_season"] is not None and int(row["requested_season"]) in requested_seasons]
+    result["matched"] = bool(scoped_rows)
+    result["scoped_rows"] = [dict(row) for row in scoped_rows]
+    return result
+
+
+def _cli_debrid_failure_reason(evidence: dict[str, Any]) -> str:
+    if evidence.get("error"):
+        return "INGESTION_ACK_UNAVAILABLE"
+    return "CONTENT_SOURCE_NOT_MATCHED"
+
+
 def _standard_binding_hash(args: dict[str, Any]) -> str:
     value = json.dumps(_standard_argument_binding(args), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(value.encode()).hexdigest()
@@ -1807,6 +1884,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
 
     if args.get("episode_scope"):
         return {"status": "rejected", "reason": "STANDARD_EPISODE_SCOPE_UNSUPPORTED", "write_executed": False}
+    if not STANDARD_MEDIA_BACKEND_READY:
+        return {"status": "disabled", "reason": "STANDARD_MEDIA_BACKEND_NOT_READY", "write_executed": False, "request_shape": payload}
     if not STANDARD_MEDIA_WRITES_ENABLED:
         return {"status": "disabled", "reason": "STANDARD_MEDIA_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
     if payload["mediaType"] == "movie" and not STANDARD_MOVIE_WRITES_ENABLED:
@@ -1878,28 +1957,58 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     workflow.update({"confirmation_status": "SUBMITTING", "canonical_state": "REQUESTED", "mode": "standard"})
     _save_workflow_update(rows, workflow)
 
+    webhook_payload = _build_cli_debrid_overseerr_webhook(args, workflow_id)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     headers["X-Home-AI-Bridge-Token"] = _standard_bridge_secret()
+    transport_success = False
+    response_body: dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=12, headers=headers) as client:
         try:
-            await client.get(f"{CLIDEBRID_BASE}/api/v1/status")
-            response = await client.post(f"{CLIDEBRID_BASE}/api/v1/request", json=payload)
+            response = await client.post(f"{CLIDEBRID_BASE}/", json=webhook_payload)
             response.raise_for_status()
-            body = response.json() if response.content else {}
-        except Exception:
-            workflow.update({"confirmation_status": "FAILED", "canonical_state": "FAILED", "failure_reason": "BRIDGE_UNAVAILABLE"})
+            response_body = response.json() if response.content else {}
+            transport_success = True
+        except Exception as exc:
+            workflow.update({"confirmation_status": "CONSUMED", "canonical_state": "FAILED_INGESTION",
+                             "current_state": "FAILED_INGESTION", "failure_reason": "BRIDGE_UNAVAILABLE",
+                             "last_attempt": {"route": "cli_debrid_webhook", "transport_success": False,
+                                               "ingestion_confirmed": False, "error": type(exc).__name__,
+                                               "request_shape": payload, "attempted_at": now()}})
             _save_workflow_update(rows, workflow)
             raise
+    # The supported webhook returns transport success, not ownership proof.
+    # Confirm exact canonical persistence from cli_debrid's read-only database
+    # before exposing REQUESTED to the conversation state.
+    evidence = _cli_debrid_exact_item_evidence(webhook_payload)
+    if not evidence.get("matched"):
+        workflow.update({"confirmation_status": "CONSUMED", "current_state": "FAILED_INGESTION",
+                         "canonical_state": "FAILED_INGESTION", "storage_class": "unknown",
+                         "failure_reason": _cli_debrid_failure_reason(evidence),
+                         "standard_library": storage_policy["standard"]["library"],
+                         "request_shape": payload, "request_response": response_body,
+                         "last_attempt": {"route": "cli_debrid_webhook", "transport_success": transport_success,
+                                           "ingestion_confirmed": False, "failure_reason": _cli_debrid_failure_reason(evidence),
+                                           "evidence": evidence, "request_shape": payload, "attempted_at": now()}})
+        _save_workflow_update(rows, workflow)
+        return {"status": "failed_ingestion", "write_executed": True,
+                "submission_transport_success": transport_success, "ingestion_confirmed": False,
+                "reason": _cli_debrid_failure_reason(evidence), "workflow_id": workflow_id,
+                "request_shape": payload, "response": response_body}
     workflow.update({"confirmation_status": "CONSUMED", "current_state": "REQUESTED", "canonical_state": "REQUESTED",
                      "storage_class": "debrid", "standard_library": storage_policy["standard"]["library"],
                      "cli_debrid_state": "Wanted", "submitted_at": now(), "request_shape": payload,
-                     "request_response": {key: body.get(key) for key in ("id", "status", "type", "createdAt", "updatedAt") if key in body}})
+                     "request_response": response_body,
+                     "last_attempt": {"route": "cli_debrid_webhook", "transport_success": transport_success,
+                                       "ingestion_confirmed": True, "evidence": evidence, "request_shape": payload,
+                                       "attempted_at": now()}})
     _save_workflow_update(rows, workflow)
     return {
         "status": "submitted",
         "write_executed": True,
+        "submission_transport_success": transport_success,
+        "ingestion_confirmed": True,
         "workflow_id": workflow_id,
-        "cli_debrid": {key: body.get(key) for key in ("id", "status", "type", "createdAt", "updatedAt") if key in body},
+        "cli_debrid": response_body,
         "request_shape": payload,
     }
 
