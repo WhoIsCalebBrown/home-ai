@@ -948,11 +948,35 @@ def grounded_recent_activity_answer(result: dict) -> str | None:
     metadata = review.get("genai") or {}
     summary = metadata.get("shortSummary") or metadata.get("short_summary")
     if summary:
+        # GenAI scene prose is useful for action, but its clock strings are
+        # not authoritative and can be wrong by a timezone offset. The
+        # deterministic normalized timing above owns all clock statements.
+        summary = re.sub(r"\b(?:around|at|before|after)\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?", "", summary, flags=re.I)
+        summary = re.sub(r"\s+([,.])", r"\1", summary).strip()
         return f"Yes. {when}, {summary}"
     if isinstance(duration, (int, float)):
         return f"Yes. {when}, a person was visible for about {duration:g} seconds."
     objects = ", ".join(review.get("objects") or []) or "activity"
     return f"Yes. {when}, Frigate recorded {objects} at the front door."
+
+
+def historical_timing_question(text: str) -> bool:
+    return bool(re.search(r"\b(?:what\s+time\s+was\s+that|when\s+was\s+that|when\s+did\s+that|what\s+time\s+did\s+they|when\s+did\s+they)\b", text, re.I))
+
+
+def grounded_event_timing_answer(result: dict) -> str | None:
+    """Answer historical clock questions only from normalized event timing."""
+    events = result.get("events") or []
+    timing = (events[0].get("time") if events and isinstance(events[0], dict) else None) or result.get("time") or {}
+    start = timing.get("start") or {}
+    end = timing.get("end") or {}
+    start_display = start.get("display")
+    end_display = end.get("display")
+    if not start_display:
+        return None
+    if end_display and end_display != start_display:
+        return f"That event started at {start_display} and ended at {end_display}."
+    return f"That event happened at {start_display}."
 
 
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
@@ -2212,9 +2236,11 @@ async def generate_final(messages: list[dict]) -> str:
 def evidence_message(results: list[dict]) -> list[dict]:
     clean = []
     images = []
+    has_current_snapshot = False
     for item in results:
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         copy = dict(item)
+        has_current_snapshot = has_current_snapshot or item.get("tool") == "frigate_snapshot"
         if result.get("frames_base64"):
             images.extend(result["frames_base64"][:4])
             copy["result"] = {k: v for k, v in result.items() if k not in {"frames_base64", "image_base64"}}
@@ -2222,7 +2248,10 @@ def evidence_message(results: list[dict]) -> list[dict]:
             images.append(result["image_base64"])
             copy["result"] = {k: v for k, v in result.items() if k != "image_base64"}
         clean.append(copy)
-    messages = [{"role": "system", "content": "<internal_server_evidence>\n" + INTERNAL_EVIDENCE_RULE + "\n" + json.dumps(clean, separators=(",", ":"), ensure_ascii=False) + "\n</internal_server_evidence>"}]
+    current_rule = ""
+    if has_current_snapshot:
+        current_rule = "\nFor a current snapshot, answer only what is visible now. Do not infer that a historical person went inside, left, or remained present, and do not copy historical duration or clock claims into the current-state answer. If no person is visible, say that no person is visible now.\n"
+    messages = [{"role": "system", "content": "<internal_server_evidence>\n" + INTERNAL_EVIDENCE_RULE + current_rule + json.dumps(clean, separators=(",", ":"), ensure_ascii=False) + "\n</internal_server_evidence>"}]
     if images:
         messages.append({
             "role": "user",
@@ -2813,6 +2842,17 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     store_provenance(client_id, live_results)
                     await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
                     await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_recent_activity")
+                    history.append({"role": "assistant", "content": direct})
+                    await ws.send_json({"type": "done", "request_id": request_id})
+                    return
+        if live_results and historical_timing_question(user_text):
+            details_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "frigate_activity_details" and item.get("status") == "ok"), None)
+            if details_result is not None:
+                direct = grounded_event_timing_answer(details_result)
+                if direct:
+                    store_provenance(client_id, live_results)
+                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_event_timing")
                     history.append({"role": "assistant", "content": direct})
                     await ws.send_json({"type": "done", "request_id": request_id})
                     return
