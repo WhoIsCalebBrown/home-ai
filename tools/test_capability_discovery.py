@@ -361,6 +361,28 @@ def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow
     assert result["source_workflow_state"] == "SEARCHING"
 
 
+def test_media_status_query_matches_parenthesized_year(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module.MEDIA_WORKFLOWS_PATH.write_text(json.dumps([{
+        "workflow_id": "wf-hobbit", "media_type": "movie", "mode": "standard",
+        "current_state": "SEARCHING",
+        "canonical_identity": {"title": "The Hobbit", "year": 1977, "tmdb_id": 1362},
+    }]))
+
+    async def plex(_):
+        return {"matched": False, "candidates": []}
+
+    monkeypatch.setattr(module, "plex_match_canonical_media", plex)
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
+        "matched": True, "rows": [{"state": "Wanted", "tmdb_id": 1362, "type": "movie"}]
+    })
+    result = asyncio.run(module.media_status({"query": "The Hobbit (1977)"}))
+    assert result["found"] is True
+    assert result["workflow_id"] == "wf-hobbit"
+
+
 def test_media_status_does_not_report_blacklisted_item_as_requested(monkeypatch, tmp_path):
     import asyncio
     import json

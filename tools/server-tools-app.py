@@ -1867,6 +1867,11 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did)\s+", "", title_query, flags=re.I)
         title_query = re.sub(r"\s+(?:doing|going|ready|found|find|downloading|downloaded|in plex|there yet)\b.*$", "", title_query, flags=re.I).strip(" .?!")
         requested_year = parts.get("requested_year")
+        parenthesized_year = re.search(r"\((?:19|20)\d{2}\)", title_query)
+        if parenthesized_year:
+            if requested_year is None:
+                requested_year = int(parenthesized_year.group(0).strip("()"))
+            title_query = re.sub(r"\s*\((?:19|20)\d{2}\)", "", title_query).strip(" .?!")
         norm = re.sub(r"[^a-z0-9]+", " ", title_query.casefold()).strip()
         candidates = []
         for candidate in workflow_rows:
