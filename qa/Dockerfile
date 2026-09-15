@@ -4,5 +4,6 @@ RUN pip install --no-cache-dir \
     pytest==8.3.5 \
     fastapi==0.115.6 \
     httpx==0.28.1 \
-    pydantic==2.10.6
+    pydantic==2.10.6 \
+    websockets==14.2
 WORKDIR /repo

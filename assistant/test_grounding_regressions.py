@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "media_status_display_title", "is_confirmation"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "media_status_display_title", "is_confirmation", "store_provenance"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -16,7 +16,7 @@ def is_needed_assignment(node):
 
 
 nodes = [node for node in tree.body if getattr(node, "name", None) in needed or is_needed_assignment(node)]
-namespace = {"json": json, "re": re, "time": time}
+namespace = {"json": json, "re": re, "time": time, "provenance": {}}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "voice-api-app.py", "exec"), namespace)
 SOURCE_NAMES = namespace["SOURCE_NAMES"]
 evidence_supported_answer = namespace["evidence_supported_answer"]
@@ -41,6 +41,7 @@ complete_speakable_sentence = namespace["complete_speakable_sentence"]
 direct_structured_answer = namespace["direct_structured_answer"]
 media_plan_response = namespace["media_plan_response"]
 is_confirmation = namespace["is_confirmation"]
+store_provenance = namespace["store_provenance"]
 current_external_question = namespace["current_external_question"]
 explicit_web_search_request = namespace["explicit_web_search_request"]
 historical_camera_question = namespace["historical_camera_question"]
@@ -81,6 +82,25 @@ def test_natural_media_acquisition_language_resolves_to_planner():
         assert media_goal_request(text)
         assert explicit_domain(text) == "media"
         assert preflight_plan(text) == [("media_plan_goal", {"goal": text})]
+
+
+def test_bounded_docker_stt_repair_preserves_server_routing():
+    repaired = routing_aliases("me to dock or run and count.")
+    assert "Docker" in repaired
+    assert preflight_plan(repaired) == [("list_containers", {"status": "running"})]
+    assert routing_aliases("The boat is near the dock.") == "The boat is near the dock."
+
+
+def test_not_found_media_status_retains_domain_for_next_title_followup():
+    conversation_context["media-not-found"] = {"domain": "media", "group": "media"}
+    store_provenance("media-not-found", [{
+        "tool": "media_status", "status": "ok",
+        "result": {"found": False, "status": "NOT_FOUND", "query": "The Hobbit"},
+    }])
+    state = conversation_context["media-not-found"]
+    assert state["domain"] == "media"
+    assert state["latest_media_status"]["status"] == "NOT_FOUND"
+    assert preflight_plan("What about Dumb and Dumber?", state) == [("media_status", {"query": "What about Dumb and Dumber?"})]
 
 
 def test_direct_file_and_playback_requests_do_not_become_acquisition():

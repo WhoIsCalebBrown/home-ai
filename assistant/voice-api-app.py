@@ -929,6 +929,14 @@ ARTIST_ALIASES = {"travis": "Travis Scott", "travis scott": "Travis Scott"}
 
 def routing_aliases(text: str) -> str:
     """Normalize high-confidence STT aliases only for routing, never for display/history."""
+    # Bounded Whisper repair observed in the audio corpus: "Docker running
+    # count" can become "dock or run and count".  Require the complete server
+    # shape before repairing; ordinary uses of "dock" remain untouched.
+    if (re.search(r"\bdock\s+or\b", text, re.I)
+            and re.search(r"\b(?:run|running)\b", text, re.I)
+            and re.search(r"\bcount\b", text, re.I)):
+        text = re.sub(r"\bdock\s+or\b", "Docker", text, flags=re.I)
+        text = re.sub(r"\brun\s+and\s+count\b", "running count", text, flags=re.I)
     if re.search(r"\b(lidar|lidarr|plexium|plex|music|album|artist|added|download)\b", text, re.I):
         text = re.sub(r"\blidar\b", "Lidarr", text, flags=re.I)
         text = re.sub(r"\bplexium\b", "Plex", text, flags=re.I)
@@ -1648,16 +1656,29 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
                                                "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
                                                "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
                                                "canonical_identity": identity, "media_type": result.get("goal", {}).get("media_type")}
-        elif last.get("tool") == "media_status" and result.get("found") and result.get("workflow_id"):
+        elif last.get("tool") == "media_status":
             identity = result.get("canonical_identity") or {}
-            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names,
-                                               "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
-                                               "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
-                                               "canonical_identity": identity, "media_type": result.get("media_type") or identity.get("media_type"),
-                                               "latest_media_workflow": {"workflow_id": result.get("workflow_id"),
-                                                                          "canonical_external_id": identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("foreign_album_id"),
-                                                                          "media_type": result.get("media_type") or identity.get("media_type"),
-                                                                          "title": identity.get("title"), "mode": result.get("mode", "standard")}}
+            updated = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names}
+            if result.get("workflow_id"):
+                updated.update({
+                    "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
+                    "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
+                    "canonical_identity": identity, "media_type": result.get("media_type") or identity.get("media_type"),
+                    "latest_media_workflow": {"workflow_id": result.get("workflow_id"),
+                                               "canonical_external_id": identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("foreign_album_id"),
+                                               "media_type": result.get("media_type") or identity.get("media_type"),
+                                               "title": identity.get("title"), "mode": result.get("mode", "standard")},
+                })
+            else:
+                # A truthful NOT_FOUND result is still a media-domain result.
+                # Retain that domain so a next-turn title referent such as
+                # “What about Dumb and Dumber?” uses media_status rather than
+                # falling through to Qwen.  Do not fabricate a workflow.
+                updated["latest_media_status"] = {
+                    "query": result.get("query"),
+                    "status": result.get("status", "NOT_FOUND"),
+                }
+            conversation_context[client_id] = updated
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):
