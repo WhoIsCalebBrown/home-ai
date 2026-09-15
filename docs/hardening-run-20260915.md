@@ -52,6 +52,16 @@ This journal records evidence and falsification attempts. Production media write
 - Runtime/template drift report is clean; Tools health reports contract `1.0` and 67 tools.
 - Recovery experiment: Assistant initially started before Tools and logged `TOOLS_BACKEND_UNAVAILABLE`; after Tools became healthy it recovered to `TOOLS_BACKEND_READY` without a code change. This proves recovery but also identifies startup ordering as a remaining availability concern.
 - The provider-read failure fix is deployed in Assistant/Tools `sha-c4e9420`; runtime image digests are Assistant `sha256:0a450291ee768205ed568c7c17154c937c4d057e3d1d5e915e6f8139c7315fef` and Tools `sha256:da8dd8fae140beb34cf338084c070b43c4f2a2b55704cda3d224cfd52efa9b3f`. Rollback templates are timestamped under `/boot/config/plugins/dockerMan/templates-user/*.bak-hardening-*` on Unraid.
+
+## Frigate health-parser experiment
+
+- Observation: the production read-only smoke lane returned `JSONDecodeError` for `frigate_status`, while `frigate_recent_events` succeeded.
+- Hypothesis: the live Frigate `/api/version` endpoint returns plain text, but the generic Tools JSON helper was used.
+- Prediction/control: direct in-container read should show `text/plain`; JSON event endpoints should remain unchanged.
+- Experiment: direct read returned `200 text/plain` with `0.17.2-3d4dd3a`; the focused parser regression covers both plain text and JSON bodies; the disposable QA lane passed 104 tests.
+- Fix: Tools `sha-275d670` uses an explicit bounded text-or-JSON parser only for `/api/version`. The production smoke lane now fails on structured tool errors instead of treating HTTP 200 as success.
+- Live replication: Assistant discovery still exposes 67 tools; `frigate_status` now returns `status=ok`, `reachable=true`, and the live version through the Assistant network path. No Frigate image or configuration was changed.
+- Rollback: `/boot/config/plugins/dockerMan/templates-user/Home-AI-Tools.xml.bak-hardening-20260915T052759Z`.
 - Live read-only status: The Hobbit is `AVAILABLE` in Movies-DB with exact TMDB 1362 evidence and `storage_class=debrid`; Dumb and Dumber is `NO_CANDIDATE` from cli_debrid `Blacklisted`, with no Plex match. No request was submitted during this hardening pass.
 - Live read-only smoke lane succeeded for containers, Plex, Frigate events, weather, media storage, and SearXNG-backed web search.
 - Isolated qualification lane now has 102 passing tests, including 140 acquisition-language mutations, parallel cross-session confirmation rejection, side-effect tripwires, expiry, provider failure, exact episode fail-closed behavior, restart persistence, and canonical-ID collision checks. A 50-iteration network-isolated safety soak also passed.
