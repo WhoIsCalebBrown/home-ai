@@ -1118,13 +1118,13 @@ def media_status_question(text: str) -> bool:
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
     question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is)|i\s+was|can i)\b", routed_text, re.I)
-    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch|pipeline)\b", routed_text, re.I)
+    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch|pipeline|already)\b", routed_text, re.I)
     if question_frame and status_word:
         return True
     # STT often drops the opening question frame. Treat a multi-token media
     # subject followed by a completion/status assertion as read-only status,
     # while excluding acquisition language.
-    return bool(status_word and re.search(r"\b(?:download(?:ed|ing)?|finish(?:ed)?|found|ready|import(?:ed)?)\b", routed_text, re.I)
+    return bool(status_word and re.search(r"\b(?:download(?:ed|ing)?|finish(?:ed)?|found|ready|import(?:ed)?|already|watch)\b", routed_text, re.I)
                 and (not media_acquisition_language(routed_text) or re.search(r"\bget\s+found\b", routed_text, re.I))
                 and media_title_status_signal(routed_text))
 
@@ -1141,7 +1141,7 @@ def media_title_status_signal(text: str) -> bool:
         return True
     if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|watch|pipeline)\b", text, re.I):
         return True
-    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+was)\s+", "", text, flags=re.I)
+    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+(?:was|watch))\s+", "", text, flags=re.I)
     subject = re.split(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b", subject, maxsplit=1, flags=re.I)[0]
     tokens = re.findall(r"[a-z0-9]+", subject.casefold())
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
