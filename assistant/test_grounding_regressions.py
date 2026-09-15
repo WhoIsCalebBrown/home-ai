@@ -102,6 +102,7 @@ def test_media_status_questions_use_live_status_capability():
     assert preflight_plan("dumb and dumb already") == [("media_status", {"query": "dumb and dumb already"})]
     assert preflight_plan("I watch The Hobbit now") == [("media_status", {"query": "I watch The Hobbit now"})]
     assert preflight_plan("I watched The Hobbit now") == [("media_status", {"query": "I watched The Hobbit now"})]
+    assert preflight_plan("Gotta watch The Hobbit now") == [("media_status", {"query": "Gotta watch The Hobbit now"})]
     assert preflight_plan("Is Dumb and Dumber ready in Plex?") == [("media_status", {"query": "Is Dumb and Dumber ready in Plex?"})]
     assert media_title_status_signal("as the 10th kingdom ready")
     assert preflight_plan("as the 10th kingdom ready") == [("media_status", {"query": "as the 10th kingdom ready"})]
