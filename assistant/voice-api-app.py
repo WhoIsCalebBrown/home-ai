@@ -38,6 +38,7 @@ MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 LLM_CONTEXT = int(os.getenv("LLM_CONTEXT", "4096"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
+TOOLS_CONTRACT_VERSION = os.getenv("TOOLS_CONTRACT_VERSION", "1.0")
 SAMPLES_DIR = Path(os.getenv("TTS_SAMPLES_DIR", "/app/tts-tests/kokoro-comparison")).resolve()
 COMPARISON_DIR = Path(os.getenv("TTS_COMPARISON_DIR", "/app/tts-tests/chatterbox-comparison")).resolve()
 PRONUNCIATION_LEXICON = Path(os.getenv("PRONUNCIATION_LEXICON", "/app/pronunciation/approved-pronunciation-lexicon.yaml")).resolve()
@@ -67,8 +68,10 @@ async def check_tools_backend() -> None:
             count = int(payload.get("tools", 0))
             if count <= 0:
                 raise RuntimeError("empty tool registry")
+            if str(payload.get("contract_version", "")) != TOOLS_CONTRACT_VERSION:
+                raise RuntimeError("incompatible tool contract")
             tools_backend_status = {"ok": True, "status": "READY", "url": TOOLS_URL,
-                                    "tool_count": count, "service": payload.get("service")}
+                                    "tool_count": count, "service": payload.get("service"), "contract_version": payload.get("contract_version")}
             print(f"TOOLS_BACKEND_READY url={TOOLS_URL} tools={count}", flush=True)
     except Exception as exc:
         tools_backend_status = {"ok": False, "status": "TOOLS_BACKEND_UNAVAILABLE",
@@ -532,6 +535,8 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
             response.raise_for_status()
             payload = response.json()
+            if str(payload.get("contract_version", "")) != TOOLS_CONTRACT_VERSION:
+                raise RuntimeError("incompatible tool contract")
             entries = payload.get("tools", [])
             return [item["function"] for item in entries], [item.get("metadata", {}) for item in entries], round((time.perf_counter() - started) * 1000, 2)
     except Exception as exc:

@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
+TOOL_CONTRACT_VERSION = "1.0"
 
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
@@ -2352,7 +2353,7 @@ def public_schema(item):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "tools": len(REGISTRY), "service": "server-tools"}
+    return {"ok": True, "tools": len(REGISTRY), "service": "server-tools", "contract_version": TOOL_CONTRACT_VERSION}
 
 
 @app.get("/registry")
@@ -2360,7 +2361,7 @@ async def registry(groups: str = ""):
     requested = {item.strip() for item in groups.split(",") if item.strip()}
     services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
     items = REGISTRY if not requested else [item for item in REGISTRY if item[3] in services]
-    return {"tools": [public_schema(x) for x in items], "groups": sorted(requested)}
+    return {"tools": [public_schema(x) for x in items], "groups": sorted(requested), "contract_version": TOOL_CONTRACT_VERSION}
 
 
 @app.get("/media/capabilities")
@@ -2378,7 +2379,7 @@ async def discover(query: str, max_results: int = 8, context_json: str = ""):
     except json.JSONDecodeError:
         context = {}
     results = discover_capabilities(query, max_results, context)
-    return {"tools": results, "query": query, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "total_enabled": len(REGISTRY)}
+    return {"tools": results, "query": query, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "total_enabled": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION}
 
 
 @app.post("/invoke")
