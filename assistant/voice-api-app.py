@@ -626,6 +626,11 @@ def front_door_presence_question(text: str) -> bool:
     return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion|alert|alerts|detection|detected)\b", text, re.I))
 
 
+def current_camera_presence_question(text: str) -> bool:
+    """A retained historical referent may be used to ask about the present."""
+    return bool(re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment|what(?:'s| is)\s+(?:happening|there))\b", text, re.I))
+
+
 def dynamic_fact_question(text: str) -> bool:
     return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline|news|policy|policies|president|version|release|product)\b", text, re.I))
 
@@ -789,6 +794,28 @@ def grounded_camera_presence_answer(result: dict) -> str:
             when = f"about {round(age / 60)} minutes ago"
         return f"Yeah, someone was at the front door {when}, but they aren't there now."
     return "Someone was detected at the front door, but I can't tell if they're still there right now."
+
+
+def grounded_recent_activity_answer(result: dict) -> str | None:
+    """Answer a latest-only activity read from deterministic review evidence."""
+    if not result.get("latest_only"):
+        return None
+    reviews = result.get("reviews") or []
+    if not reviews:
+        return "I haven't found any recent activity at the front door."
+    review = reviews[0]
+    timing = review.get("time") or {}
+    start = timing.get("start") or {}
+    when = start.get("relative_time") or "recently"
+    duration = timing.get("duration_seconds")
+    metadata = review.get("genai") or {}
+    summary = metadata.get("shortSummary") or metadata.get("short_summary")
+    if summary:
+        return f"Yes. {when}, {summary}"
+    if isinstance(duration, (int, float)):
+        return f"Yes. {when}, a person was visible for about {duration:g} seconds."
+    objects = ", ".join(review.get("objects") or []) or "activity"
+    return f"Yes. {when}, Frigate recorded {objects} at the front door."
 
 
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
@@ -1499,7 +1526,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         if re.search(r"\b(?:how\s+long|duration|what\s+time|when\s+was\s+that|when\s+did\s+that)\b", text, re.I):
             return [("frigate_activity_details", {"event_id": event_id})]
         if activity_question(text):
-            return [("frigate_event_activity", {"event_id": event_id})]
+            return [("frigate_activity_details", {"event_id": event_id})]
         return [("frigate_event_snapshot", {"event_id": event_id})]
     if context.get("latest_event_id"):
         event_id = context["latest_event_id"]
@@ -1552,7 +1579,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if remove_match:
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
     if context.get("latest_event_id") and activity_question(text):
-        return [("frigate_event_activity", {"event_id": context["latest_event_id"]})]
+        return [("frigate_activity_details", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and visual_question(text):
         return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(?:yeah|yes|that's|that is|exactly|right)\b", t):
@@ -2165,6 +2192,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # they do not replace the user turn.  Exclude the just-appended user
         # entry from retained history so referential turns do not duplicate it.
         model_history = history[-7:-1] if has_referential_language(user_text) else []
+        # A current-state camera question must be grounded in the current
+        # snapshot, not in prose from the historical event conversation. The
+        # structured referent is retained separately for routing, but old
+        # assistant wording must not leak historical duration/action claims
+        # into the present-tense answer.
+        if current_camera_presence_question(user_text):
+            model_history = []
         messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": user_text}]
         context = turn_context(client_id, user_text)
         contextual = contextual_entity_resolution(user_text, context)
@@ -2220,6 +2254,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
+        # Planned tools have already been executed against the bounded
+        # arguments. Do not expose the same capability to Qwen for a second
+        # discretionary call; synthesis still receives the evidence below.
+        if planned:
+            tools = []
         if current_external_question(user_text) or context.get("domain") == "web_research":
             search_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "web_search" and item.get("status") == "ok"), None)
             first_url = next((item.get("url") for item in (search_result or {}).get("results", []) if item.get("url")), None)
@@ -2260,6 +2299,17 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        if live_results and any(item.get("tool") == "frigate_recent_activity" for item in live_results):
+            activity_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "frigate_recent_activity" and item.get("status") == "ok"), None)
+            if activity_result is not None:
+                direct = grounded_recent_activity_answer(activity_result)
+                if direct:
+                    store_provenance(client_id, live_results)
+                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_recent_activity")
+                    history.append({"role": "assistant", "content": direct})
+                    await ws.send_json({"type": "done", "request_id": request_id})
+                    return
         if live_results and any(item.get("tool") == "investigate_media_pipeline" and item.get("status") == "ok" for item in live_results):
             investigation = next(item.get("result", {}) for item in live_results if item.get("tool") == "investigate_media_pipeline")
             direct = grounded_investigation_answer(investigation, user_text)
