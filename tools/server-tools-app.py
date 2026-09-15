@@ -1487,8 +1487,9 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
             break
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"^\s*put\s+", "", title, flags=re.I)
-    title = re.sub(r"\s+(?:on|in)\s+(?:my\s+)?plex\s*$", "", title, flags=re.I)
-    title = re.sub(r"\s+for\s+me\s*$", "", title, flags=re.I)
+    title = title.strip(" .?!")
+    title = re.sub(r"\s+(?:on|in)\s+(?:my\s+)?plex\s*[.!?]*$", "", title, flags=re.I)
+    title = re.sub(r"\s+for\s+me\s*[.!?]*$", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|give|grab|add|request) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     if requested_year:
         title = re.sub(rf"\s*(?:from|in)\s+{requested_year}\b|\s*\({requested_year}\)", "", title, flags=re.I).strip(" .?!")
