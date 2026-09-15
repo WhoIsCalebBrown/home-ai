@@ -1545,6 +1545,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if action and action.get("conversation_id") != client_id:
         pending.pop(client_id, None)
         action = None
+    if not action and is_confirmation(user_text):
+        previous_media = conversation_context.get(client_id, {}).get("latest_media_workflow") or {}
+        if previous_media.get("execution_status") in {"error", "failed_ingestion", "rejected", "disabled"}:
+            full = "That request did not make it into the media queue, so I haven't started anything. I can prepare a fresh request if you want."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="media_confirmation_after_failure")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
     if action and is_confirmation(user_text):
         pending.pop(client_id, None)
         action_name = action.get("name")
@@ -1567,6 +1575,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 full = f"I couldn't restart {display_target}."
         elif action_name == "media_standard_request":
             details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            outer_status = result.get("status")
+            execution_status = details.get("status")
+            execution_reason = details.get("reason") or details.get("error")
             media_state = dict(conversation_context.get(client_id, {}))
             media_state.update({
                 "domain": "media", "kind": "media_workflow", "group": "media",
@@ -1578,13 +1589,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     "media_type": action.get("arguments", {}).get("media_type"),
                     "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
                     "mode": "standard",
-                    "execution_status": details.get("status"),
-                    "reason": details.get("reason"),
+                    "execution_status": execution_status or outer_status,
+                    "reason": execution_reason,
                 },
             })
             conversation_context[client_id] = media_state
-            status = details.get("status")
-            if status == "submitted" and details.get("ingestion_confirmed"):
+            status = execution_status
+            if outer_status != "ok":
+                full = "I couldn't hand that request off to your media queue."
+            elif status == "submitted" and details.get("ingestion_confirmed"):
                 full = "Done. It's looking for it now."
             elif status == "no_op":
                 full = "It's already on the way."

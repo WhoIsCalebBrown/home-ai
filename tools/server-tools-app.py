@@ -30,7 +30,9 @@ app = FastAPI(title="Local Server Tools", version="2026.09.13")
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
-CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", f"{TOWER}:5000/webhook").rstrip("/")
+# cli_debrid is bound to localhost on the Unraid host.  Home-AI-Tools reaches
+# it through the private voiceai network, never through the host-published port.
+CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", "http://cli_debrid:5000/webhook").rstrip("/")
 CLIDEBRID_BRIDGE_TOKEN = os.getenv("CLIDEBRID_BRIDGE_TOKEN", "")
 # Home-AI-Tools mounts the Unraid appdata root at /config; cli_debrid's
 # token lives below its mounted config directory.  Keep the path server-side
