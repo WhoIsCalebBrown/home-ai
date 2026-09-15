@@ -102,6 +102,7 @@ def test_media_status_questions_use_live_status_capability():
     assert preflight_plan("has the 10th kingdom ready") == [("media_status", {"query": "has the 10th kingdom ready"})]
     assert media_title_status_signal("How is Dumb and Dumber doing?")
     assert preflight_plan("How is Dumb and Dumber doing?") == [("media_status", {"query": "How is Dumb and Dumber doing?"})]
+    assert preflight_plan("I was Dumb and Dumber doing") == [("media_status", {"query": "I was Dumb and Dumber doing"})]
 
 
 def test_media_status_does_not_turn_acquisition_language_into_status():
