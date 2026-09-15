@@ -1172,7 +1172,7 @@ def media_status_question(text: str) -> bool:
     routed_text = routing_aliases(text)
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
-    if re.search(r"\bwhere(?:'s|\s+is)\b", routed_text, re.I) and media_title_status_signal(routed_text):
+    if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
     question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was)|i\s+was|can i)\b", routed_text, re.I)
     status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already)\b", routed_text, re.I)
@@ -1205,6 +1205,14 @@ def media_title_status_signal(text: str) -> bool:
     if where_match:
         subject_tokens = re.findall(r"[a-z0-9]+", where_match.group(1).casefold())
         blocked = {"my", "our", "your", "package", "car", "keys", "phone", "house", "home", "dog", "cat", "person", "server", "container", "camera", "door", "weather", "news", "outside", "now", "currently"}
+        return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 2 and not (set(subject_tokens) & blocked)
+    # ASR can turn "where's <title>" into "where it's <title>" or prepend a
+    # short filler. Keep this a bounded read-only status signal, not a title
+    # alias, and reject local/public-domain nouns.
+    where_its = re.search(r"\bwhere\s+it(?:'s|\s+is)\s+(.+?)\s*[?.!]*$", text, re.I)
+    if where_its:
+        subject_tokens = re.findall(r"[a-z0-9]+", where_its.group(1).casefold())
+        blocked = {"weather", "outside", "news", "politics", "camera", "door", "server", "container", "docker", "storage"}
         return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 2 and not (set(subject_tokens) & blocked)
     subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)(?:\s+(?:a|the))?|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+(?:was|watch(?:ed)?)|(?:gotta|going\s+to)\s+watch)\s+", "", text, flags=re.I)
     subject = re.split(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b", subject, maxsplit=1, flags=re.I)[0]
@@ -1268,10 +1276,17 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     # when Whisper dropped the noun ("movie/show") and retained only the title
     # plus a status frame. This must outrank inherited context but comes after
     # explicit weather/server/web/camera markers above.
-    if not re.search(r"\b(front\s+door|camera|frigate|snapshot|weather|forecast|temperature|rain|snow|docker|container|server|storage|news|politics?)\b", lowered) and media_status_question(text):
+    camera_live_followup = bool(prior and prior.get("domain") == "camera" and re.search(r"\b(?:outside|right now|currently|happening)\b", lowered))
+    if not camera_live_followup and not re.search(r"\b(front\s+door|camera|frigate|snapshot|weather|forecast|temperature|rain|snow|docker|container|server|storage|news|politics?)\b", lowered) and media_status_question(text):
         return "media"
     if re.search(r"\b(lidarr|lidar|plexium|plex|sonarr|radarr|qbittorrent|slskd|torbox|music|album|artist|download|downloading|travis|utopia|media pipeline)\b", lowered):
         return "media"
+    # In a retained camera conversation, "outside/right now" is a live-camera
+    # continuation even though the generic status grammar also sees
+    # "happening" as a possible media status word.  Explicit web/weather/server
+    # markers have already returned above.
+    if prior and prior.get("domain") == "camera" and re.search(r"\b(?:outside|right now|currently|happening)\b", lowered):
+        return "camera"
     if re.search(r"\b(front door|camera|cameras|frigate|snapshot|screenshot|event image)\b", lowered):
         return "camera"
     if prior and prior.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian)\b", lowered):
@@ -1376,6 +1391,14 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # workflow exists or when the current turn explicitly switches domains.
     if retained_media_status_repair(text, context):
         return [("media_status", {"workflow_id": latest_media.get("workflow_id") or context.get("workflow_id")})]
+    diagnosis_signal = re.search(r"\b(?:why|stuck|blocking|taking\s+so\s+long|holding\s+up|diagnos(?:e|is|ed))\b", t, re.I)
+    if latest_media.get("workflow_id") and diagnosis_signal:
+        return [("media_diagnose", {"workflow_id": latest_media["workflow_id"]})]
+    # Do not broaden a diagnosis with no canonical workflow into a global
+    # download investigation. That would inspect unrelated services and can
+    # make a missing referent sound like an active request.
+    if context.get("domain") == "media" and diagnosis_signal:
+        return []
     # Status language must outrank the broad media-goal regex below.  Without
     # this guard, "How is the movie doing?" is misclassified as a new plan
     # because the word "doing" appears in the historical acquisition phrase
@@ -1462,6 +1485,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # media-status matcher (for example, "What's new in Plex?").
     if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
         return [("plex_recently_added", {"limit": 1})]
+    # A retained canonical workflow makes diagnosis a bounded read of that
+    # workflow.  Keep this ahead of the generic status matcher so phrases
+    # such as "why isn't it ready?" do not degrade into another status read.
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
@@ -1470,11 +1496,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:
         return [("media_plan_goal", {"goal": text})]
-    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health)\b", t):
+    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
             plan.append(("get_gpu_status", {}))
-        if re.search(r"\b(container|containers|docker|service|services)\b", t) or (context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t)):
+        if re.search(r"\b(container|containers|docker|service|services)\b", t) or re.search(r"\b(?:server|system)\s+(?:health|status|overview)\b", t) or (context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t)):
             status = next((value for value in ("running", "stopped", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t)), None)
             if status == "stopped":
                 status = "exited"
@@ -1838,7 +1864,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"{verb} for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
         explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr|blackhawk|flying|helicopter|toronto|heard|search|look into|technology|ai)\b", lowered)
-        followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
+        followup = re.search(r"\b(they|them|that|it|there|outside|now|currently|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find|happening)\b", lowered)
         if followup and not explicit_camera_topic:
             return f"front door camera current snapshot person {text}"
     if context.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian|topic|story)", lowered):
@@ -1864,7 +1890,7 @@ def ambiguous_container_status_followup(text: str, context: dict) -> bool:
     if context.get("referent_type") != "containers":
         return False
     lowered = text.casefold().strip(" .?!")
-    return bool(re.fullmatch(r"(?:what|how) about start", lowered))
+    return bool(re.fullmatch(r"(?:so\s+)?(?:what|how) about start", lowered))
 
 
 async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str) -> None:

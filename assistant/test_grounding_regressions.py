@@ -305,6 +305,35 @@ def test_explicit_live_front_door_language_uses_current_snapshot():
     ]
 
 
+def test_camera_context_maps_outside_now_to_live_snapshot():
+    context = {"domain": "camera", "group": "cameras", "camera": "front_door"}
+    conversation_context["camera-outside"] = context
+    routed = resolved_followup_text("camera-outside", "What's happening outside now?")
+    assert preflight_plan(routed, context) == [("frigate_snapshot", {"camera": "front_door"})]
+
+
+def test_retained_media_diagnosis_beats_generic_status():
+    context = {"latest_media_workflow": {"workflow_id": "wf-8467"}}
+    assert preflight_plan("Why isn't it ready?", context) == [
+        ("media_diagnose", {"workflow_id": "wf-8467"})
+    ]
+
+
+def test_server_status_is_a_bounded_read():
+    assert preflight_plan("What is the server status?") == [("list_containers", {})]
+
+
+def test_asr_where_its_title_stays_a_media_status_read():
+    assert preflight_plan("out where it's dumb and dumber") == [
+        ("media_status", {"query": "out where it's dumb and dumber"})
+    ]
+
+
+def test_asr_so_what_about_start_stays_ambiguous():
+    context = {"referent_type": "containers"}
+    assert ambiguous_container_status_followup("So what about start?", context)
+
+
 def test_retained_media_workflow_status_outranks_new_media_plan():
     context = {"latest_media_workflow": {"workflow_id": "wf-8467"}}
     assert preflight_plan("How is Dumb and Dumber doing?", context) == [
