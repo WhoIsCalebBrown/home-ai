@@ -1102,9 +1102,14 @@ def media_nouns_for_status(text: str) -> bool:
 
 def media_title_status_signal(text: str) -> bool:
     """Recognize a likely title in a status frame when STT drops the title's type word."""
-    if re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage)\b", text, re.I):
+    if re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage|server|service|process|disk)\b", text, re.I):
         return False
-    return bool(re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet)\b", text, re.I))
+    if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet)\b", text, re.I):
+        return True
+    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|did|where\s+is|what(?:'s|\s+is))\s+", "", text, flags=re.I)
+    subject = re.split(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet|status|progress)\b", subject, maxsplit=1, flags=re.I)[0]
+    tokens = re.findall(r"[a-z0-9]+", subject.casefold())
+    return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
 
 
 def media_status_display_title(result: dict, user_text: str) -> str:

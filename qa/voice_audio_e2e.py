@@ -71,6 +71,7 @@ READ_ONLY_SCENARIOS = {
     "direct_file": {
         "text": "Send me the Dumb and Dumber movie file here.",
         "allowed_tools": set(),
+        "require_tool": False,
     },
     "containers_filler": {
         "text": "Uh, can you tell me how many containers are running?",
@@ -193,6 +194,8 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
         unexpected = selected - scenario["allowed_tools"]
         if unexpected:
             result.error = f"unexpected tool selection: {sorted(unexpected)}"
+        elif scenario.get("require_tool", bool(scenario["allowed_tools"])) and not selected:
+            result.error = "expected a read-only tool, but no tool was selected"
     except Exception as exc:  # pragma: no cover - exercised by live harness
         result.error = f"{type(exc).__name__}: {exc}"
     result.elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -241,6 +244,7 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
             selected = {item.get("tool") for item in traces if item.get("status") == "ok"}
             unexpected = selected - allowed_tools
             if unexpected: error = f"unexpected tool selection: {sorted(unexpected)}"
+            elif allowed_tools and not selected: error = "expected a read-only tool, but no tool was selected"
             results.append({"turn": index + 1, "source_text": text, "transcript": transcript,
                             "answer": answer, "tools": traces, "audio_chunks": chunks,
                             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
