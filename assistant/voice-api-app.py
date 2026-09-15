@@ -1117,7 +1117,15 @@ def playback_request(text: str) -> bool:
     """Keep playback/control language distinct from library acquisition."""
     if direct_file_request(text):
         return False
-    return bool(re.search(r"\b(?:play|stream)\b", text, re.I))
+    if re.search(r"\b(?:play|stream)\b", text, re.I):
+        return True
+    # Whisper can drop the leading playback verb while retaining the delivery
+    # target (for example, "a movie inside this conversation").  This shape
+    # is still a direct playback/delivery request, never a Plex search.
+    return bool(
+        re.search(r"\b(?:movie|film|video|show)\b", text, re.I)
+        and re.search(r"\b(?:inside|in)\s+(?:this|the)\s+(?:conversation|chat)\b", text, re.I)
+    )
 
 
 def media_identity_signal(text: str) -> bool:

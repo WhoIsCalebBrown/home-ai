@@ -139,6 +139,8 @@ def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Upload Dumb and Dumber into this chat.")
     assert not media_goal_request("Send me the Dumb and Dumber movie file here.")
     assert not media_goal_request("Upload Dumb and Dumber into this chat.")
+    assert playback_request("a movie inside this conversation")
+    assert not media_goal_request("a movie inside this conversation")
 
 
 def test_total_live_tool_failure_cannot_become_model_grounded_answer():
