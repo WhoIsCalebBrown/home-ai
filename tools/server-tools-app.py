@@ -1458,6 +1458,10 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
             kind = "anime" if "anime" in lowered else "tv"
         elif re.search(r"\b(movie|film|hobbit)\b", lowered):
             kind = "movie"
+        elif re.search(r"\b(?:from|in)\s+(?:19|20)\d{2}\b", lowered):
+            # A year-qualified untyped media request is safely movie-shaped;
+            # album/series language has already claimed those branches above.
+            kind = "movie"
         else:
             kind = "unknown"
     artist = None
@@ -1477,7 +1481,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     # title words, before identity lookup.
     for _ in range(5):
         before = title
-        title = re.sub(r"^\s*(?:please\s+)?(?:a\s+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:get|find|add|request)(?:\s+me)?\s+", "", title, flags=re.I)
         if title == before:
             break
