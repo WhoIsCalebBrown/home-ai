@@ -925,6 +925,11 @@ def routing_aliases(text: str) -> str:
     # unmistakably surrounded by the local media/Plex domain.
     if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist|going\s+to|end\s+up|eventually|headed|added)\b", text, re.I):
         text = re.sub(r"\blitter\b", "Lidarr", text, flags=re.I)
+    # Faster-Whisper occasionally hears "storage" as "stores".  Keep this
+    # correction tightly scoped to an unmistakable capacity question; do not
+    # turn ordinary references to stores into infrastructure intent.
+    if re.search(r"\bhow\s+much\b", text, re.I) and re.search(r"\b(stores?|left|free|space|disk|cache)\b", text, re.I):
+        text = re.sub(r"\bstores?\b", "storage", text, flags=re.I)
     return text
 
 
@@ -1220,7 +1225,10 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if context.get("latest_event_id") and re.search(r"\b(event|detection|image|snapshot|that)\b", t) and visual_question(text):
         return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t):
-        status = next(value for value in ("running", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t))
+        status = next((value for value in ("running", "stopped", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t)), None)
+        if status is None:
+            return [("list_containers", {})]
+        status = "exited" if status == "stopped" else status
         return [("list_containers", {"status": status})]
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", t):
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]

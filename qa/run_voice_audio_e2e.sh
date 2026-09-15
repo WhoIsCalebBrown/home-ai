@@ -6,6 +6,11 @@ set -euo pipefail
 # strictly read-only.  Do not add write-capable scenarios to this entrypoint.
 host=${HOME_AI_HOST:-unraid}
 container=${HOME_AI_ASSISTANT_CONTAINER:-Home-AI-Assistant}
-scenario=${1:-containers}
+if [[ $# -eq 0 ]]; then
+  set -- --scenario containers
+elif [[ "$1" != --* ]]; then
+  set -- --scenario "$@"
+fi
 
-ssh "$host" "docker exec -i '$container' python3 - --scenario '$scenario'" < "$(dirname "$0")/voice_audio_e2e.py"
+printf '%q ' "$@" >/dev/null
+ssh "$host" "docker exec -i '$container' python3 - $*" < "$(dirname "$0")/voice_audio_e2e.py"

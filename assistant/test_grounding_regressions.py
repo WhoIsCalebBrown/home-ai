@@ -156,6 +156,18 @@ def test_retained_media_workflow_status_outranks_new_media_plan():
     ]
 
 
+def test_container_followup_maps_stopped_to_exited_without_crashing():
+    context = {"referent_type": "containers"}
+    assert preflight_plan("What have I stopped?", context) == [
+        ("list_containers", {"status": "exited"})
+    ]
+
+
+def test_storage_stt_repair_is_bounded_to_capacity_questions():
+    assert routing_aliases("How much stores do I have left?") == "How much storage do I have left?"
+    assert routing_aliases("The stores are closed") == "The stores are closed"
+
+
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
     assert grounded_camera_presence_answer(result) == "Yeah, someone's at the front door."

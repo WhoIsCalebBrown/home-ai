@@ -150,33 +150,38 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
     async with websockets.connect("ws://127.0.0.1:8088/ws", max_size=20 * 1024 * 1024) as ws:
         for index, (text, allowed_tools) in enumerate(turns):
             started = time.perf_counter()
-            async with httpx.AsyncClient(timeout=60) as http:
-                response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
-                response.raise_for_status()
-                wav = response.content
-            await ws.send(json.dumps({"type": "start", "client_id": client_id}))
-            await ws.recv()
-            await ws.send(wav)
-            await ws.send(json.dumps({"type": "audio_end"}))
             transcript = ""
             answer = ""
             traces = []
             chunks = 0
             error = None
-            deadline = time.monotonic() + 90
-            while time.monotonic() < deadline:
-                message = await asyncio.wait_for(ws.recv(), timeout=15)
-                if isinstance(message, bytes):
-                    chunks += 1
-                    continue
-                payload = json.loads(message)
-                kind = payload.get("type")
-                if kind == "transcript": transcript = payload.get("text", "")
-                elif kind == "text": answer = payload.get("text", "")
-                elif kind == "trace": traces = payload.get("tools") or []
-                elif kind == "audio_chunk": chunks += 1
-                elif kind == "error": error = payload.get("error") or payload.get("message")
-                elif kind == "done": break
+            try:
+                async with httpx.AsyncClient(timeout=60) as http:
+                    response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
+                    response.raise_for_status()
+                    wav = response.content
+                await ws.send(json.dumps({"type": "start", "client_id": client_id}))
+                await ws.recv()
+                await ws.send(wav)
+                await ws.send(json.dumps({"type": "audio_end"}))
+                deadline = time.monotonic() + 90
+                while time.monotonic() < deadline:
+                    message = await asyncio.wait_for(ws.recv(), timeout=20)
+                    if isinstance(message, bytes):
+                        chunks += 1
+                        continue
+                    payload = json.loads(message)
+                    kind = payload.get("type")
+                    if kind == "transcript": transcript = payload.get("text", "")
+                    elif kind == "text": answer = payload.get("text", "")
+                    elif kind == "trace": traces = payload.get("tools") or []
+                    elif kind == "audio_chunk": chunks += 1
+                    elif kind == "error": error = payload.get("error") or payload.get("message")
+                    elif kind == "done": break
+                else:
+                    error = "audio lane timeout"
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
             selected = {item.get("tool") for item in traces if item.get("status") == "ok"}
             unexpected = selected - allowed_tools
             if unexpected: error = f"unexpected tool selection: {sorted(unexpected)}"
