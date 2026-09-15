@@ -1191,6 +1191,31 @@ def media_title_status_signal(text: str) -> bool:
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
 
 
+def retained_media_status_repair(text: str, context: dict) -> bool:
+    """Recognize a damaged status utterance only when a canonical workflow exists.
+
+    Faster-Whisper has produced forms such as ``I was dumb in Dumberdorn`` for
+    a status question about an active media item.  This must not become a
+    title alias or a general media heuristic: without a retained workflow it
+    is safer to ask for clarification.  Explicit current domains and writes
+    always outrank this repair.
+    """
+    if not (context.get("latest_media_workflow") or context.get("workflow_id")):
+        return False
+    if media_goal_request(text) or direct_file_request(text) or playback_request(text):
+        return False
+    if explicit_domain(text, context) in {"web_research", "weather", "camera", "server"}:
+        return False
+    if not re.search(r"\b(?:i\s+was|it\s+was|how|what|is|did|has|where)\b", text, re.I):
+        return False
+    # Require a non-trivial subject after the damaged question frame.  This
+    # prevents a bare acknowledgement or unrelated short utterance from
+    # consuming the workflow.
+    subject = re.sub(r"^\s*(?:i\s+was|it\s+was|how(?:'s|\s+is)?|what(?:'s|\s+is)?|is|did|has|where(?:'s|\s+is)?)\s+", "", text, flags=re.I)
+    tokens = re.findall(r"[a-z0-9]+", subject.casefold())
+    return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this", "in", "on", "for"}]) >= 2
+
+
 def media_status_display_title(result: dict, user_text: str) -> str:
     """Extract a short human title for a truthful not-found status response."""
     query = str(result.get("query") or user_text).strip(" .?!")
@@ -1318,6 +1343,12 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
             and not re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage|server)\b", text, re.I)
             and len(re.findall(r"[a-z0-9]+", re.sub(r"^.*?\bwhat\s+about\b", "", text, flags=re.I))) >= 2):
         return [("media_status", {"query": text})]
+    # If ASR mangles a follow-up badly enough to lose the normal status words,
+    # use the retained canonical workflow rather than asking Qwen to interpret
+    # the damaged title.  This remains read-only and is disabled when no
+    # workflow exists or when the current turn explicitly switches domains.
+    if retained_media_status_repair(text, context):
+        return [("media_status", {"workflow_id": latest_media.get("workflow_id") or context.get("workflow_id")})]
     # Status language must outrank the broad media-goal regex below.  Without
     # this guard, "How is the movie doing?" is misclassified as a new plan
     # because the word "doing" appears in the historical acquisition phrase

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -55,12 +55,26 @@ media_goal_request = namespace["media_goal_request"]
 media_status_question = namespace["media_status_question"]
 media_nouns_for_status = namespace["media_nouns_for_status"]
 media_title_status_signal = namespace["media_title_status_signal"]
+retained_media_status_repair = namespace["retained_media_status_repair"]
 media_status_display_title = namespace["media_status_display_title"]
 
 
 def test_download_followup_uses_recorded_sources():
     expected = ["qbittorrent", "sonarr", "radarr", "lidarr", "slskd", "torbox"]
     assert [SOURCE_NAMES[name] for name in expected] == ["qBittorrent", "Sonarr", "Radarr", "Lidarr", "Slskd", "Torbox"]
+
+
+def test_damaged_media_status_uses_retained_workflow_only():
+    context = {"latest_media_workflow": {"workflow_id": "wf-1"}, "domain": "media"}
+    damaged = "I was dumb in Dumberdorn."
+    assert retained_media_status_repair(damaged, context)
+    assert preflight_plan(damaged, context) == [("media_status", {"workflow_id": "wf-1"})]
+    assert not retained_media_status_repair(damaged, {})
+
+
+def test_damaged_media_status_cannot_override_explicit_new_domain():
+    context = {"latest_media_workflow": {"workflow_id": "wf-1"}, "domain": "media"}
+    assert not retained_media_status_repair("I was thinking about politics today.", context)
 
 
 def test_lidar_alias_resolves_to_canonical_lidarr():
