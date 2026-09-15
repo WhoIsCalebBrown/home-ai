@@ -19,6 +19,7 @@ from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
+from tts_audio import apply_pcm16_headroom, merge_wav_chunks
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -274,9 +275,9 @@ async def transcribe(wav_bytes: bytes) -> str:
                 return Transcript.from_event(event).text.strip()
 
 
-async def send_wav(ws: WebSocket, request_id: str, wav: bytes) -> None:
+async def send_wav(ws: WebSocket, request_id: str, wav: bytes, provider: str = "buffered") -> None:
     print(f"TTS_TIMING request={request_id} event=first_audio_sent t={time.time():.6f}", flush=True)
-    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "kokoro_or_buffered", "audio_format": "wav"})
+    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": provider, "audio_format": "wav"})
     await ws.send_json({"type": "audio_start", "request_id": request_id})
     await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(wav).decode()})
     await ws.send_json({"type": "audio_end", "request_id": request_id})
@@ -323,17 +324,17 @@ async def stream_pocket(ws: WebSocket, request_id: str, text: str) -> None:
     async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
         async with http.stream("POST", POCKET_API_URL.rsplit("/", 1)[0] + "/stream", json={"input": text}) as response:
             response.raise_for_status()
-            await ws.send_json({"type": "audio_start", "request_id": request_id})
-            first_chunk = True
+            pocket_chunks: list[bytes] = []
             async for line in response.aiter_lines():
                 if not line:
                     continue
                 payload = json.loads(line)
-                if first_chunk:
-                    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav"})
-                    first_chunk = False
-                await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": payload["audio"], "streaming": True})
-            await ws.send_json({"type": "audio_end", "request_id": request_id})
+                pocket_chunks.append(base64.b64decode(payload["audio"], validate=True))
+            # Pocket's stream is WAV-framed per ~80 ms chunk.  Reassemble it
+            # before sending so the browser plays one continuous source.
+            wav = apply_pcm16_headroom(merge_wav_chunks(pocket_chunks))
+            discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav", "transport": "reassembled"})
+            await send_wav(ws, request_id, wav, provider="pocket")
 
 
 async def synthesize_piper(text: str) -> bytes:
@@ -446,7 +447,7 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
                 wav = await synthesize_piper(text)
             if wav:
                 print(f"TTS_TIMING request={request_id} event={primary}_complete duration_ms={(time.perf_counter() - tts_started) * 1000:.2f}", flush=True)
-                await send_wav(ws, request_id, wav)
+                await send_wav(ws, request_id, wav, provider=primary)
             return
         except asyncio.CancelledError:
             raise
@@ -466,7 +467,7 @@ async def speak(ws: WebSocket, request_id: str, text: str, prepared: bool = Fals
                 else:
                     wav = await synthesize_piper(text)
                 if wav:
-                    await send_wav(ws, request_id, wav)
+                    await send_wav(ws, request_id, wav, provider=TTS_FALLBACK_PROVIDER)
             except asyncio.CancelledError:
                 raise
             except Exception as fallback_exc:

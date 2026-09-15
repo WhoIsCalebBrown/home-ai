@@ -9,6 +9,7 @@ COPY assistant/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY assistant/voice-api-app.py ./voice-api-app.py
 COPY assistant/semantic_routing.py ./semantic_routing.py
+COPY assistant/tts_audio.py ./tts_audio.py
 COPY assistant/voice-api-index.html ./voice-api-index.html
 COPY assistant/tts-comparison.html ./tts-comparison.html
 COPY assistant/approved-pronunciation-lexicon.yaml ./pronunciation/approved-pronunciation-lexicon.yaml

@@ -32,6 +32,7 @@ jobs:
         if: matrix.name == 'home-ai-assistant'
         run: |
           python -m py_compile assistant/voice-api-app.py
+          python -m pytest -q assistant/test_tts_audio.py
           python -m pytest -q assistant/test_grounding_regressions.py qa
       - name: Run tools contract regressions
         if: matrix.name == 'home-ai-tools'
