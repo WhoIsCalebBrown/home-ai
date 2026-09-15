@@ -113,6 +113,11 @@ def test_explicit_container_domain_beats_repair_inheritance():
     assert preflight_plan("I mean, containers are stopped.", state) == [("list_containers", {"status": "exited"})]
 
 
+def test_past_tense_media_status_frame_keeps_title_status_route():
+    assert media_status_question("what was happening with the 10th kingdom.")
+    assert preflight_plan("what was happening with the 10th kingdom.") == [("media_status", {"query": "what was happening with the 10th kingdom."})]
+
+
 def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Send me the Dumb and Dumber movie file here.")
     assert direct_file_request("Upload Dumb and Dumber into this chat.")

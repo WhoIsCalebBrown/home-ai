@@ -1128,7 +1128,7 @@ def media_status_question(text: str) -> bool:
     routed_text = routing_aliases(text)
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
-    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is)|i\s+was|can i)\b", routed_text, re.I)
+    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was)|i\s+was|can i)\b", routed_text, re.I)
     status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already)\b", routed_text, re.I)
     if question_frame and status_word:
         return True
