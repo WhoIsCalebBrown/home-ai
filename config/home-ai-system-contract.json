@@ -8,13 +8,13 @@
       "container": "Home-AI-Assistant",
       "internal_alias": "assistant",
       "port": 8088,
-      "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-45581dd"
+      "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-5c0c1b7"
     },
     "tools": {
       "container": "Home-AI-Tools",
       "internal_alias": "server-tools",
       "port": 8090,
-      "image": "ghcr.io/whoiscalebbrown/home-ai-tools:sha-0c2e2df"
+      "image": "ghcr.io/whoiscalebbrown/home-ai-tools:sha-92a7ea5"
     },
     "ollama": {
       "container": "Ollama",
