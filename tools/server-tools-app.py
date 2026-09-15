@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import socket
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,22 @@ import xml.etree.ElementTree as ET
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# Several test harnesses load this file directly via
+# importlib.util.spec_from_file_location(..., ".../server-tools-app.py")
+# rather than as a package import, and do so with this file's own directory
+# NOT yet on sys.path -- unlike a normal package-relative import,
+# spec_from_file_location never adds the loaded file's own directory to
+# sys.path as a side effect. Whether `from canonical_identity import ...`
+# below resolves then depends entirely on collection order / which other
+# test file happened to add tools/ to sys.path first, which is exactly the
+# kind of order-dependent fragility a full `pytest -q` run at the repo root
+# (no explicit path args) can surface non-deterministically. Make the
+# sibling-module imports work regardless of how this file was loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from canonical_identity import build_canonical_identity
+from workflow_events import log_event_safe
 
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
 TOOL_CONTRACT_VERSION = "1.0"
@@ -1782,9 +1799,11 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         identity, ambiguous = _pick_match(matches, title, artist)
         plan["steps"].append({"capability": "media.identify", "owner": "lidarr", "reason": "canonical album identity required"})
         if identity:
-            plan["canonical_identity"] = {"media_type": "album", "title": identity.get("title"), "artist": identity.get("artist"),
-                                           "year": str(identity.get("release_date", ""))[:4] or None, "foreign_album_id": identity.get("foreign_album_id"),
-                                           "album_type": identity.get("album_type")}
+            plan["canonical_identity"] = build_canonical_identity(
+                media_type="album", title=identity.get("title"), artist=identity.get("artist"),
+                year=str(identity.get("release_date", ""))[:4] or None,
+                foreign_album_id=identity.get("foreign_album_id"), album_type=identity.get("album_type"),
+            ).to_dict()
         plan["ambiguous"] = ambiguous
         plex = await plex_library_lookup({"query": title, "library": "Music"})
         plan["providers"]["plex_music"] = plex
@@ -1824,7 +1843,9 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                 ambiguous = True
         plan["steps"].append({"capability": "media.identify", "owner": "radarr", "reason": "canonical movie identity required"})
         if identity:
-            plan["canonical_identity"] = {"media_type": "movie", "title": identity.get("title"), "year": identity.get("year"), "tmdb_id": identity.get("tmdbId")}
+            plan["canonical_identity"] = build_canonical_identity(
+                media_type="movie", title=identity.get("title"), year=identity.get("year"), tmdb_id=identity.get("tmdbId"),
+            ).to_dict()
         plan["ambiguous"] = ambiguous
         plex_identity = {"tmdb_id": identity.get("tmdbId")} if identity else {}
         permanent_match = await plex_match_canonical_media({"media_type": "movie", "title": identity.get("title", title),
@@ -1854,9 +1875,11 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             parts["media_type"] = "anime"
         plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
         if identity:
-            plan["canonical_identity"] = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"),
-                                           "tvdb_id": identity.get("tvdbId"), "tmdb_id": identity.get("tmdbId"), "series_type": identity.get("seriesType"),
-                                           "genres": identity.get("genres") or []}
+            plan["canonical_identity"] = build_canonical_identity(
+                media_type=kind, title=identity.get("title"), year=identity.get("year"),
+                tvdb_id=identity.get("tvdbId"), tmdb_id=identity.get("tmdbId"),
+                series_type=identity.get("seriesType"), genres=identity.get("genres") or [],
+            ).to_dict()
         plan["ambiguous"] = ambiguous
         if identity:
             plex_identity = {key: identity.get(key) for key in ("tmdb_id", "tvdb_id") if identity.get(key)}
@@ -1999,6 +2022,12 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         rows.append(workflow)
     _save_media_workflows(rows)
     plan["workflow_id"] = workflow["workflow_id"]
+    _subject_key = str(canonical_id) if canonical_id else None
+    log_event_safe(workflow_id=workflow["workflow_id"], event_type="IDENTIFIED" if not existing else "RESOLVED",
+                    canonical_subject_id=_subject_key, source_service="tools", event_detail=kind)
+    log_event_safe(workflow_id=workflow["workflow_id"], event_type="AVAILABILITY_CHECKED",
+                    canonical_subject_id=_subject_key, source_service="plex",
+                    event_detail=str(plan.get("current_state")))
     if existing and preserved_state == "FAILED_INGESTION":
         plan["current_state"] = "FAILED_INGESTION"
         plan["retry_available"] = True
@@ -2033,6 +2062,11 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                          "confirmation_id": plan["confirmation_record"]["confirmation_id"],
                          "confirmation_status": "PENDING"})
         _save_media_workflows(rows)
+        log_event_safe(workflow_id=workflow["workflow_id"], event_type="PLAN_CREATED",
+                        canonical_subject_id=_subject_key, source_service="tools")
+        log_event_safe(workflow_id=workflow["workflow_id"], event_type="CONFIRMATION_REQUESTED",
+                        canonical_subject_id=_subject_key, source_service="tools",
+                        backend_object_id=plan["confirmation_record"].get("confirmation_id"))
     plan["idempotent"] = True
     return plan
 
@@ -2456,6 +2490,13 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     # state and cannot submit the same standard request twice.
     workflow.update({"confirmation_status": "SUBMITTING", "canonical_state": "REQUESTED", "mode": "standard"})
     _save_workflow_update(rows, workflow)
+    _identity_for_events = workflow.get("canonical_identity") or {}
+    _subject_key = str(_identity_for_events.get("tmdb_id") or _identity_for_events.get("tvdb_id")
+                        or _identity_for_events.get("foreign_album_id") or "")
+    log_event_safe(workflow_id=workflow_id, event_type="CONFIRMATION_CONSUMED",
+                    canonical_subject_id=_subject_key or None, source_service="tools")
+    log_event_safe(workflow_id=workflow_id, event_type="REQUEST_SUBMITTED",
+                    canonical_subject_id=_subject_key or None, source_service="cli_debrid")
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     headers["X-Home-AI-Bridge-Token"] = _standard_bridge_secret()
@@ -2474,6 +2515,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                                "ingestion_confirmed": False, "error": type(exc).__name__,
                                                "request_shape": payload, "attempted_at": now()}})
             _save_workflow_update(rows, workflow)
+            log_event_safe(workflow_id=workflow_id, event_type="FAILED", canonical_subject_id=_subject_key or None,
+                            source_service="cli_debrid", event_detail="BRIDGE_UNAVAILABLE")
             return {"status": "unavailable", "reason": "BRIDGE_UNAVAILABLE",
                     "write_executed": False, "submission_transport_success": False,
                     "ingestion_confirmed": False, "workflow_id": workflow_id,
@@ -2492,6 +2535,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                            "ingestion_confirmed": False, "failure_reason": _cli_debrid_failure_reason(evidence),
                                            "evidence": evidence, "request_shape": payload, "attempted_at": now()}})
         _save_workflow_update(rows, workflow)
+        log_event_safe(workflow_id=workflow_id, event_type="FAILED", canonical_subject_id=_subject_key or None,
+                        source_service="cli_debrid", event_detail=_cli_debrid_failure_reason(evidence))
         return {"status": "failed_ingestion", "write_executed": True,
                 "submission_transport_success": transport_success, "ingestion_confirmed": False,
                 "reason": _cli_debrid_failure_reason(evidence), "workflow_id": workflow_id,
@@ -2504,6 +2549,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                        "ingestion_confirmed": True, "evidence": evidence, "request_shape": payload,
                                        "attempted_at": now()}})
     _save_workflow_update(rows, workflow)
+    log_event_safe(workflow_id=workflow_id, event_type="QUEUED", canonical_subject_id=_subject_key or None,
+                    source_service="cli_debrid")
     return {
         "status": "submitted",
         "write_executed": True,

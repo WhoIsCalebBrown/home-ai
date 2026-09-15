@@ -1,0 +1,37 @@
+# Owned QA image for production-shaped Assistant integration testing.
+#
+# The plain `qa/Dockerfile` intentionally avoids Assistant's heavy runtime
+# dependencies (nemo_text_processing/pynini) for fast, dependency-light unit
+# tests. This image exists because those unit tests are not sufficient proof
+# that the conversation flow works through the real assistant/voice-api-app.py
+# code path (respond()/invoke_tool/session state) -- exercising that module
+# for real requires its actual runtime dependency stack to import cleanly.
+#
+# Matches assistant/Dockerfile's base image and system packages exactly, so
+# a dependency that installs here is proven to install in production too.
+# No production container/image is built or modified by this file; it is a
+# separate, additional QA-only image.
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /repo
+COPY assistant/requirements.txt /repo/assistant/requirements.txt
+RUN pip install --no-cache-dir -r /repo/assistant/requirements.txt \
+    && pip install --no-cache-dir pytest==8.3.5 pydantic==2.10.6 pytest-asyncio==0.24.0
+
+COPY assistant /repo/assistant
+COPY tools /repo/tools
+COPY qa /repo/qa
+# test_tts_normalization.py hardcodes /app/voice-api-app.py (the real
+# assistant/Dockerfile's WORKDIR) -- mirror that exact runtime path instead
+# of changing the test, so this image proves the same path production uses.
+RUN mkdir -p /app && cp /repo/assistant/voice-api-app.py /app/voice-api-app.py \
+    && cp /repo/assistant/semantic_routing.py /app/semantic_routing.py \
+    && cp /repo/assistant/subject_model.py /app/subject_model.py \
+    && cp /repo/assistant/tts_audio.py /app/tts_audio.py
+
+ENV PYTHONPATH=/repo/assistant:/repo/tools
+CMD ["python", "-m", "pytest", "-q"]

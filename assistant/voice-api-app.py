@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
+from subject_model import PendingOffer, ResolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -50,7 +51,143 @@ DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/disco
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
+# PENDING_OFFER is a distinct, deliberately weaker concept from `pending`
+# above (PENDING_CONFIRMATION). `pending` entries are session/workflow/
+# plan-hash/args-hash/TTL-bound write authorizations validated server-side
+# by Home-AI-Tools; `pending_offers` entries are lightweight, read-only
+# conversational continuations built from subject_model.PendingOffer, which
+# structurally cannot hold side_effect="write" (see subject_model.py). A
+# PendingOffer is never passed to invoke_tool's `confirmed=True` path, and no
+# code in this file constructs a `pending[...]` write-confirmation entry from
+# a `pending_offers[...]` entry. See respond()'s offer-handling block.
+pending_offers: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
+# conversation_context field contract (documentation-level, not a typed
+# migration -- see the final report for why a full dataclass rewrite of
+# every read/write site was judged out of scope for this pass). Keyed by
+# client_id; each field below is read via .get() by convention, so an
+# absent field is never distinguished from an explicitly-cleared one.
+#
+# domain / kind / group / tools / entities / camera / subject
+#   OWNER: turn_context() (explicit_domain's classification for THIS turn only)
+#   WRITERS: turn_context() only
+#   READERS: narrow_capability_entries() (via discovery_context's "group"),
+#     the confirmed-action branch in respond() (media_standard_request path)
+#   EXPIRY: none -- overwritten every turn turn_context() runs; never a
+#     sticky "last known domain" by design (explicit_domain intentionally
+#     omits prior domain from routing -- see its docstring)
+#   OVERRIDE RULE: the newest turn's explicit_domain() result always wins;
+#     no turn ever inherits a prior turn's domain as its own intent
+#   PERSISTENCE: in-process only, lost on restart (see RESTART/PERSISTENCE below)
+#
+# latest_resolved_referent
+#   OWNER: whichever mechanism most recently identified a subject
+#   WRITERS: turn_context()'s discovery_question() branch, record_tool_referent()
+#     (after web_search/media_plan_goal/media_resolve/media_status/
+#     media_diagnose/plex_search/plex_match_canonical_media/web_fetch calls)
+#   READERS: discovery_context() in semantic_routing.py (feeds bounded
+#     capability retrieval), underspecified_read_request() (referent-presence
+#     guard), stage_media_offer() indirectly via canonical_identity
+#   EXPIRY: none; persists until overwritten by a newer resolution
+#   OVERRIDE RULE: record_tool_referent() prefers a tool result's own
+#     canonical_identity.title over the raw call argument, but never
+#     downgrades an established value to a weaker one within one call
+#   PERSISTENCE: in-process only
+#   KNOWN GAP: no single explicit "recent_subjects" list exists -- only the
+#     single latest value. Multiple concurrently-live subjects (e.g. a
+#     multi-subject conversation) are not tracked as a set; see
+#     test_explicit_subject_switch_replaces_offer_without_executing_it for
+#     how offer-vs-subject-switch is handled without one.
+#
+# canonical_identity
+#   OWNER: whichever media_plan_goal/media_resolve call last set it
+#   WRITERS: stage_media_confirmation(), stage_media_offer() (read-only, does
+#     not write it back), the confirmed media_standard_request branch in respond()
+#   READERS: discovery_context(), turn_context()'s carry-forward loop
+#   EXPIRY: none; overwritten by the next resolution
+#   OVERRIDE RULE: never overwritten with a weaker/partial identity by
+#     record_tool_referent() (title-only fallback never replaces a dict
+#     already containing canonical IDs) -- see canonical_identity.py's merge()
+#     for the equivalent rule on the Tools side
+#   PERSISTENCE: in-process only
+#
+# latest_media_workflow (workflow_id, canonical_external_id, media_type,
+#     title, mode, execution_status, reason)
+#   OWNER: stage_media_confirmation() / the confirmed-action branch
+#   WRITERS: stage_media_confirmation(), the media_standard_request-confirmed
+#     branch in respond()
+#   READERS: the is_confirmation()-without-pending-action branch (checks
+#     execution_status to phrase a failure message), retained_media_status_repair()
+#   EXPIRY: none
+#   OVERRIDE RULE: newest confirmation/execution always replaces it
+#   PERSISTENCE: in-process only. KNOWN GAP: this is NOT the same as
+#     tools/server-tools-app.py's persisted JSON workflow row or
+#     workflow_events -- if the Assistant process restarts, this pointer is
+#     lost even though the Tools-side workflow and its event history survive
+#     (see RESTART/PERSISTENCE below).
+#
+# pending_disambiguation (candidates, original_goal, created_at)
+#   OWNER: stage_disambiguation()
+#   WRITERS: stage_disambiguation() (both the pre-loop media_plan_response
+#     and post-loop direct_structured_answer call sites, whenever a
+#     media_plan_goal result reports ambiguous=True with candidates); the
+#     disambiguation-resolution branch in respond() clears it on a resolved
+#     reply, and on expiry
+#   READERS: the disambiguation-resolution branch in respond() only
+#   EXPIRY: _DISAMBIGUATION_TTL_SECONDS (90s), checked before every use
+#   OVERRIDE RULE: a genuinely different explicit domain (not "media" --
+#     see the branch's own comment for why "media" itself never counts as
+#     competing here) outranks a stale disambiguation prompt; an
+#     unrecognized/non-distinguishing reply re-asks rather than guessing
+#     and does NOT clear the entry
+#   PERSISTENCE: in-process only, deliberately ephemeral, same as
+#     pending_offers
+#
+# pending_offers[client_id] (offer, arguments, description)
+#   OWNER: stage_media_offer()
+#   WRITERS: stage_media_offer() only (always replaces, never appends --
+#     see test_staging_a_new_offer_replaces_the_previous_one_for_the_same_client)
+#   READERS: the offer-handling block in respond() (expiry check, accept/
+#     decline/ambiguous classification)
+#   EXPIRY: PendingOffer.expires_at (default 90s), checked before every use
+#   OVERRIDE RULE: a newer explicit intent (explicit_domain() match or
+#     media_acquisition_language()-bearing accept) outranks a stale offer;
+#     see test_topic_switch_does_not_consume_offer /
+#     test_explicit_subject_switch_replaces_offer_without_executing_it
+#   PERSISTENCE: in-process only, deliberately ephemeral (see below)
+#
+# pending[client_id] (PENDING_CONFIRMATION -- name, arguments, action_id,
+#     conversation_id, session_id, expires, workflow_id,
+#     canonical_external_id, plan_version_hash)
+#   OWNER: stage_media_confirmation() / the confirmation_required branch in
+#     the Qwen tool-dispatch loop
+#   WRITERS: same two sites only
+#   READERS: the is_confirmation()-with-action branch
+#   EXPIRY: 60-120s depending on staging site (see stage_media_confirmation)
+#   OVERRIDE RULE: single-use -- popped the instant a confirmation turn is
+#     processed, regardless of outcome
+#   PERSISTENCE: in-process only. The authoritative, durable version of this
+#     binding is tools/server-tools-app.py's workflow row
+#     (plan_version_hash/confirmation_id/confirmation_status), which is what
+#     actually enforces single-use server-side -- this in-process copy is a
+#     convenience for phrasing the next response, not a second source of truth.
+#
+# latest_assistant_response / latest_user_utterance / latest_tool_result /
+#     latest_spoken_response
+#   OWNER: emit_answer()/record_assistant_response(), respond()'s entry
+#   WRITERS: as named
+#   READERS: repeat_intent/rephrase_intent handling, provenance_question handling
+#   EXPIRY: none; single most-recent value
+#   PERSISTENCE: in-process only
+#
+# No explicit "latest_failed_interpretation" or "unresolved_web_topic" field
+# exists as such today -- the closest equivalents are "unresolved_request"/
+# "topic" (set by turn_context's web_research branch) and clarification
+# text returned directly by underspecified_read_request()/
+# disambiguate_subjects()-shaped responses, which are not themselves stored
+# back into conversation_context. KNOWN GAP, not fixed in this pass: a
+# genuinely distinct "the last thing we tried to resolve and could not"
+# field, separate from "the last thing we did resolve", does not exist.
 conversation_context: dict[str, dict] = {}
 tts_lock = asyncio.Lock()
 normalizer_lock = asyncio.Lock()
@@ -1352,6 +1489,60 @@ def underspecified_read_request(text: str, context: dict | None = None) -> str |
     return None
 
 
+_DISCOVERY_QUESTION_PATTERNS = (
+    re.compile(r"\bdo you know(?: (?:the|this|that))?\s+(?:\w+\s+){0,4}?(?:called|named)\s+(.+)$", re.I),
+    re.compile(r"\bdo you know\s+(?:the|this|that)?\s*(.+)$", re.I),
+    re.compile(r"\bhave you heard of\s+(.+)$", re.I),
+    re.compile(r"\bwhat(?:'s| is)\s+(.+)$", re.I),
+    re.compile(r"\bcan you tell me what\s+(.+?)\s+is\b", re.I),
+    re.compile(r"\bwhat can you find (?:about|on)\s+(.+)$", re.I),
+    re.compile(r"\bthere'?s\s+a\s+\w+\s+called\s+(.+?),\s*do you know it\b", re.I),
+)
+_DISCOVERY_QUESTION_STOPWORDS = frozenset({
+    "it", "that", "this", "there", "them", "he", "she", "going on", "wrong",
+})
+
+
+def discovery_question(text: str) -> str | None:
+    """Recognize the closed grammar of identification questions and extract
+    the subject phrase, without deciding what kind of thing the subject is.
+
+    Covers: "do you know X" / "do you know the show called X", "have you
+    heard of X", "what is X" / "what's X", "can you tell me what X is",
+    "what can you find about X", "there's a show called X, do you know it".
+    This is a fixed, small set of question SHAPES, not a per-title regex --
+    adding a new title never requires touching this function. Whether the
+    extracted subject is media, general knowledge, or a web topic is left
+    entirely to bounded capability discovery/Qwen (spec section 4); this
+    function only prevents a discovery-shaped utterance from being silently
+    dropped or misread as something else, and lets the subject survive as a
+    referent for follow-up turns.
+    """
+    stripped = text.strip().rstrip("?.!")
+    if not stripped:
+        return None
+    for pattern in _DISCOVERY_QUESTION_PATTERNS:
+        match = pattern.search(stripped)
+        if not match:
+            continue
+        subject = match.group(1).strip().strip("?.!").strip()
+        if not subject or len(subject) > 80:
+            continue
+        if subject.casefold() in _DISCOVERY_QUESTION_STOPWORDS:
+            continue
+        # A referential subject ("do you know it") is not a fresh discovery
+        # -- it depends on an existing referent and must not manufacture a
+        # new one from the pronoun itself.
+        if has_referential_language(subject) and len(_tokens_for_discovery(subject)) <= 2:
+            continue
+        return subject
+    return None
+
+
+def _tokens_for_discovery(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.casefold())
+
+
 def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     """Resolve an explicit current-turn domain before applying conversational context."""
     lowered = routing_aliases(text).casefold()
@@ -1402,7 +1593,7 @@ def turn_context(client_id: str, text: str) -> dict:
     # provenance for genuine elliptical follow-ups.
     current = {key: prior[key] for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
@@ -1434,12 +1625,22 @@ def turn_context(client_id: str, text: str) -> dict:
         # generic discovery language such as "find it online" does not match
         # this invariant and therefore cannot inherit weather.
         current.update({"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": prior.get("location", "")})
+    elif discovery_question(text):
+        # A discovery-shaped question ("do you know X", "what is X", "have
+        # you heard of X", ...) has no explicit domain of its own -- this
+        # does NOT decide media/general/web, it only makes sure the subject
+        # phrase survives as a referent for retrieval and for a later
+        # follow-up turn, instead of being silently dropped. Bounded
+        # capability discovery (discover_tools) and Qwen still decide which
+        # capability actually answers it.
+        current["latest_resolved_referent"] = discovery_question(text)
+        current["discovery_subject"] = discovery_question(text)
     # No explicit domain: leave current intent unset. The model-facing
     # semantic retriever decides it from the newest utterance; referential
     # resolution is supplied separately through structured context.
     for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
     ):
@@ -1783,6 +1984,177 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     conversation_context[client_id] = prior
 
 
+# Which argument key names the subject of a call to this tool. This is the
+# only place a tool name is associated with "what did this call try to
+# identify" -- adding a new identification-capable tool means adding one
+# entry here, not a new phrase-router branch. How the assistant learned
+# about the subject (this tool) is deliberately kept separate from what the
+# subject turns out to be (set below from the tool's *result*, when the
+# result carries a resolved title/canonical identity; the argument is only
+# the fallback when the result does not).
+_REFERENT_ARGUMENT_KEYS = {
+    "web_search": "query",
+    "web_fetch": "url",
+    "media_plan_goal": "goal",
+    "media_resolve": "title",
+    "media_status": "title",
+    "media_diagnose": "title",
+    "plex_search": "query",
+    "plex_match_canonical_media": "title",
+}
+
+
+def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result: dict) -> None:
+    """After any identification-capable tool call, keep the subject it was
+    asked about (or, if the result resolved a cleaner canonical title,
+    that) as this session's latest_resolved_referent -- regardless of which
+    tool answered it. This is the fix for the gap where a web_search result
+    never fed back into conversation_context: without this, "do I have it?"
+    after "can you find X online?" had no referent to resolve "it" against.
+    Never overwrites an established canonical_identity with a bare string;
+    only ever supplements latest_resolved_referent, which downstream
+    referent resolution already treats as lower-priority than
+    canonical_identity (see discovery_context() in semantic_routing.py).
+    """
+    argument_key = _REFERENT_ARGUMENT_KEYS.get(tool_name)
+    if not argument_key:
+        return
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    subject = None
+    if isinstance(payload, dict):
+        identity = payload.get("canonical_identity")
+        if isinstance(identity, dict) and identity.get("title"):
+            subject = identity["title"]
+    if not subject and isinstance(arguments, dict):
+        raw = arguments.get(argument_key)
+        if isinstance(raw, str) and raw.strip():
+            subject = raw.strip()
+    if not subject:
+        return
+    context = dict(conversation_context.get(client_id, {}))
+    context["latest_resolved_referent"] = subject
+    conversation_context[client_id] = context
+
+
+_DISAMBIGUATION_TTL_SECONDS = 90
+
+
+def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str) -> None:
+    """Persist an ambiguous media_plan_goal's candidate set so the next
+    turn's natural-language reply ("the new one", "2021", "the movie") can
+    resolve against it, instead of the assistant losing the candidates the
+    moment it asks "which one do you mean?". Small, additive extension of
+    conversation_context -- not a new state store (spec item #14)."""
+    if not candidates:
+        return
+    context = dict(conversation_context.get(client_id, {}))
+    context["pending_disambiguation"] = {
+        "candidates": candidates, "original_goal": original_goal, "created_at": time.time(),
+    }
+    conversation_context[client_id] = context
+
+
+def _disambiguation_expired(entry: dict) -> bool:
+    return time.time() - float(entry.get("created_at", 0)) > _DISAMBIGUATION_TTL_SECONDS
+
+
+def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | None:
+    """Match a natural reply to exactly one candidate, or return None.
+
+    Never guesses: an unrecognized or genuinely ambiguous reply (a bare
+    "yeah" with no distinguishing language) returns None so the caller can
+    ask again rather than silently picking one -- this is the same
+    never-guess discipline as disambiguate_subjects() in subject_model.py,
+    applied to raw plan candidates (title/year/media_type dicts) since that
+    is the shape media_plan_goal's ambiguous results actually carry, not
+    ResolvedSubject instances.
+    """
+    lowered = text.strip().casefold().rstrip(".!?")
+    if not lowered:
+        return None
+    years = [c.get("year") for c in candidates if c.get("year")]
+    numeric_years = sorted({int(y) for y in years if str(y).isdigit()})
+    year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
+    if year_match:
+        matches = [c for c in candidates if str(c.get("year")) == year_match.group(0)]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\b(new|newest|latest|recent)\b", lowered) and numeric_years:
+        matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[-1])]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\b(old|oldest|original|first)\b", lowered) and numeric_years:
+        matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[0])]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\bfirst\s+one\b", lowered) and len(candidates) >= 1:
+        return candidates[0]
+    if re.search(r"\bsecond\s+one\b", lowered) and len(candidates) >= 2:
+        return candidates[1]
+    media_type_words = {"movie": "movie", "film": "movie", "album": "album", "record": "album",
+                         "show": "tv", "series": "tv", "anime": "anime", "game": "game"}
+    for word, media_type in media_type_words.items():
+        if re.search(rf"\bthe\s+{word}\b", lowered):
+            matches = [c for c in candidates if str(c.get("media_type", "")).casefold() == media_type]
+            if len(matches) == 1:
+                return matches[0]
+    return None
+
+
+def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
+    """Compute the next-best read-only action for an identified-but-not-yet-
+    actionable (or already-available) media plan, stage it as a PendingOffer,
+    and return the natural-language question to append to the response.
+
+    This never stages an offer for a plan that already carries a write
+    confirmation (media_plan_response's own guard already keeps this
+    function from being called in that case -- see its call site) and never
+    creates more than one offer at a time for a client: staging a new offer
+    always replaces any previous one for this client_id, so "yes" can never
+    become ambiguous between two live offers (spec section 33).
+    """
+    identity = plan_result.get("canonical_identity") or {}
+    if not identity:
+        return None
+    subject = ResolvedSubject.new(
+        "media",
+        identity.get("title") or "that",
+        canonical_identity=build_canonical_identity(**identity),
+        confidence="high",
+        discovery_source="media_plan_goal",
+    )
+    state = str(plan_result.get("current_state") or "UNKNOWN")
+    actions = available_actions(subject, state)
+    action = next_best_action(actions)
+    if action is None or action.side_effect != "read":
+        return None
+    offer = PendingOffer.create(session_id=client_id, subject_ref=subject.subject_id, operation=action.tool_name)
+    # Each read tool has its own real argument contract (see
+    # tools/server-tools-app.py): media_plan_goal takes a free-text `goal`,
+    # media_status/media_diagnose take a workflow_id or a title/query
+    # fallback, plex_match_canonical_media/media_resolve take structured
+    # identity fields. Building one generic argument dict here and handing
+    # it to whichever tool the offer names was wrong -- caught by
+    # qa/test_assistant_conversation_integration.py driving this through the
+    # real invoke_tool boundary, not by unit-testing this function alone.
+    workflow_id = plan_result.get("workflow_id")
+    title = identity.get("title") or "that"
+    if action.tool_name == "media_plan_goal":
+        offer_arguments: dict = {"goal": title, "media_type": identity.get("media_type")}
+    elif action.tool_name in {"media_status", "media_diagnose"}:
+        offer_arguments = {"workflow_id": workflow_id, "title": title, "media_type": identity.get("media_type")}
+    else:
+        offer_arguments = {"title": title, "canonical_identity": identity, "media_type": identity.get("media_type")}
+    pending_offers[client_id] = {
+        "offer": offer,
+        "arguments": offer_arguments,
+        "description": action.description,
+    }
+    discovery_audit({"event": "offer_presented", "client_id": client_id, "offer_id": offer.offer_id,
+                      "operation": offer.operation, "subject": identity.get("title")})
+    return f"Want me to {action.description}?"
+
+
 def visible_model_text(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.I | re.S)
     text = re.sub(r"</?think>", "", text, flags=re.I)
@@ -2110,6 +2482,71 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
+    disambiguation = conversation_context.get(client_id, {}).get("pending_disambiguation")
+    if disambiguation and _disambiguation_expired(disambiguation):
+        context_after_expiry = dict(conversation_context.get(client_id, {}))
+        context_after_expiry.pop("pending_disambiguation", None)
+        conversation_context[client_id] = context_after_expiry
+        disambiguation = None
+    if disambiguation and not pending.get(client_id):
+        candidates = disambiguation.get("candidates", [])
+        # A genuinely new explicit request (a different domain) always
+        # outranks a stale disambiguation prompt -- same newest-intent-wins
+        # rule as offers. A bare, non-distinguishing reply must never guess.
+        # Unlike the offer precedent below, "media" itself is never treated
+        # as a competing domain here: a disambiguation reply is inherently
+        # media-flavored language ("the album", "the movie", a bare year),
+        # which explicit_domain correctly classifies as domain="media" via
+        # its own noun/status regexes -- treating that as "competing" would
+        # block every media-type-word reply from ever resolving.
+        disambiguation_domain = explicit_domain(user_text)
+        has_competing_intent = disambiguation_domain is not None and disambiguation_domain != "media"
+        resolved = None if has_competing_intent else resolve_disambiguation_reply(user_text, candidates)
+        if resolved is not None:
+            context_cleared = dict(conversation_context.get(client_id, {}))
+            context_cleared.pop("pending_disambiguation", None)
+            conversation_context[client_id] = context_cleared
+            title = resolved.get("title") or ""
+            year = resolved.get("year")
+            media_type = resolved.get("media_type")
+            type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
+            disambiguated_goal = f"{disambiguation.get('original_goal', '')} {title} {year or ''} {type_word}".strip()
+            result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": request_id}, client_id, request_id)
+            live_results_resolved = [result]
+            resolved_text = media_plan_response(user_text, live_results_resolved)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if resolved_text is None:
+                post_direct_resolved = direct_structured_answer(user_text, live_results_resolved)
+                resolved_text = post_direct_resolved or f"I found {title}."
+                if plan_result.get("confirmation_required"):
+                    stage_media_confirmation(client_id, request_id, plan_result)
+            elif plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                offer_question = stage_media_offer(client_id, plan_result)
+                if offer_question:
+                    resolved_text = f"{resolved_text} {offer_question}"
+            store_provenance(client_id, live_results_resolved)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="disambiguation_resolved")
+            history.append({"role": "assistant", "content": resolved_text})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if not has_competing_intent:
+            # Ambiguous or unrecognized reply against a live candidate set:
+            # ask again rather than guessing. A bare "yeah" must not select
+            # a subject.
+            labels = []
+            for candidate in candidates[:3]:
+                candidate_title = candidate.get("title") or candidate.get("name")
+                candidate_year = candidate.get("year")
+                if candidate_title:
+                    labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
+            full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="disambiguation_reprompt")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # Competing explicit intent: leave the stale disambiguation entry in
+        # place (mirrors the offer precedent) and fall through to normal routing.
     action = pending.get(client_id)
     if action and action.get("expires", 0) <= time.time():
         pending.pop(client_id, None)
@@ -2117,6 +2554,64 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if action and action.get("conversation_id") != client_id:
         pending.pop(client_id, None)
         action = None
+    offer_entry = pending_offers.get(client_id)
+    if offer_entry:
+        offer: PendingOffer = offer_entry["offer"]
+        if offer.is_expired():
+            pending_offers.pop(client_id, None)
+            offer_entry = None
+    if offer_entry and not action:
+        reply_kind = classify_offer_reply(user_text)
+        # The newest explicit request always outranks a stale offer (spec
+        # sections 17, 18, 29) -- an utterance that itself names a new
+        # explicit domain or a direct media goal is never treated as offer
+        # acceptance, even if it superficially contains an accept word.
+        has_competing_intent = explicit_domain(user_text) is not None or media_goal_request(user_text)
+        if reply_kind == "accept" and not has_competing_intent:
+            pending_offers.pop(client_id, None)
+            offer_arguments = dict(offer_entry.get("arguments", {}))
+            # "Yeah, get it." both accepts the offer AND escalates it: the
+            # offer replays a read-only media_plan_goal call by design (its
+            # stored arguments never change from what was originally
+            # vetted), but a bare accept-plus-acquisition-verb utterance
+            # must not silently downgrade the user's actual request-shaped
+            # intent into a read-only replay just because it also matched
+            # the accept grammar. Only escalates the *action* the
+            # (still-authoritative, still server-side) media_plan_goal call
+            # resolves -- it does not skip straight to a write.
+            if offer.operation == "media_plan_goal" and media_acquisition_language(user_text):
+                offer_arguments["goal"] = f"get {offer_arguments.get('goal', '')}".strip()
+            discovery_audit({"event": "offer_accepted", "client_id": client_id, "offer_id": offer.offer_id, "operation": offer.operation})
+            result = await invoke_tool(offer.operation, offer_arguments, client_id, request_id)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if offer.operation == "media_plan_goal" and plan_result:
+                stage_media_confirmation(client_id, request_id, plan_result)
+                full = direct_structured_answer(user_text, [{"tool": "media_plan_goal", "status": result.get("status"), "result": plan_result}])
+                if not full:
+                    full = "I couldn't confirm that without changing anything."
+            else:
+                messages = [
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "tool", "name": offer.operation, "content": json.dumps(result.get("result", {}), separators=(",", ":"))},
+                    {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE},
+                ]
+                full = await generate_final(messages)
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="offer_accepted")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if reply_kind == "decline":
+            pending_offers.pop(client_id, None)
+            full = "No problem."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="offer_declined")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # Ambiguous or a competing explicit intent: leave the offer exactly
+        # as staged (do not pop it) and fall through to normal routing for
+        # this turn. The subject the offer refers to is preserved separately
+        # in conversation_context, so a later plain "yes" can still resolve
+        # it even though this turn was not itself acceptance.
     if not action and is_confirmation(user_text):
         previous_media = conversation_context.get(client_id, {}).get("latest_media_workflow") or {}
         if previous_media.get("execution_status") in {"error", "failed_ingestion", "rejected", "disabled"}:
@@ -2282,7 +2777,18 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 args = {**args, "session_id": request_id}
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
-            live_results.append(await invoke_tool(name, args, client_id, request_id))
+            planned_result = await invoke_tool(name, args, client_id, request_id)
+            live_results.append(planned_result)
+            # preflight_plan now deterministically routes a much broader set
+            # of media/camera requests than the old calculator/unit_convert-
+            # only preflight did (main's "dispatch bounded camera plans
+            # deterministically" change) -- record_tool_referent must run
+            # here too, not only in the Qwen tool-call loop below, or a
+            # deterministically-routed media_plan_goal/media_status call
+            # silently stops updating latest_resolved_referent. Found by
+            # running this branch's conversation-integration suite against
+            # merged main, not by inspection alone.
+            record_tool_referent(client_id, name, args, planned_result)
         # Planned tools have already been executed against the bounded
         # arguments. Do not expose the same capability to Qwen for a second
         # discretionary call; synthesis still receives the evidence below.
@@ -2366,6 +2872,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # identifiable/actionable.  Never let an unresolved or failed
             # media plan fall through to Qwen, which could invent a started
             # request from conversational context.
+            plan_item = next((item for item in live_results if item.get("tool") == "media_plan_goal"), None)
+            plan_result = plan_item.get("result") if plan_item and isinstance(plan_item.get("result"), dict) else {}
+            if plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                offer_question = stage_media_offer(client_id, plan_result)
+                if offer_question:
+                    media_direct = f"{media_direct} {offer_question}"
+            if plan_result and plan_result.get("ambiguous") and plan_result.get("candidates"):
+                stage_disambiguation(client_id, plan_result["candidates"], user_text)
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
@@ -2401,7 +2915,44 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     history.append({"role": "assistant", "content": full})
                     await ws.send_json({"type": "done", "request_id": request_id})
                     return
-        if not live_results and media_status_question(user_text) and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text)):
+        # Root cause of the pre-existing "no matching live workflow" gap
+        # (present in main before this session; see final report): this
+        # branch ran before deterministic_plan/semantic_preflight_allowed
+        # was narrowed to calculator/unit_convert only, back when the richer
+        # preflight_plan() (which itself calls retained_media_status_repair
+        # and would resolve "how's it doing" against
+        # context["latest_media_workflow"]) still fed `planned`/`live_results`
+        # here. respond() now calls the narrower deterministic_plan()
+        # instead (preflight_plan/preflight_names are unreferenced from the
+        # live turn path), so `live_results` is always empty at this point
+        # for a media-status question -- this canned failure fired
+        # unconditionally, before Qwen/discover_tools ever got a chance to
+        # call media_status/media_diagnose with a real referent.
+        #
+        # Fix: only take this shortcut when there is genuinely no resolvable
+        # media referent in context. When one exists (latest_media_workflow,
+        # canonical_identity, or workflow_id), fall through to the normal
+        # bounded-discovery + Qwen tool-call path below instead of
+        # preempting it -- generic, not phrase-specific, does not bypass
+        # tool discovery, and touches nothing about confirmation/write
+        # safety (this whole branch is a read-only response shortcut, not a
+        # tool invocation).
+        # latest_media_workflow/canonical_identity are only ever set by
+        # stage_media_confirmation(), which itself early-returns when no
+        # write confirmation is required -- an "identified but not yet
+        # actionable" result (e.g. found, not in Plex, nothing to confirm)
+        # never populates either field. latest_resolved_referent is the
+        # field record_tool_referent() sets unconditionally after any
+        # identification-capable tool call, so it is included here too;
+        # without it, a plain "I found X, want me to look into it?" ->
+        # "How's it doing?" pair would still incorrectly hit this shortcut.
+        has_resolvable_media_referent = bool(
+            context.get("latest_media_workflow") or context.get("canonical_identity")
+            or context.get("workflow_id") or context.get("latest_resolved_referent")
+        )
+        if (not live_results and media_status_question(user_text)
+                and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text))
+                and not has_resolvable_media_referent):
             full = "I couldn't verify the current media status because I don't have a matching live workflow."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="media_status_without_live_evidence")
             history.append({"role": "assistant", "content": full})
@@ -2465,12 +3016,49 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
+                    record_tool_referent(client_id, name, arguments, result)
         if live_results:
             post_direct = direct_structured_answer(user_text, live_results)
             if post_direct:
                 for item in live_results:
                     if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
-                        stage_media_confirmation(client_id, request_id, item.get("result") or {})
+                        plan_result = item.get("result") or {}
+                        stage_media_confirmation(client_id, request_id, plan_result)
+                        # media_plan_goal is almost always reached through
+                        # this Qwen tool-call loop, not the deterministic
+                        # preflight list (semantic_preflight_allowed only
+                        # allows calculator/unit_convert to bypass Qwen) --
+                        # stage_media_offer must run here too, not only in
+                        # the pre-loop media_plan_response branch, or a
+                        # PendingOffer is never actually created in a real
+                        # conversation. No-op when a write confirmation was
+                        # already staged above (plan_result carries
+                        # confirmation_required=True in that case, and
+                        # stage_media_offer only offers a *read* action).
+                        if not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                            offer_question = stage_media_offer(client_id, plan_result)
+                            if offer_question:
+                                post_direct = f"{post_direct} {offer_question}"
+                        if plan_result.get("ambiguous") and plan_result.get("candidates"):
+                            # Same dead-path class as stage_media_offer
+                            # above: this is the actual response path for a
+                            # Qwen-driven ambiguous result, so disambiguation
+                            # must be staged here, not only at the pre-loop
+                            # media_plan_response call site (which never
+                            # sees a populated live_results for a
+                            # Qwen-driven call). direct_structured_answer's
+                            # own ambiguous text has no candidate labels;
+                            # replace it with the labeled version so the
+                            # user actually hears what to choose between.
+                            stage_disambiguation(client_id, plan_result["candidates"], user_text)
+                            labels = []
+                            for candidate in plan_result["candidates"][:3]:
+                                candidate_title = candidate.get("title") or candidate.get("name")
+                                candidate_year = candidate.get("year")
+                                if candidate_title:
+                                    labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
+                            if labels:
+                                post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")

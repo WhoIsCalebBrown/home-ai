@@ -30,15 +30,32 @@ jobs:
         run: python -m pip install --disable-pip-version-check pytest fastapi==0.115.6 httpx==0.28.1 pydantic==2.10.6
       - name: Run assistant grounding regressions
         if: matrix.name == 'home-ai-assistant'
+        # qa/test_assistant_conversation_integration.py needs assistant's
+        # full runtime deps (wyoming, nemo_text_processing/pynini) which are
+        # deliberately NOT installed on this bare interpreter -- it is
+        # excluded here and run in its own step below, inside the image
+        # that actually has those deps.
         run: |
           python -m py_compile assistant/voice-api-app.py
           python -m pytest -q assistant/test_tts_audio.py
-          python -m pytest -q assistant/test_grounding_regressions.py qa
+          python -m pytest -q assistant/test_grounding_regressions.py qa --ignore=qa/test_assistant_conversation_integration.py
+      - name: Run assistant conversation integration tests (production-shaped deps)
+        if: matrix.name == 'home-ai-assistant'
+        # assistant/requirements.txt (nemo_text_processing/pynini included)
+        # only installs cleanly under the same base image/Python version as
+        # assistant/Dockerfile -- this builds that exact image (not the
+        # lightweight ubuntu-latest interpreter above) and runs the real
+        # respond()-driving integration suite inside it, plus the full
+        # dependency-light suite as a cross-check. See qa/Dockerfile.assistant_integration.
+        run: |
+          docker build -f qa/Dockerfile.assistant_integration -t home-ai-qa-assistant-integration:ci .
+          docker run --rm home-ai-qa-assistant-integration:ci python -m pytest -q -o asyncio_mode=auto
       - name: Run tools contract regressions
         if: matrix.name == 'home-ai-tools'
         run: |
           python -m py_compile tools/server-tools-app.py
-          python -m pytest -q tools/test_capability_discovery.py qa
+          python -m pip install --disable-pip-version-check pytest-asyncio==0.24.0
+          python -m pytest -q -o asyncio_mode=auto tools/test_capability_discovery.py tools/test_canonical_identity.py tools/test_workflow_events.py tools/test_media_workflow_integration.py qa --ignore=qa/test_assistant_conversation_integration.py
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:
