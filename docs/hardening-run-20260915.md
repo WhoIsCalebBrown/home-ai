@@ -43,3 +43,15 @@ This journal records evidence and falsification attempts. Production media write
 - Contract/integration: 85 tests execute against Python 3.12 application dependencies in a disposable container.
 - Full E2E: pending post-deployment Assistant-path smoke checks; no write-capable production call will be made.
 - Adversarial/live read-only: live inventory, DNS/health, capability discovery, workflow status, and Plex/provider evidence checked.
+
+## Post-deployment checkpoint
+
+- CI run `34930186784` passed for the hardened Assistant and Tools images.
+- Assistant and Tools were recreated from first-party Home-AI images `sha-68d9ff2`; no third-party container was restarted or modified.
+- Persistent Unraid templates now point to `sha-68d9ff2` and retain `TOOLS_URL=http://server-tools:8090`.
+- Runtime/template drift report is clean; Tools health reports contract `1.0` and 67 tools.
+- Recovery experiment: Assistant initially started before Tools and logged `TOOLS_BACKEND_UNAVAILABLE`; after Tools became healthy it recovered to `TOOLS_BACKEND_READY` without a code change. This proves recovery but also identifies startup ordering as a remaining availability concern.
+- Live read-only status: The Hobbit is `AVAILABLE` in Movies-DB with exact TMDB 1362 evidence and `storage_class=debrid`; Dumb and Dumber is `NO_CANDIDATE` from cli_debrid `Blacklisted`, with no Plex match. No request was submitted during this hardening pass.
+- Live read-only smoke lane succeeded for containers, Plex, Frigate events, weather, media storage, and SearXNG-backed web search.
+- Isolated qualification lane now has 96 passing tests, including side-effect tripwires, cross-session confirmation rejection, expiry, provider failure, exact episode fail-closed behavior, restart persistence, and canonical-ID collision checks.
+- The safe QA runner intentionally uses a network-isolated test container; its first implementation failed because it attempted a runtime package install, then was corrected by baking pytest/FastAPI/httpx/Pydantic into `qa/Dockerfile`. The corrected runner passed.

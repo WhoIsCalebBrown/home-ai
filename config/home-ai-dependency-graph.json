@@ -1,0 +1,24 @@
+{
+  "contract_version": "1.0",
+  "generated_for": "production-2026-09-15",
+  "edges": [
+    {"from":"assistant","to":"tools","access":"READ_WRITE","strength":"HARD","purpose":"typed capability discovery and invocation"},
+    {"from":"assistant","to":"ollama","access":"READ_WRITE","strength":"HARD","purpose":"Qwen synthesis and tool selection"},
+    {"from":"assistant","to":"stt","access":"READ","strength":"HARD","purpose":"voice transcription"},
+    {"from":"assistant","to":"tts_pocket","access":"READ","strength":"HARD","purpose":"primary speech synthesis"},
+    {"from":"assistant","to":"tts_kokoro","access":"READ","strength":"FALLBACK","purpose":"speech synthesis fallback"},
+    {"from":"tools","to":"plex","access":"READ","strength":"HARD","purpose":"canonical availability and delivery verification"},
+    {"from":"tools","to":"frigate","access":"READ","strength":"OPTIONAL","purpose":"camera status, event, and visual evidence"},
+    {"from":"tools","to":"searxng","access":"READ","strength":"OPTIONAL","purpose":"current public information"},
+    {"from":"tools","to":"cli_debrid","access":"WRITE_BOUNDED","strength":"OPTIONAL","purpose":"standard movie/season request bridge"},
+    {"from":"tools","to":"radarr","access":"READ_WRITE_BOUNDED","strength":"OPTIONAL","purpose":"permanent movie lifecycle; currently writes disabled"},
+    {"from":"tools","to":"sonarr","access":"READ_WRITE_BOUNDED","strength":"OPTIONAL","purpose":"permanent TV lifecycle; currently writes disabled"},
+    {"from":"tools","to":"lidarr","access":"READ_WRITE_BOUNDED","strength":"OPTIONAL","purpose":"music lifecycle; currently writes disabled"},
+    {"from":"tools","to":"qbittorrent","access":"READ","strength":"OPTIONAL","purpose":"download observability"},
+    {"from":"tools","to":"torbox","access":"READ","strength":"OPTIONAL","purpose":"provider observability"},
+    {"from":"tools","to":"slskd","access":"READ","strength":"OPTIONAL","purpose":"music acquisition observability"},
+    {"from":"tools","to":"music_enricher","access":"READ","strength":"OPTIONAL","purpose":"music enrichment observability"},
+    {"from":"tools","to":"beets","access":"READ","strength":"OPTIONAL","purpose":"music tagging/import observability"}
+  ],
+  "side_effect_rule": "automated tests may only write through isolated fake adapters"
+}
