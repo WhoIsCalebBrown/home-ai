@@ -31,6 +31,16 @@ def runtime_image(host: str, container: str) -> str:
     return ssh(host, f"docker inspect --format '{{{{.Config.Image}}}}' {container}").strip()
 
 
+def runtime_alias_present(host: str, container: str) -> bool:
+    if container != "Home-AI-Tools":
+        return True
+    raw = ssh(host, f"docker inspect --format '{{{{json .NetworkSettings.Networks}}}}' {container}")
+    networks = json.loads(raw)
+    voiceai = networks.get("voiceai") or {}
+    names = set(voiceai.get("Aliases") or []) | set(voiceai.get("DNSNames") or [])
+    return "server-tools" in names
+
+
 def template_env(host: str, container: str) -> tuple[str | None, dict, bool]:
     xml_path = f"/boot/config/plugins/dockerMan/templates-user/{container}.xml"
     text = ssh(host, f"cat {xml_path}")
@@ -51,15 +61,19 @@ def main() -> int:
     args = parser.parse_args()
     report = {"host": args.host, "services": {}, "drift": []}
     for container in WATCH:
-        image, template, alias = template_env(args.host, container)
+        image, template, template_alias = template_env(args.host, container)
         actual = runtime_env(args.host, container)
         actual_image = runtime_image(args.host, container)
-        service = {"runtime_env": actual, "template_env": template, "runtime_image": actual_image, "template_image": image, "network_alias_present": alias}
+        runtime_alias = runtime_alias_present(args.host, container)
+        service = {"runtime_env": actual, "template_env": template, "runtime_image": actual_image, "template_image": image,
+                   "template_network_alias_present": template_alias, "runtime_network_alias_present": runtime_alias}
         report["services"][container] = service
         if actual_image != image:
             report["drift"].append(f"{container}: image runtime/template differ")
-        if container == "Home-AI-Tools" and not alias:
-            report["drift"].append(f"{container}: missing persistent server-tools alias")
+        if container == "Home-AI-Tools" and not template_alias:
+            report["drift"].append(f"{container}: missing persistent server-tools alias in template")
+        if container == "Home-AI-Tools" and not runtime_alias:
+            report["drift"].append(f"{container}: missing server-tools alias in runtime network")
         for key in sorted(set(actual) | set(template)):
             if actual.get(key) != template.get(key):
                 report["drift"].append(f"{container}: {key} runtime/template differ")
