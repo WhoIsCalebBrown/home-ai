@@ -57,6 +57,7 @@ def main() -> int:
             "mounts": [{"source": m.get("Source"), "destination": m.get("Destination"), "mode": m.get("Mode"), "rw": m.get("RW")} for m in item.get("Mounts", [])],
             "entrypoint": config.get("Entrypoint"),
             "command": config.get("Cmd"),
+            "container_labels": config.get("Labels") or {},
             "env_keys": sorted((entry.split("=", 1)[0] for entry in config.get("Env", []))),
         }
     print(json.dumps(inventory, indent=2, sort_keys=True))
