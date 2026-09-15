@@ -145,6 +145,13 @@ READ_ONLY_CONVERSATIONS = {
         ("How is The Hobbit doing?", {"media_status"}),
         ("What about Dumb and Dumber?", {"media_status"}),
     ],
+    "media_status_asr_repair": [
+        ("How is The Hobbit doing?", {"media_status"}),
+        # Regression for the observed Faster-Whisper shape where a status
+        # question became "I was dumb in Dumberdorn".  The retained workflow
+        # must remain authoritative; no title alias or write is permitted.
+        ("I was dumb in Dumberdorn.", {"media_status"}),
+    ],
     "web_then_weather": [
         ("What happened today in American politics?", {"web_search", "web_fetch"}),
         ("What's the weather today?", {"weather_forecast"}),

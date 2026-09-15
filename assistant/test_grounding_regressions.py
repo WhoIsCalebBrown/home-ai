@@ -66,9 +66,9 @@ def test_download_followup_uses_recorded_sources():
 
 def test_damaged_media_status_uses_retained_workflow_only():
     context = {"latest_media_workflow": {"workflow_id": "wf-1"}, "domain": "media"}
-    damaged = "I was dumb in Dumberdorn."
-    assert retained_media_status_repair(damaged, context)
-    assert preflight_plan(damaged, context) == [("media_status", {"workflow_id": "wf-1"})]
+    for damaged in ("I was dumb in Dumberdorn.", "That was Dumb and Dumberdorn.", "It is dumb in Dumberdorn."):
+        assert retained_media_status_repair(damaged, context)
+        assert preflight_plan(damaged, context) == [("media_status", {"workflow_id": "wf-1"})]
     assert not retained_media_status_repair(damaged, {})
 
 

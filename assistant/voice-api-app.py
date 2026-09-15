@@ -1214,12 +1214,12 @@ def retained_media_status_repair(text: str, context: dict) -> bool:
         return False
     if explicit_domain(text, context) in {"web_research", "weather", "camera", "server"}:
         return False
-    if not re.search(r"\b(?:i\s+was|it\s+was|how|what|is|did|has|where)\b", text, re.I):
+    if not re.search(r"\b(?:i\s+was|it\s+(?:was|is)|that\s+(?:was|is)|how|what|is|did|has|where)\b", text, re.I):
         return False
     # Require a non-trivial subject after the damaged question frame.  This
     # prevents a bare acknowledgement or unrelated short utterance from
     # consuming the workflow.
-    subject = re.sub(r"^\s*(?:i\s+was|it\s+was|how(?:'s|\s+is)?|what(?:'s|\s+is)?|is|did|has|where(?:'s|\s+is)?)\s+", "", text, flags=re.I)
+    subject = re.sub(r"^\s*(?:i\s+was|it\s+(?:was|is)|that\s+(?:was|is)|how(?:'s|\s+is)?|what(?:'s|\s+is)?|is|did|has|where(?:'s|\s+is)?)\s+", "", text, flags=re.I)
     tokens = re.findall(r"[a-z0-9]+", subject.casefold())
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this", "in", "on", "for"}]) >= 2
 
