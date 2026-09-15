@@ -598,6 +598,8 @@ def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set
             return "backend_read_failure_truthful"
     if not trace and re.search(r"did you mean|could you clarify|need more details|not sure", answer, re.I):
         return "safe_stt_recovery"
+    if not trace and re.search(r"couldn't verify the current media status|no matching live workflow", answer, re.I):
+        return "safe_stt_recovery"
     return None
 
 
