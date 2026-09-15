@@ -786,6 +786,8 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             return f"{title} is already on the way."
         if state in {"FAILED", "FAILED_INGESTION"}:
             return f"The request for {title} did not make it into the media queue."
+        if state == "NO_CANDIDATE":
+            return f"I couldn't find a suitable copy of {title}."
         return f"I don't have a confirmed current status for {title} yet."
     if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
         offset = int(result.get("days_from_now") or 0)

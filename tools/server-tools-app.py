@@ -1264,7 +1264,8 @@ MEDIA_CAPABILITY_REGISTRY = {
 
 MEDIA_LIFECYCLE = ["UNKNOWN", "IDENTIFIED", "ALREADY_AVAILABLE", "WANTED", "REQUESTED", "SEARCHING",
                    "CANDIDATE_FOUND", "QUEUED", "ACQUIRING", "DOWNLOADED", "PENDING_IMPORT", "IMPORTED",
-                   "ENRICHING", "AVAILABLE_IN_PLEX", "FAILED", "BLOCKED", "NOT_FOUND"]
+                   "ENRICHING", "ACQUIRED_NOT_VISIBLE", "AVAILABLE_IN_PLEX", "NO_CANDIDATE", "FAILED",
+                   "FAILED_INGESTION", "BLOCKED", "NOT_FOUND"]
 
 # Central, planner-owned policy.  Provider IDs and paths are never selected by
 # Qwen.  A null policy is intentional: planning must fail closed until the
@@ -1863,6 +1864,10 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         canonical_state, storage_class = "AVAILABLE", "permanent_local"
     elif standard.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "debrid"
+    elif any(token in state_text for token in ("blacklist", "no candidate", "no_candidate")):
+        canonical_state, storage_class = "NO_CANDIDATE", "unknown"
+    elif any(token in state_text for token in ("fail", "error")):
+        canonical_state, storage_class = "FAILED", "unknown"
     elif any(token in state_text for token in ("collect", "complete", "downloaded")):
         canonical_state, storage_class = "ACQUIRED_NOT_VISIBLE", "debrid"
     elif any(token in state_text for token in ("check", "verif")):

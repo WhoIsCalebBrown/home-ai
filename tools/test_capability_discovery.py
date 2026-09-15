@@ -294,6 +294,23 @@ def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow
     assert result["source_workflow_state"] == "SEARCHING"
 
 
+def test_media_status_does_not_report_blacklisted_item_as_requested(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module.MEDIA_WORKFLOWS_PATH.write_text(json.dumps([{
+        "workflow_id": "wf-dumb", "media_type": "movie", "mode": "standard",
+        "current_state": "REQUESTED", "canonical_identity": {"title": "Dumb and Dumber", "year": 1994, "tmdb_id": 8467}
+    }]))
+    async def no_match(_): return {"matched": False, "candidates": []}
+    monkeypatch.setattr(module, "plex_match_canonical_media", no_match)
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
+        "matched": True, "rows": [{"state": "Blacklisted", "tmdb_id": 8467, "type": "movie"}]
+    })
+    result = asyncio.run(module.media_status({"workflow_id": "wf-dumb"}))
+    assert result["canonical_state"] == "NO_CANDIDATE"
+
+
 def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypatch, tmp_path):
     import asyncio
     module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
