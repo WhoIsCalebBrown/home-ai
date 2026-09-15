@@ -62,6 +62,15 @@ This journal records evidence and falsification attempts. Production media write
 - Fix: Tools `sha-275d670` uses an explicit bounded text-or-JSON parser only for `/api/version`. The production smoke lane now fails on structured tool errors instead of treating HTTP 200 as success.
 - Live replication: Assistant discovery still exposes 67 tools; `frigate_status` now returns `status=ok`, `reachable=true`, and the live version through the Assistant network path. No Frigate image or configuration was changed.
 - Rollback: `/boot/config/plugins/dockerMan/templates-user/Home-AI-Tools.xml.bak-hardening-20260915T052759Z`.
+
+## Media executor revalidation experiment
+
+- Observation: persisted workflows included stale active states and at least one pending approval for an item already present in Plex; the executor checked persisted state before live provider evidence.
+- Hypothesis: stale state could suppress a legitimate retry or leave a pending confirmation unnecessarily actionable.
+- Control: exact canonical Plex matching and exact cli_debrid TMDB/season evidence are authoritative; title/state text alone is not.
+- Experiment: added a no-op regression with an enabled executor, stale `SEARCHING` state, exact live `Wanted` evidence, and a pending confirmation. The request produced no external call and invalidated the approval. The full disposable suite passed 108 tests.
+- Fix: Tools `sha-1e7a923` revalidates cli_debrid and canonical Plex before any webhook, refuses writes on provider read failure, and retires pending confirmations when a live no-op is proven.
+- Live replication: production smoke passed through the Assistant network path; runtime/template drift is empty after the template update. No media write was invoked.
 - Live read-only status: The Hobbit is `AVAILABLE` in Movies-DB with exact TMDB 1362 evidence and `storage_class=debrid`; Dumb and Dumber is `NO_CANDIDATE` from cli_debrid `Blacklisted`, with no Plex match. No request was submitted during this hardening pass.
 - Live read-only smoke lane succeeded for containers, Plex, Frigate events, weather, media storage, and SearXNG-backed web search.
 - Isolated qualification lane now has 102 passing tests, including 140 acquisition-language mutations, parallel cross-session confirmation rejection, side-effect tripwires, expiry, provider failure, exact episode fail-closed behavior, restart persistence, and canonical-ID collision checks. A 50-iteration network-isolated safety soak also passed.
