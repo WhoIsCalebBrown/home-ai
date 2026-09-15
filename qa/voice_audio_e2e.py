@@ -46,7 +46,15 @@ READ_ONLY_SCENARIOS = {
     },
     "media_status": {
         "text": "How is The Hobbit doing?",
-        "allowed_tools": {"media_plan_goal"},
+        "allowed_tools": {"media_status"},
+    },
+    "media_status_failed": {
+        "text": "How is Dumb and Dumber doing?",
+        "allowed_tools": {"media_status"},
+    },
+    "media_status_missing": {
+        "text": "Is The 10th Kingdom ready?",
+        "allowed_tools": {"media_status"},
     },
     "politics": {
         "text": "What happened today in American politics?",
