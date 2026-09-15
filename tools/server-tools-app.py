@@ -1429,7 +1429,11 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     by_match = re.search(r"\b(.+?)\s+by\s+(.+?)(?:[.!?]|$)", text, re.I)
     if by_match:
         title, artist = by_match.group(1), by_match.group(2)
-    title = re.sub(r"^\s*(?:get|find|add|request|do i have|is there)\s+", "", title, flags=re.I)
+    # Strip polite request framing before identity lookup.  Keep the raw goal
+    # unchanged for audit/history, but do not send "Can you get me the movie"
+    # as part of the title query to Radarr.
+    title = re.sub(r"^\s*(?:(?:can|could|would)\s+you\s+|please\s+)?(?:get|find|add|request)(?:\s+me)?\s+", "", title, flags=re.I)
+    title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     season_match = re.search(r"\bseason\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
     episode_match = re.search(r"\bepisode\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)

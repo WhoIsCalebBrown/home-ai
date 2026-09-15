@@ -54,6 +54,26 @@ normalizer_lock = asyncio.Lock()
 speech_normalizer = None
 pronunciation_entries: dict[str, str] = {}
 normalization_init_seconds: float | None = None
+tools_backend_status: dict[str, object] = {"ok": False, "status": "NOT_CHECKED", "url": TOOLS_URL}
+
+
+async def check_tools_backend() -> None:
+    global tools_backend_status
+    try:
+        async with httpx.AsyncClient(timeout=3) as http:
+            health = await http.get(f"{TOOLS_URL}/health")
+            health.raise_for_status()
+            payload = health.json()
+            count = int(payload.get("tools", 0))
+            if count <= 0:
+                raise RuntimeError("empty tool registry")
+            tools_backend_status = {"ok": True, "status": "READY", "url": TOOLS_URL,
+                                    "tool_count": count, "service": payload.get("service")}
+            print(f"TOOLS_BACKEND_READY url={TOOLS_URL} tools={count}", flush=True)
+    except Exception as exc:
+        tools_backend_status = {"ok": False, "status": "TOOLS_BACKEND_UNAVAILABLE",
+                                "url": TOOLS_URL, "error": type(exc).__name__}
+        print(f"TOOLS_BACKEND_UNAVAILABLE url={TOOLS_URL} error={type(exc).__name__}", flush=True)
 
 
 def record_assistant_response(client_id: str, text: str, request_id: str | None = None, origin: str = "") -> None:
@@ -131,6 +151,7 @@ def complete_speakable_sentence(text: str) -> bool:
 async def initialize_speech_frontend() -> None:
     global speech_normalizer, pronunciation_entries, normalization_init_seconds
     pronunciation_entries = load_pronunciation_lexicon()
+    await check_tools_backend()
     started = time.perf_counter()
     try:
         from nemo_text_processing.text_normalization.normalize import Normalizer
@@ -513,7 +534,9 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             payload = response.json()
             entries = payload.get("tools", [])
             return [item["function"] for item in entries], [item.get("metadata", {}) for item in entries], round((time.perf_counter() - started) * 1000, 2)
-    except Exception:
+    except Exception as exc:
+        tools_backend_status.update({"ok": False, "status": "DISCOVERY_FAILED", "error": type(exc).__name__})
+        print(f"TOOLS_BACKEND_UNAVAILABLE url={TOOLS_URL} stage=discovery error={type(exc).__name__}", flush=True)
         return [], [], None
 
 
@@ -1590,6 +1613,7 @@ async def health():
         "tts_normalization": "nemo_text_processing" if speech_normalizer is not None else "unavailable",
         "pronunciation_entries": len(pronunciation_entries),
         "normalization_init_seconds": normalization_init_seconds,
+        "tools_backend": tools_backend_status,
     }
 
 
