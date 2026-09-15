@@ -508,3 +508,77 @@ async def test_web_to_plex_to_request_same_subject(session):
 
     await session.turn("Go ahead.")
     assert len(session.backend.submitted_writes) == 1
+
+
+# --- Full weather -> media -> web -> plex -> request chain (#7) --------
+
+@pytest.mark.asyncio
+async def test_weather_media_web_plex_request_full_chain(session):
+    """"What's the weather?" -> "Do you know this show called Segua?" ->
+    "Can you find it on the internet?" -> "Do I have it?" -> "Okay, get it."
+    -- the old weather domain must never reassert itself at any later step
+    merely because a follow-up is short."""
+    session.backend.seed_web("Segua", media_type="tv", tvdb_id="999")
+
+    await session.turn(
+        "What's the weather?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {}}},
+        ]}}, {"message": {"content": "It's sunny and 70 degrees.", "tool_calls": []}}],
+    )
+    assert session.app.conversation_context.get(session.client_id, {}).get("domain") == "weather"
+
+    await session.turn(
+        "Do you know this show called Segua?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Segua"}}},
+        ]}}],
+        final_text="Segua is a TV series.",
+    )
+    context_after_media = session.app.conversation_context.get(session.client_id, {})
+    assert context_after_media.get("domain") != "weather"
+    referent = context_after_media.get("latest_resolved_referent")
+    assert referent and "segua" in referent.casefold()
+
+    await session.turn(
+        "Can you find it on the internet?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Segua"}}},
+        ]}}],
+        final_text="Segua is a TV series about survival.",
+    )
+    assert not any(name == "weather_forecast" for name, _ in session.backend.call_log[-2:]), "weather must never reassert itself"
+
+    await session.turn(
+        "Do I have it?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Segua"}}},
+        ]}}],
+    )
+    plan_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
+    assert any("segua" in str(a.get("goal", "")).casefold() for a in plan_calls)
+    assert session.client_id not in session.app.pending
+
+    await session.turn(
+        "Okay, get it.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
+        ]}}],
+    )
+    assert session.client_id in session.app.pending
+    assert not session.backend.submitted_writes
+
+
+# --- Red team: Tools failure during offer execution must never write (#23) --
+
+@pytest.mark.asyncio
+async def test_tools_failure_during_offer_acceptance_produces_no_write(session):
+    async def failing_invoke(name, arguments, cid, rid, confirmed=False, action_id=None):
+        return {"tool": name, "status": "error", "result": {"error": "Tool service unavailable", "detail": "ConnectError"}}
+
+    session.app.invoke_tool = failing_invoke
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_plan_goal")
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"goal": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    await session.turn("Yeah.")
+    assert session.client_id not in session.app.pending
+    assert not session.backend.submitted_writes
