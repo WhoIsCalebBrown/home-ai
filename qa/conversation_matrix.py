@@ -13,7 +13,8 @@ def load_router():
     source = Path(__file__).resolve().parents[1] / "assistant/voice-api-app.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     names = {
-        "media_goal_request", "media_acquisition_language", "media_identity_signal", "visual_question",
+        "media_goal_request", "media_acquisition_language", "media_identity_signal", "media_status_question",
+        "media_title_status_signal", "visual_question",
         "direct_file_request", "playback_request", "preflight_plan", "deterministic_plan",
         "explicit_domain", "explicit_web_search_request", "current_external_question",
         "historical_camera_question", "historical_camera_window", "front_door_presence_question",

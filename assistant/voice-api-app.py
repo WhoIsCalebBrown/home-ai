@@ -1264,6 +1264,12 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
         return "media"
     if explicit_web_search_request(text) or re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|political|government|congress|election|president|prime minister|trump|trade war|trade dispute)\b", lowered):
         return "web_research"
+    # A title-shaped lifecycle question is an explicit media-domain turn even
+    # when Whisper dropped the noun ("movie/show") and retained only the title
+    # plus a status frame. This must outrank inherited context but comes after
+    # explicit weather/server/web/camera markers above.
+    if not re.search(r"\b(front\s+door|camera|frigate|snapshot|weather|forecast|temperature|rain|snow|docker|container|server|storage|news|politics?)\b", lowered) and media_status_question(text):
+        return "media"
     if re.search(r"\b(lidarr|lidar|plexium|plex|sonarr|radarr|qbittorrent|slskd|torbox|music|album|artist|download|downloading|travis|utopia|media pipeline)\b", lowered):
         return "media"
     if re.search(r"\b(front door|camera|cameras|frigate|snapshot|screenshot|event image)\b", lowered):

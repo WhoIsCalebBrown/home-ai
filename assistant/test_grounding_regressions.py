@@ -357,6 +357,13 @@ def test_standalone_title_where_question_is_media_status_read():
     assert not media_title_status_signal("Where is my package?")
 
 
+def test_title_status_turn_overrides_inherited_weather_domain():
+    assert explicit_domain("That's the Hobbit ready.", {"domain": "weather"}) == "media"
+    assert preflight_plan("That's the Hobbit ready.", {"domain": "weather"}) == [
+        ("media_status", {"query": "That's the Hobbit ready."})
+    ]
+
+
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
     assert grounded_camera_presence_answer(result) == "Yeah, someone's at the front door."
