@@ -20,8 +20,9 @@ def _install(module, fn):
     module.TOOLS["qa_failure_probe"] = ("qa_failure_probe", "isolated", "read", "qa", {}, fn)
 
 
-def test_timeout_is_structured_and_contains_no_evidence():
+def test_timeout_is_structured_and_contains_no_evidence(tmp_path):
     module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
 
     async def slow(_):
         await asyncio.sleep(13)
@@ -33,8 +34,9 @@ def test_timeout_is_structured_and_contains_no_evidence():
     assert result["result"]["evidence_available"] is False
 
 
-def test_http_500_is_backend_unavailable_not_success():
+def test_http_500_is_backend_unavailable_not_success(tmp_path):
     module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
 
     async def failing(_):
         request = httpx.Request("GET", "http://qa.invalid")
@@ -49,8 +51,9 @@ def test_http_500_is_backend_unavailable_not_success():
     assert result["result"]["evidence_available"] is False
 
 
-def test_malformed_success_payload_is_invalid_tool_result():
+def test_malformed_success_payload_is_invalid_tool_result(tmp_path):
     module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
 
     async def malformed(_):
         return ["not", "a", "mapping"]
