@@ -1462,15 +1462,29 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
             kind = "unknown"
     artist = None
     title = text
+    requested_year = None
+    year_match = re.search(r"(?:\b(?:from|in)\s+|\()((?:19|20)\d{2})\)?\b", text, re.I)
+    if year_match:
+        requested_year = int(year_match.group(1))
     by_match = re.search(r"\b(.+?)\s+by\s+(.+?)(?:[.!?]|$)", text, re.I)
     if by_match:
         title, artist = by_match.group(1), by_match.group(2)
     # Strip polite request framing before identity lookup.  Keep the raw goal
     # unchanged for audit/history, but do not send "Can you get me the movie"
     # as part of the title query to Radarr.
-    title = re.sub(r"^\s*(?:(?:can|could|would)\s+you\s+|please\s+)?(?:get|find|add|request)(?:\s+me)?\s+", "", title, flags=re.I)
+    # Speech disfluencies often repeat the request frame ("can you get a can
+    # you request ..."). Strip bounded framing repeatedly, never arbitrary
+    # title words, before identity lookup.
+    for _ in range(5):
+        before = title
+        title = re.sub(r"^\s*(?:please\s+)?(?:a\s+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*(?:please\s+)?(?:get|find|add|request)(?:\s+me)?\s+", "", title, flags=re.I)
+        if title == before:
+            break
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
+    if requested_year:
+        title = re.sub(rf"\s*(?:from|in)\s+{requested_year}\b|\s*\({requested_year}\)", "", title, flags=re.I).strip(" .?!")
     season_match = re.search(r"\bseason\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
     episode_match = re.search(r"\bepisode\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
     season_scope = [int(season_match.group(1))] if season_match else []
@@ -1486,7 +1500,8 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
             "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect",
-            "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope}
+            "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope,
+            "requested_year": requested_year}
 
 
 def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool]:
@@ -1551,6 +1566,8 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     elif kind == "movie":
         lookup = await radarr_search({"query": title})
         matches = lookup.get("matches", [])
+        if parts.get("requested_year"):
+            matches = [row for row in matches if str(row.get("year", "")).isdigit() and int(row.get("year")) == parts["requested_year"]]
         identity, ambiguous = _pick_match(matches, title)
         if re.search(r"\boriginal\b", parts["raw_goal"], re.I) and re.search(r"\banimated\b", parts["raw_goal"], re.I):
             preferred = next((row for row in matches
