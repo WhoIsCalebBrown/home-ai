@@ -1606,7 +1606,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                          "risk": "CONFIRMATION_REQUIRED", "status": "NOT_EXECUTED"}]
             plan["confirmation_required"] = True
             plan["bounded_write_plan"] = [{
-                "operation": "POST /webhook/api/v1/request",
+                "operation": "POST /webhook",
                 "arguments": {
                     "mediaType": "movie" if kind == "movie" else "tv",
                     "mediaId": identity.get("tmdb_id"),
