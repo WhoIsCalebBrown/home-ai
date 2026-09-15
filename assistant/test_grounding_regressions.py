@@ -190,6 +190,13 @@ def test_retained_media_workflow_status_outranks_new_media_plan():
     ]
 
 
+def test_media_what_about_followup_keeps_new_title_as_status_query():
+    context = {"latest_media_workflow": {"workflow_id": "wf-1362"}}
+    assert preflight_plan("What about Dumb and Dumber?", context) == [
+        ("media_status", {"query": "What about Dumb and Dumber?"})
+    ]
+
+
 def test_container_followup_maps_stopped_to_exited_without_crashing():
     context = {"referent_type": "containers"}
     assert preflight_plan("What have I stopped?", context) == [

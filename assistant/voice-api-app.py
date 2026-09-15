@@ -1220,6 +1220,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if media_goal_request(text):
         return [("media_plan_goal", {"goal": text})]
     latest_media = context.get("latest_media_workflow") or {}
+    # A retained media conversation may switch to another explicitly named
+    # item with a short referential status frame such as "What about Dumb and
+    # Dumber?".  Do not bind that query to the previous workflow; preserve the
+    # new title as the status lookup instead.  This is deliberately bounded to
+    # the referential frame and a multi-token subject, not a title allowlist.
+    if (latest_media.get("workflow_id")
+            and re.search(r"\bwhat\s+about\b", text, re.I)
+            and not re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage|server)\b", text, re.I)
+            and len(re.findall(r"[a-z0-9]+", re.sub(r"^.*?\bwhat\s+about\b", "", text, flags=re.I))) >= 2):
+        return [("media_status", {"query": text})]
     # Status language must outrank the broad media-goal regex below.  Without
     # this guard, "How is the movie doing?" is misclassified as a new plan
     # because the word "doing" appears in the historical acquisition phrase

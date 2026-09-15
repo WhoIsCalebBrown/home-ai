@@ -130,8 +130,39 @@ READ_ONLY_CONVERSATIONS = {
     ],
     "camera_history": [
         ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
-        ("What were they wearing?", {"frigate_event_snapshot", "frigate_event_activity"}),
+        # The live read-only state may legitimately contain no matching event.
+        # In that branch the safe response is deterministic and must not call
+        # a visual tool or fall back to the live camera.
+        ("What were they wearing?", set()),
         ("What's at the front door right now?", {"frigate_snapshot"}),
+    ],
+    "media_status_chain": [
+        ("How is The Hobbit doing?", {"media_status"}),
+        ("What about Dumb and Dumber?", {"media_status"}),
+    ],
+    "web_then_weather": [
+        ("What happened today in American politics?", {"web_search", "web_fetch"}),
+        ("What's the weather today?", {"weather_forecast"}),
+    ],
+    "media_then_web": [
+        ("Is The 10th Kingdom ready?", {"media_status"}),
+        ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+    ],
+    "weather_then_containers": [
+        ("What's the weather today?", {"weather_forecast"}),
+        ("How many containers are running?", {"list_containers"}),
+    ],
+    "camera_then_web": [
+        ("What's happening at the front door right now?", {"frigate_snapshot"}),
+        ("What's happening in American politics today?", {"web_search", "web_fetch"}),
+    ],
+    "web_then_camera": [
+        ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+        ("Is anyone at the front door right now?", {"frigate_snapshot"}),
+    ],
+    "plex_then_storage": [
+        ("What's the last thing added to Plex?", {"plex_recently_added"}),
+        ("How much storage do I have left?", {"get_storage_status"}),
     ],
 }
 
