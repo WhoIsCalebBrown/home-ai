@@ -2276,7 +2276,10 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                                "ingestion_confirmed": False, "error": type(exc).__name__,
                                                "request_shape": payload, "attempted_at": now()}})
             _save_workflow_update(rows, workflow)
-            raise
+            return {"status": "unavailable", "reason": "BRIDGE_UNAVAILABLE",
+                    "write_executed": False, "submission_transport_success": False,
+                    "ingestion_confirmed": False, "workflow_id": workflow_id,
+                    "error_type": type(exc).__name__, "request_shape": payload}
     # The supported webhook returns transport success, not ownership proof.
     # Confirm exact canonical persistence from cli_debrid's read-only database
     # before exposing REQUESTED to the conversation state.

@@ -45,6 +45,12 @@ class RecordingAsyncClient:
         )
 
 
+class FailingAsyncClient(RecordingAsyncClient):
+    async def post(self, url, json):
+        self.posts.append({"url": url, "json": json, "headers": dict(self.headers)})
+        raise httpx.ConnectError("simulated bridge outage", request=httpx.Request("POST", url))
+
+
 def _configure(module, tmp_path, evidence):
     module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
     module.STANDARD_MEDIA_BACKEND_READY = True
@@ -140,6 +146,29 @@ def test_http_success_without_exact_persistence_is_failed_ingestion(tmp_path):
     workflow = module._workflow_for_id(plan["workflow_id"])[1]
     assert workflow["canonical_state"] == "FAILED_INGESTION"
     assert workflow["confirmation_status"] == "CONSUMED"
+
+
+def test_bridge_transport_failure_returns_structured_unavailable_and_consumes_approval(tmp_path):
+    module = _load_tools()
+    _configure(module, tmp_path, [{"matched": False, "rows": []}])
+    module.httpx.AsyncClient = FailingAsyncClient
+    plan, record, args = _plan_and_bound_args(module)
+
+    result = asyncio.run(module.media_standard_request(args))
+
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "BRIDGE_UNAVAILABLE"
+    assert result["submission_transport_success"] is False
+    assert result["ingestion_confirmed"] is False
+    assert result["write_executed"] is False
+    workflow = module._workflow_for_id(plan["workflow_id"])[1]
+    assert workflow["canonical_state"] == "FAILED_INGESTION"
+    assert workflow["failure_reason"] == "BRIDGE_UNAVAILABLE"
+    assert workflow["confirmation_status"] == "CONSUMED"
+
+    replay = asyncio.run(module.media_standard_request(args))
+    assert replay["status"] == "rejected"
+    assert replay["reason"] == "CONFIRMATION_ALREADY_CONSUMED"
 
 
 def test_exact_live_item_produces_noop_without_post(tmp_path):
