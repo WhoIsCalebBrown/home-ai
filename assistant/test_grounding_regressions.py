@@ -155,6 +155,10 @@ def test_event_activity_followup_uses_event_id():
     assert preflight_plan("What were they doing?", context) == [("frigate_event_activity", {"event_id": "event-123"})]
 
 
+def test_historical_camera_zero_results_never_fall_back_to_live_snapshot():
+    assert preflight_plan("What were they wearing?", {"domain": "camera", "group": "cameras"}) == []
+
+
 def test_recent_frigate_event_does_not_prove_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 30, "active": False}]}
     answer = grounded_camera_presence_answer(result)

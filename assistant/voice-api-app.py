@@ -1225,6 +1225,12 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # deterministic and cannot be confused by an inherited camera domain.
     if front_door_presence_question(text) and re.search(r"\b(?:now|right now|currently|at the moment)\b", t, re.I):
         return [("frigate_snapshot", {"camera": "front_door"})]
+    # A historical camera query with zero candidates must not fall through to
+    # the live camera merely because the follow-up asks about clothing or
+    # activity.  Keep the absence of an event explicit; an event-specific
+    # snapshot/activity read is only safe when latest_event_id is present.
+    if context.get("group") == "cameras" and not context.get("latest_event_id") and visual_question(text):
+        return []
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):
@@ -1898,6 +1904,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if not live_results and media_status_question(user_text) and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text)):
             full = "I couldn't verify the current media status because I don't have a matching live workflow."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="media_status_without_live_evidence")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if not live_results and context.get("group") == "cameras" and not context.get("latest_event_id") and visual_question(user_text):
+            full = "I couldn't find a matching historical camera event to inspect."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="historical_camera_without_event")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
