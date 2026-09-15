@@ -954,6 +954,10 @@ def routing_aliases(text: str) -> str:
     # turn ordinary references to stores into infrastructure intent.
     if re.search(r"\bhow\s+much\b", text, re.I) and re.search(r"\b(stores?|left|free|space|disk|cache)\b", text, re.I):
         text = re.sub(r"\bstores?\b", "storage", text, flags=re.I)
+    # Whisper can fuse the short phrase "ready in Plex" into one token. Keep
+    # this repair limited to an unmistakable media-status shape.
+    if re.search(r"\bradiumplex\b", text, re.I) and re.search(r"\b(?:hobbit|movie|film|show|series|album)\b", text, re.I):
+        text = re.sub(r"\bradiumplex\b", "ready in Plex", text, flags=re.I)
     return text
 
 
@@ -1110,10 +1114,19 @@ def media_status_question(text: str) -> bool:
     # Keep backend-pipeline investigations on their existing route.  This
     # predicate is for a concrete media item's lifecycle, not questions such
     # as "Is anything in Lidarr going to Plex?".
-    if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", text, re.I):
+    routed_text = routing_aliases(text)
+    if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
-    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is)|i\s+was|can i)\b", text, re.I)
-                and re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch|pipeline)\b", text, re.I))
+    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is)|i\s+was|can i)\b", routed_text, re.I)
+    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch|pipeline)\b", routed_text, re.I)
+    if question_frame and status_word:
+        return True
+    # STT often drops the opening question frame. Treat a multi-token media
+    # subject followed by a completion/status assertion as read-only status,
+    # while excluding acquisition language.
+    return bool(status_word and re.search(r"\b(?:download(?:ed|ing)?|finish(?:ed)?|found|ready|import(?:ed)?)\b", routed_text, re.I)
+                and not media_acquisition_language(routed_text)
+                and media_title_status_signal(routed_text))
 
 
 def media_nouns_for_status(text: str) -> bool:
