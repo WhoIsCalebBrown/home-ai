@@ -2627,7 +2627,44 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     history.append({"role": "assistant", "content": full})
                     await ws.send_json({"type": "done", "request_id": request_id})
                     return
-        if not live_results and media_status_question(user_text) and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text)):
+        # Root cause of the pre-existing "no matching live workflow" gap
+        # (present in main before this session; see final report): this
+        # branch ran before deterministic_plan/semantic_preflight_allowed
+        # was narrowed to calculator/unit_convert only, back when the richer
+        # preflight_plan() (which itself calls retained_media_status_repair
+        # and would resolve "how's it doing" against
+        # context["latest_media_workflow"]) still fed `planned`/`live_results`
+        # here. respond() now calls the narrower deterministic_plan()
+        # instead (preflight_plan/preflight_names are unreferenced from the
+        # live turn path), so `live_results` is always empty at this point
+        # for a media-status question -- this canned failure fired
+        # unconditionally, before Qwen/discover_tools ever got a chance to
+        # call media_status/media_diagnose with a real referent.
+        #
+        # Fix: only take this shortcut when there is genuinely no resolvable
+        # media referent in context. When one exists (latest_media_workflow,
+        # canonical_identity, or workflow_id), fall through to the normal
+        # bounded-discovery + Qwen tool-call path below instead of
+        # preempting it -- generic, not phrase-specific, does not bypass
+        # tool discovery, and touches nothing about confirmation/write
+        # safety (this whole branch is a read-only response shortcut, not a
+        # tool invocation).
+        # latest_media_workflow/canonical_identity are only ever set by
+        # stage_media_confirmation(), which itself early-returns when no
+        # write confirmation is required -- an "identified but not yet
+        # actionable" result (e.g. found, not in Plex, nothing to confirm)
+        # never populates either field. latest_resolved_referent is the
+        # field record_tool_referent() sets unconditionally after any
+        # identification-capable tool call, so it is included here too;
+        # without it, a plain "I found X, want me to look into it?" ->
+        # "How's it doing?" pair would still incorrectly hit this shortcut.
+        has_resolvable_media_referent = bool(
+            context.get("latest_media_workflow") or context.get("canonical_identity")
+            or context.get("workflow_id") or context.get("latest_resolved_referent")
+        )
+        if (not live_results and media_status_question(user_text)
+                and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text))
+                and not has_resolvable_media_referent):
             full = "I couldn't verify the current media status because I don't have a matching live workflow."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="media_status_without_live_evidence")
             history.append({"role": "assistant", "content": full})

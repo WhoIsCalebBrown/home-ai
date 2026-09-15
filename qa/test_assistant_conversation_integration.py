@@ -695,34 +695,42 @@ async def test_music_discovery_offer_and_status_no_cli_debrid(session):
 
 @pytest.mark.asyncio
 async def test_music_status_followup_same_workflow(session):
+    """Regression test for the "2298" media-status-follow-up bug (predates
+    this session -- confirmed present in `main` at the same line -- root
+    cause: respond() called the narrow deterministic_plan()/
+    semantic_preflight_allowed() pair, scoped to calculator/unit_convert
+    only, so `live_results` was always empty for a media-status question,
+    and a canned "no matching live workflow" short-circuit fired
+    unconditionally before Qwen/discover_tools ever got a chance -- even
+    when a real latest_media_workflow/canonical_identity already existed in
+    context. Fixed by gating that short-circuit on the ABSENCE of a
+    resolvable media referent, so a genuine follow-up now falls through to
+    the normal bounded-discovery + Qwen tool-call path instead of being
+    preempted. See voice-api-app.py's has_resolvable_media_referent comment
+    for the full root-cause writeup.
+    """
     session.backend.seed_library("Rodeo", media_type="album", state="ACQUIRED_NOT_VISIBLE", foreign_album_id="fa-rodeo-2", artist="Travis Scott")
+    # "Do I have X?" phrasing itself hits the same media_status_question
+    # short-circuit as a bare question (no canonical_identity/workflow
+    # exists yet on the very first turn), so this uses the same
+    # "Can you check Plex for X?" phrasing already proven to route through
+    # the Qwen loop elsewhere in this file, to actually create the workflow
+    # this test's second turn needs.
     await session.turn(
-        "Do I have Rodeo by Travis Scott?",
+        "Can you check Plex for Rodeo by Travis Scott?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Rodeo"}}},
         ]}}],
     )
-    workflow_before = session.app.conversation_context.get(session.client_id, {}).get("latest_media_workflow")
+    # stage_media_confirmation (the only writer of latest_media_workflow/
+    # canonical_identity) early-returns when no write confirmation is
+    # required, so an "identified but not yet actionable" result like this
+    # one only ever populates latest_resolved_referent (via
+    # record_tool_referent), not latest_media_workflow -- check the field
+    # that's actually set, not the one that isn't for this shape of result.
+    referent_before = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
+    assert referent_before and "rodeo" in referent_before.casefold(), "setup sanity check -- a referent must exist in context for this test to mean anything"
 
-    # REAL PRODUCTION GAP found by this test, not a fake-harness artifact:
-    # respond() (voice-api-app.py, the `if not live_results and
-    # media_status_question(user_text) and (...)` branch right before the
-    # Qwen loop) hardcodes "I couldn't verify the current media status
-    # because I don't have a matching live workflow." whenever live_results
-    # is still empty at that point -- which it always is for a media status
-    # question, since deterministic preflight (`semantic_preflight_allowed`)
-    # is scoped to calculator/unit_convert only. It never attempts a real
-    # media_status(workflow_id=...) lookup against
-    # conversation_context[client_id]["latest_media_workflow"] before
-    # giving up, and never reaches the Qwen loop at all. This means ANY
-    # "how's X doing" / "how's it doing" status follow-up currently answers
-    # this canned failure unconditionally, regardless of whether a real
-    # workflow exists. Reported as a BUGS FOUND item, NOT patched here --
-    # this is core routing code guarded by an extensive existing regression
-    # suite (qa/test_hardening_matrix.py, scenario_catalog.py) this pass did
-    # not have budget to re-verify line by line, and the established review
-    # convention on this branch is to flag rather than silently patch
-    # anything touching routing/confirmation-adjacent behavior.
     full_reply = await session.turn(
         "How's the Rodeo album doing?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
@@ -730,11 +738,149 @@ async def test_music_status_followup_same_workflow(session):
         ]}}],
         final_text="It's been collected but Plex hasn't picked it up yet.",
     )
-    assert "matching live workflow" in full_reply.casefold(), (
-        "documents the real gap above -- if this assertion ever starts "
-        "failing because the message changed, re-check whether the gap "
-        "was fixed and update/remove this test accordingly"
+    assert "matching live workflow" not in full_reply.casefold(), "the canned short-circuit must not fire when a workflow exists in context"
+    status_calls = [args for name, args in session.backend.call_log if name == "media_status"]
+    assert status_calls, "media_status must actually be invoked now that the short-circuit no longer preempts it"
+    assert "rodeo" in full_reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_status_followup_with_no_referent_still_asks_or_declines_safely(session):
+    """The negative control (spec item #10): with NO resolvable media
+    referent at all, the short-circuit's original behavior is correct and
+    must be preserved -- a bare "How's it doing?" with nothing in context
+    must not silently invent a subject or call a tool speculatively."""
+    reply = await session.turn("How's it doing?")
+    assert "matching live workflow" in reply.casefold()
+    assert not session.backend.call_log
+
+
+@pytest.mark.asyncio
+async def test_status_followup_negative_control_weather_stays_weather(session):
+    reply = await session.turn(
+        "How's the weather doing?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {}}},
+        ]}}],
+        final_text="It's sunny and 72 degrees.",
     )
+    assert any(name == "weather_forecast" for name, _ in session.backend.call_log)
+    assert "matching live workflow" not in reply.casefold()
+
+
+@pytest.mark.parametrize("phrase", [
+    "How's it doing?", "Any progress?", "Is it ready?", "Did it find anything?",
+    "Why isn't it ready?", "What happened with it?",
+])
+@pytest.mark.parametrize("media_type,title,identity_fields", [
+    ("movie", "Dune", {"tmdb_id": "1", "year": "2021"}),
+    ("tv", "Segua", {"tvdb_id": "999"}),
+    ("album", "Rodeo", {"foreign_album_id": "fa-rodeo-9", "artist": "Travis Scott"}),
+])
+@pytest.mark.asyncio
+async def test_2298_regression_matrix_with_active_subject(session, phrase, media_type, title, identity_fields):
+    """Spec item #9's regression matrix, "one active media subject" cell:
+    every status-shaped phrase, for every media type, must actually reach a
+    real status/diagnose tool once a workflow is resolved -- context
+    resolution decides the outcome, not the phrase's exact wording."""
+    session.backend.seed_library(title, media_type=media_type, state="SEARCHING", **identity_fields)
+    await session.turn(
+        f"Get {title}.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": f"get {title}"}}},
+        ]}}],
+    )
+    session.app.pending.pop(session.client_id, None)  # this cell only cares about status-follow-up routing, not confirmation
+    reply = await session.turn(
+        phrase,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_status" if "why" not in phrase.casefold() else "media_diagnose", "arguments": {"title": title}}},
+        ]}}],
+        final_text=f"{title} is still being searched for.",
+    )
+    assert "matching live workflow" not in reply.casefold()
+
+
+@pytest.mark.parametrize("phrase", ["How's it doing?", "Is it ready?"])
+@pytest.mark.asyncio
+async def test_2298_regression_no_active_subject_asks_or_declines(session, phrase):
+    """Spec item #9, "no media subject" cell: with no resolvable referent,
+    a status question must not fabricate one. Each phrase gets its own
+    fresh session/turn -- reusing one session across a loop lets the first
+    canned response become latest_assistant_response and can change how a
+    later short utterance classifies (repeat/rephrase intent), which is not
+    what this test is about.
+
+    "Any progress?" is intentionally excluded here: the real
+    media_status_question() classifier does not treat it as a status
+    question in isolation (it has no recognized question-frame word like
+    "how's/is/what's", and its fallback path's narrower word list does not
+    include "progress" even though the main status_word regex does) -- so a
+    bare "Any progress?" with zero context does not hit this short-circuit
+    at all, by design of the pre-existing classifier, not a defect this
+    pass introduced or is scoped to fix. It IS covered, correctly, in
+    test_2298_regression_matrix_with_active_subject, where a referent
+    already exists and normal routing (not this short-circuit) handles it.
+    """
+    reply = await session.turn(phrase)
+    assert "matching live workflow" in reply.casefold()
+    assert not session.backend.call_log
+
+
+@pytest.mark.asyncio
+async def test_2298_regression_web_turn_in_between_does_not_lose_subject(session):
+    """Spec item #9, "web turn in between" cell."""
+    session.backend.seed_library("Dune", media_type="movie", state="SEARCHING", tmdb_id="1", year="2021")
+    await session.turn(
+        "Get Dune.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+        ]}}],
+    )
+    session.app.pending.pop(session.client_id, None)
+    await session.turn(
+        "Can you search the web for the director?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Dune director"}}},
+        ]}}],
+        final_text="Denis Villeneuve directed it.",
+    )
+    reply = await session.turn(
+        "How's it doing?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_status", "arguments": {"title": "Dune"}}},
+        ]}}],
+        final_text="Still searching for a copy.",
+    )
+    assert "matching live workflow" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_2298_regression_weather_turn_in_between_does_not_lose_subject(session):
+    """Spec item #9, "weather turn in between" cell."""
+    session.backend.seed_library("Dune", media_type="movie", state="SEARCHING", tmdb_id="1", year="2021")
+    await session.turn(
+        "Get Dune.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+        ]}}],
+    )
+    session.app.pending.pop(session.client_id, None)
+    await session.turn(
+        "What's the weather?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {}}},
+        ]}}],
+        final_text="Sunny today.",
+    )
+    reply = await session.turn(
+        "How's it doing?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_status", "arguments": {"title": "Dune"}}},
+        ]}}],
+        final_text="Still searching for a copy.",
+    )
+    assert "matching live workflow" not in reply.casefold()
 
 
 @pytest.mark.asyncio
