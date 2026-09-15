@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from fake_media_backend import FakeMediaBackend
+from fake_media_backend import FakeMediaBackend, FakeMediaItem
 
 
 class SideEffectTripwire:
@@ -67,7 +67,7 @@ def test_expired_confirmation_is_fail_closed(now):
 def test_item_becoming_available_between_plan_and_submit_is_no_op():
     backend = FakeMediaBackend()
     plan = backend.plan("movie", 8467)
-    item = backend.items.setdefault(plan["key"], backend.items.get(plan["key"]) or __import__("fake_media_backend").FakeMediaItem(plan["key"]))
+    item = backend.items.setdefault(plan["key"], backend.items.get(plan["key"]) or FakeMediaItem(plan["key"]))
     item.state = "AVAILABLE"
     assert backend.submit(plan)["status"] == "NO_OP"
     assert item.request_count == 0
@@ -76,7 +76,7 @@ def test_item_becoming_available_between_plan_and_submit_is_no_op():
 def test_failed_ingestion_is_retryable_but_not_active():
     backend = FakeMediaBackend()
     plan = backend.plan("movie", 8467)
-    backend.items[plan["key"]] = __import__("fake_media_backend").FakeMediaItem(plan["key"], state="NO_CANDIDATE")
+    backend.items[plan["key"]] = FakeMediaItem(plan["key"], state="NO_CANDIDATE")
     retry = backend.plan("movie", 8467)
     assert retry["result"] == "PLAN_READY"
     assert backend.submit(retry)["status"] == "SUBMITTED"
@@ -124,6 +124,6 @@ def test_equivalent_titles_do_not_share_idempotency_keys():
 def test_provider_failure_is_not_reported_as_started():
     backend = FakeMediaBackend()
     plan = backend.plan("movie", 8467)
-    item = backend.items.setdefault(plan["key"], __import__("fake_media_backend").FakeMediaItem(plan["key"], state="FAILED"))
+    item = backend.items.setdefault(plan["key"], FakeMediaItem(plan["key"], state="FAILED"))
     assert backend.plan("movie", 8467)["result"] == "PLAN_READY"
     assert item.state == "FAILED"
