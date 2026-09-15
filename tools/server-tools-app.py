@@ -1935,10 +1935,15 @@ def _save_workflow_update(rows: list[dict[str, Any]], row: dict[str, Any]) -> No
 async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     """Bounded standard/watch-first bridge; execution is disabled by default."""
     allowed_keys = {"workflow_id", "media_type", "canonical_external_id", "canonical_title", "season_scope",
-                    "episode_scope", "confirmation_context", "session_id"}
+                    "episode_scope", "confirmation_context", "session_id", "mode"}
     unexpected = sorted(set(args) - allowed_keys)
     if unexpected:
         return {"status": "rejected", "reason": "UNEXPECTED_ARGUMENT", "fields": unexpected, "write_executed": False}
+    # Mode is part of the signed confirmation binding. It is accepted only as
+    # the one supported route; callers cannot use it to select a different
+    # acquisition controller.
+    if args.get("mode") not in {None, "standard"}:
+        return {"status": "rejected", "reason": "STANDARD_MODE_REQUIRED", "write_executed": False}
     workflow_id = str(args.get("workflow_id", "")).strip()
     if not workflow_id or len(workflow_id) > 128:
         return {"status": "rejected", "reason": "WORKFLOW_ID_REQUIRED", "write_executed": False}

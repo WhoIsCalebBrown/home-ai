@@ -1257,6 +1257,24 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
         "canonical_external_id": record.get("canonical_external_id"),
         "plan_version_hash": record.get("plan_version_hash"),
     }
+    # Keep the canonical target independent of the English response. A later
+    # approval or repair turn must not have to rediscover the title.
+    prior = dict(conversation_context.get(client_id, {}))
+    prior.update({
+        "domain": "media",
+        "kind": "media_workflow",
+        "group": "media",
+        "referent_type": "media_workflow",
+        "referent_ids": [record.get("canonical_external_id")],
+        "latest_media_workflow": {
+            "workflow_id": record.get("workflow_id"),
+            "canonical_external_id": record.get("canonical_external_id"),
+            "media_type": record.get("canonical_media_type"),
+            "title": record.get("title"),
+            "mode": "standard",
+        },
+    })
+    conversation_context[client_id] = prior
 
 
 def visible_model_text(text: str) -> str:
@@ -1547,6 +1565,35 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 full = f"The restart request for {display_target} completed, but I couldn't verify its running state."
             else:
                 full = f"I couldn't restart {display_target}."
+        elif action_name == "media_standard_request":
+            details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
+            media_state = dict(conversation_context.get(client_id, {}))
+            media_state.update({
+                "domain": "media", "kind": "media_workflow", "group": "media",
+                "referent_type": "media_workflow",
+                "referent_ids": [action.get("canonical_external_id")],
+                "latest_media_workflow": {
+                    "workflow_id": action.get("workflow_id"),
+                    "canonical_external_id": action.get("canonical_external_id"),
+                    "media_type": action.get("arguments", {}).get("media_type"),
+                    "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
+                    "mode": "standard",
+                    "execution_status": details.get("status"),
+                    "reason": details.get("reason"),
+                },
+            })
+            conversation_context[client_id] = media_state
+            status = details.get("status")
+            if status == "submitted" and details.get("ingestion_confirmed"):
+                full = "Done. It's looking for it now."
+            elif status == "no_op":
+                full = "It's already on the way."
+            elif status == "failed_ingestion":
+                full = "I couldn't hand that off to your media queue."
+            elif status in {"rejected", "disabled"}:
+                full = "I couldn't hand that off to your media system."
+            else:
+                full = "I couldn't confirm that media request was accepted."
         else:
             messages = [{"role": "system", "content": SYSTEM}, *history[-12:], {"role": "tool", "name": action["name"], "content": json.dumps(result.get("result", {}), separators=(",", ":"))}, {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE}]
             full = await generate_final(messages)

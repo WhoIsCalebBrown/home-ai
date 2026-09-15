@@ -204,6 +204,19 @@ def test_cli_debrid_standard_request_rejects_episode_scope_and_is_disabled_by_de
     assert result["write_executed"] is False
 
 
+def test_cli_debrid_standard_request_accepts_bound_standard_mode():
+    import asyncio
+
+    result = asyncio.run(module.media_standard_request({
+        "workflow_id": "wf-test",
+        "mode": "standard",
+        "media_type": "movie",
+        "canonical_external_id": 1362,
+    }))
+    assert result["status"] == "disabled"
+    assert result["reason"] != "UNEXPECTED_ARGUMENT"
+
+
 def test_standard_binding_changes_when_scope_or_identity_changes():
     movie = {"workflow_id": "wf", "media_type": "movie", "canonical_external_id": 1362}
     season = {"workflow_id": "wf", "media_type": "tv", "canonical_external_id": 95396, "season_scope": [2]}
