@@ -1276,7 +1276,27 @@ def media_status_display_title(result: dict, user_text: str) -> str:
 
 
 def social_acknowledgement(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks)[.!]?\s*", text, re.I))
+    return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks|got it|understood|alright|all right)[.!]?\s*", text, re.I))
+
+
+def underspecified_read_request(text: str, context: dict | None = None) -> str | None:
+    """Prevent vague read questions from selecting several unrelated tools.
+
+    This is a safety/clarification invariant, not a domain vocabulary rule:
+    a bare superlative has no object, so using the prior domain or broad
+    retrieval to guess would be less safe than asking what the user means.
+    """
+    context = context or {}
+    if context.get("latest_resolved_referent") or context.get("canonical_identity") or context.get("latest_media_workflow"):
+        return None
+    lowered = text.casefold()
+    if re.search(r"\b(?:what(?:'s| is)|which)\s+(?:the\s+)?(?:most recent|latest|newest|last)\b", lowered):
+        if re.search(r"\b(?:news|headline|headlines|plex|movie|movies|show|shows|album|music|download|downloads|request|requests|event|events|camera|weather|container|containers|server|media)\b", lowered):
+            return None
+        return "What would you like me to find the most recent of—news, Plex media, downloads, or something else?"
+    if re.fullmatch(r"\s*what\s+was\s+the\s+movie\s+called\s*[?.!]??\s*", lowered):
+        return "Which movie do you mean? I don't have a specific movie referent from the previous turn."
+    return None
 
 
 def explicit_domain(text: str, prior: dict | None = None) -> str | None:
@@ -1284,14 +1304,17 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     lowered = routing_aliases(text).casefold()
     if social_acknowledgement(text):
         return "general"
+    # A media acquisition request mentioning a Plex/server destination is still
+    # media.  Check this before generic infrastructure nouns such as "server";
+    # otherwise "add this show to my Plex server" becomes a Docker request.
+    if media_goal_request(text) or (media_identity_signal(text) and (direct_file_request(text) or playback_request(text))):
+        return "media"
     # Infrastructure terms are deliberately checked before visual language such as
     # "see".  "What containers can you see?" is a Docker question, not a camera query.
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu)\b", lowered):
         return "server"
     if re.search(r"\b(weather|forecast|temperature|rain|snow|cold|hot|warm)\b", lowered):
         return "weather"
-    if media_goal_request(text) or (media_identity_signal(text) and (direct_file_request(text) or playback_request(text))):
-        return "media"
     if explicit_web_search_request(text) or re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|political|government|congress|election|president|prime minister|trump|trade war|trade dispute)\b", lowered):
         return "web_research"
     # A title-shaped lifecycle question is an explicit media-domain turn even
@@ -1639,7 +1662,7 @@ def investigation_query_from_speech(text: str) -> str:
 
 def is_confirmation(text: str) -> bool:
     return bool(re.fullmatch(
-        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
+        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it|let's\s+(?:get|request|add)\s+it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
         text,
         re.I,
     ))
@@ -1993,6 +2016,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
+    clarification = underspecified_read_request(user_text, conversation_context.get(client_id, {}))
+    if clarification:
+        await emit_answer(ws, request_id, clarification, client_id=client_id, origin="underspecified_request")
+        history.append({"role": "assistant", "content": clarification})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
     # Do not let an ASR collision between "stopped" and "start" silently
     # become a container-management action. A bare follow-up is ambiguous.
     if ambiguous_container_status_followup(user_text, conversation_context.get(client_id, {})):
@@ -2016,6 +2045,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
+        full = "I don't have a pending request to approve. Tell me what you'd like me to do."
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="confirmation_without_pending_action")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
     if action and is_confirmation(user_text):
         pending.pop(client_id, None)
         action_name = action.get("name")

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -30,6 +30,7 @@ resolved_followup_text = namespace["resolved_followup_text"]
 conversation_context = namespace["conversation_context"]
 explicit_domain = namespace["explicit_domain"]
 social_acknowledgement = namespace["social_acknowledgement"]
+underspecified_read_request = namespace["underspecified_read_request"]
 contextual_entity_resolution = namespace["contextual_entity_resolution"]
 is_repair_turn = namespace["is_repair_turn"]
 repair_route_text = namespace["repair_route_text"]
@@ -99,6 +100,24 @@ def test_natural_media_acquisition_language_resolves_to_planner():
         assert media_goal_request(text)
         assert explicit_domain(text) == "media"
         assert preflight_plan(text) == [("media_plan_goal", {"goal": text})]
+
+
+def test_media_request_to_plex_server_beats_generic_server_domain():
+    text = "I want to add a TV show to my Plex server, can you request Sagwa, the Chinese Siamese Cat?"
+    assert explicit_domain(text, {"domain": "server"}) == "media"
+    assert preflight_plan(text) == [("media_plan_goal", {"goal": text})]
+
+
+def test_bare_recent_question_requires_a_scope_instead_of_tool_fanout():
+    clarification = underspecified_read_request("What's the most recent?", {"domain": "server", "referent_type": "containers"})
+    assert clarification and "most recent" in clarification
+    assert underspecified_read_request("What's the latest news?", {"domain": "server"}) is None
+
+
+def test_confirmation_without_pending_action_is_not_routed_to_a_writer():
+    assert is_confirmation("Yeah, let's add it")
+    assert is_confirmation("Yeah, go for it")
+    assert social_acknowledgement("Got it")
 
 
 def test_bounded_docker_stt_repair_preserves_server_routing():
