@@ -195,6 +195,9 @@ def test_media_what_about_followup_keeps_new_title_as_status_query():
     assert preflight_plan("What about Dumb and Dumber?", context) == [
         ("media_status", {"query": "What about Dumb and Dumber?"})
     ]
+    assert preflight_plan("What about Dumb and Dumber?", {"domain": "media"}) == [
+        ("media_status", {"query": "What about Dumb and Dumber?"})
+    ]
 
 
 def test_container_followup_maps_stopped_to_exited_without_crashing():

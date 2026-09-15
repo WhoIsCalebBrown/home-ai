@@ -1225,7 +1225,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # Dumber?".  Do not bind that query to the previous workflow; preserve the
     # new title as the status lookup instead.  This is deliberately bounded to
     # the referential frame and a multi-token subject, not a title allowlist.
-    if (latest_media.get("workflow_id")
+    if ((latest_media.get("workflow_id") or context.get("domain") in {"media", "plex"})
             and re.search(r"\bwhat\s+about\b", text, re.I)
             and not re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage|server)\b", text, re.I)
             and len(re.findall(r"[a-z0-9]+", re.sub(r"^.*?\bwhat\s+about\b", "", text, flags=re.I))) >= 2):
