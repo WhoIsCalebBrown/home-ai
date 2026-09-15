@@ -8,7 +8,7 @@
       "container": "Home-AI-Assistant",
       "internal_alias": "assistant",
       "port": 8088,
-      "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-ce1bc18"
+      "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-bc66ff6"
     },
     "tools": {
       "container": "Home-AI-Tools",
