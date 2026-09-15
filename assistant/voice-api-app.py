@@ -1744,8 +1744,9 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", lowered):
         ids = ",".join(str(value) for value in context.get("referent_ids", []))
         return f"check Lidarr import status for album ids {ids}"
-    if context.get("domain") == "server" and context.get("referent_type") == "containers" and re.search(r"\b(how many|which|what|are|is)\b", lowered) and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", lowered):
-        return f"how many containers are {lowered}"
+    if context.get("domain") == "server" and context.get("referent_type") == "containers" and re.search(r"\b(how many|which|what|are|is|what about)\b", lowered) and re.search(r"\b(running|stopped|stops?|exited|paused|restarting|dead)\b", lowered):
+        status = "stopped" if re.search(r"\bstops?\b", lowered) else lowered
+        return f"how many containers are {status}"
     if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):
         return "what movies are currently being acquired, queued, downloaded, or imported"
     if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):

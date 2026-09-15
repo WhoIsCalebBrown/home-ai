@@ -118,6 +118,13 @@ def test_past_tense_media_status_frame_keeps_title_status_route():
     assert preflight_plan("what was happening with the 10th kingdom.") == [("media_status", {"query": "what was happening with the 10th kingdom."})]
 
 
+def test_container_followup_repairs_whisper_stops_variant():
+    conversation_context["container-stops"] = {"domain": "server", "referent_type": "containers", "group": "server"}
+    route = resolved_followup_text("container-stops", "What about stops?")
+    assert route == "how many containers are stopped"
+    assert preflight_plan(route, conversation_context["container-stops"]) == [("list_containers", {"status": "exited"})]
+
+
 def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Send me the Dumb and Dumber movie file here.")
     assert direct_file_request("Upload Dumb and Dumber into this chat.")
