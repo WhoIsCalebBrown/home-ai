@@ -1747,6 +1747,13 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                "policy_status": policy_status.get("reason", "VALID")})
     plan["lifecycle_states"] = MEDIA_LIFECYCLE
     plan["recommended_workflow"] = " / ".join(step["capability"] for step in plan["steps"])
+    # Do not persist a workflow keyed by a guessed title.  Until a canonical
+    # identity exists, this is a read-only candidate/clarification result, not
+    # a durable media goal or an idempotency claim.
+    if not identity:
+        plan["workflow_id"] = None
+        plan["idempotent"] = False
+        return plan
     rows = _media_workflows()
     canonical_id = identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("title")
     key_data = {"type": kind, "id": canonical_id, "mode": parts.get("mode", "standard"),

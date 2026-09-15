@@ -307,3 +307,5 @@ def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypat
     assert result["candidates"][0]["tmdb_id"] == 40546
     assert result["writes_required"] == []
     assert result["confirmation_required"] is False
+    assert result["workflow_id"] is None
+    assert module._media_workflows() == []
