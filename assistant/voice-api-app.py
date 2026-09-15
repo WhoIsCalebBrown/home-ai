@@ -956,8 +956,8 @@ def routing_aliases(text: str) -> str:
         text = re.sub(r"\bstores?\b", "storage", text, flags=re.I)
     # Whisper can fuse the short phrase "ready in Plex" into one token. Keep
     # this repair limited to an unmistakable media-status shape.
-    if re.search(r"\bradiumplex\b", text, re.I) and re.search(r"\b(?:hobbit|movie|film|show|series|album)\b", text, re.I):
-        text = re.sub(r"\bradiumplex\b", "ready in Plex", text, flags=re.I)
+    if re.search(r"\bradium\s*plex\b", text, re.I) and re.search(r"\b(?:hobbit|movie|film|show|series|album)\b", text, re.I):
+        text = re.sub(r"\bradium\s*plex\b", "ready in Plex", text, flags=re.I)
     return text
 
 
@@ -1125,7 +1125,7 @@ def media_status_question(text: str) -> bool:
     # subject followed by a completion/status assertion as read-only status,
     # while excluding acquisition language.
     return bool(status_word and re.search(r"\b(?:download(?:ed|ing)?|finish(?:ed)?|found|ready|import(?:ed)?)\b", routed_text, re.I)
-                and not media_acquisition_language(routed_text)
+                and (not media_acquisition_language(routed_text) or re.search(r"\bget\s+found\b", routed_text, re.I))
                 and media_title_status_signal(routed_text))
 
 
@@ -1340,7 +1340,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
-    if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and not media_acquisition_language(text):
+    if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and (not media_acquisition_language(text) or re.search(r"\bget\s+found\b", t)):
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:
