@@ -2094,8 +2094,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # sending it to the model made stale weather/camera context compete
         # with the current request. Referential turns retain a short history,
         # while structured referents are always supplied below.
-        model_history = history[-6:] if has_referential_language(user_text) else []
-        messages = [{"role": "system", "content": SYSTEM}] + model_history
+        # The current utterance must always be a real user message.  The
+        # semantic contract and retrieved schemas constrain the model, but
+        # they do not replace the user turn.  Exclude the just-appended user
+        # entry from retained history so referential turns do not duplicate it.
+        model_history = history[-7:-1] if has_referential_language(user_text) else []
+        messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": user_text}]
         context = turn_context(client_id, user_text)
         contextual = contextual_entity_resolution(user_text, context)
         context["canonical_entities"] = contextual["entities"]
