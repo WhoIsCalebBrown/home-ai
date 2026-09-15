@@ -1660,8 +1660,14 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     plan["lifecycle_states"] = MEDIA_LIFECYCLE
     plan["recommended_workflow"] = " / ".join(step["capability"] for step in plan["steps"])
     rows = _media_workflows()
-    key = json.dumps({"type": kind, "id": (identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("title"))}, sort_keys=True)
-    existing = next((row for row in rows if row.get("dedupe_key") == key), None)
+    canonical_id = identity.get("foreign_album_id") or identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("title")
+    key_data = {"type": kind, "id": canonical_id, "mode": parts.get("mode", "standard"),
+                "season_scope": sorted(set(parts.get("season_scope") or [])),
+                "episode_scope": sorted(set(parts.get("episode_scope") or []))}
+    key = json.dumps(key_data, sort_keys=True)
+    legacy_key = json.dumps({"type": kind, "id": canonical_id}, sort_keys=True)
+    existing = next((row for row in rows if row.get("dedupe_key") == key or
+                     (row.get("dedupe_key") == legacy_key and row.get("mode", "standard") == parts.get("mode", "standard"))), None)
     workflow = existing or {"workflow_id": str(uuid.uuid4()), "dedupe_key": key, "created_at": now(), "action_history": []}
     active_states = {"REQUESTED", "SEARCHING", "ACQUIRING", "VERIFYING", "ACQUIRED", "AVAILABLE_IN_PLEX"}
     preserved_state = existing.get("current_state") if existing and existing.get("current_state") in active_states else plan["current_state"]
