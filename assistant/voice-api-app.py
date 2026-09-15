@@ -1092,7 +1092,7 @@ def media_status_question(text: str) -> bool:
     # as "Is anything in Lidarr going to Plex?".
     if re.search(r"\b(?:anything|pipeline|lidarr|sonarr|radarr)\b", text, re.I):
         return False
-    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|did|where is|what(?:'s| is))\b", text, re.I)
+    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|did|where is|what(?:'s| is))\b", text, re.I)
                 and re.search(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in plex|import(?:ed)?|there yet|status|progress)\b", text, re.I))
 
 

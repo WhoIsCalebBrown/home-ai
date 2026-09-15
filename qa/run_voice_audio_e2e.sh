@@ -13,4 +13,9 @@ elif [[ "$1" != --* ]]; then
 fi
 
 printf '%q ' "$@" >/dev/null
-ssh "$host" "docker exec -i '$container' python3 - $*" < "$(dirname "$0")/voice_audio_e2e.py"
+if [[ -z "${HOME_AI_AUDIO_CLIENT_ID:-}" ]]; then
+  client_id="qa-audio-e2e-$(date -u +%s%N)"
+else
+  client_id="$HOME_AI_AUDIO_CLIENT_ID"
+fi
+ssh "$host" "docker exec -i '$container' python3 - $* --client-id '$client_id'" < "$(dirname "$0")/voice_audio_e2e.py"

@@ -98,6 +98,7 @@ def test_media_status_questions_use_live_status_capability():
     assert preflight_plan("Is Dumb and Dumber ready in Plex?") == [("media_status", {"query": "Is Dumb and Dumber ready in Plex?"})]
     assert media_title_status_signal("as the 10th kingdom ready")
     assert preflight_plan("as the 10th kingdom ready") == [("media_status", {"query": "as the 10th kingdom ready"})]
+    assert preflight_plan("that's the 10th kingdom ready") == [("media_status", {"query": "that's the 10th kingdom ready"})]
 
 
 def test_media_status_does_not_turn_acquisition_language_into_status():
