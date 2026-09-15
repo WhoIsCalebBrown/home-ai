@@ -1894,8 +1894,11 @@ async def run_response(ws: WebSocket, client_id: str, request_id: str, user_text
 
 @app.get("/health")
 async def health():
+    tools_ready = bool(tools_backend_status.get("ok"))
     return {
         "ok": True,
+        "status": "READY" if tools_ready else "DEGRADED",
+        "dependencies_ok": tools_ready,
         "model": MODEL,
         "tts_normalization": "nemo_text_processing" if speech_normalizer is not None else "unavailable",
         "pronunciation_entries": len(pronunciation_entries),
