@@ -1482,11 +1482,14 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     for _ in range(5):
         before = title
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
-        title = re.sub(r"^\s*(?:please\s+)?(?:get|find|add|request)(?:\s+me)?\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", title, flags=re.I)
         if title == before:
             break
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
-    title = re.sub(r"\b(?:and )?(?:get|add) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
+    title = re.sub(r"^\s*put\s+", "", title, flags=re.I)
+    title = re.sub(r"\s+(?:on|in)\s+(?:my\s+)?plex\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s+for\s+me\s*$", "", title, flags=re.I)
+    title = re.sub(r"\b(?:and )?(?:get|give|grab|add|request) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     if requested_year:
         title = re.sub(rf"\s*(?:from|in)\s+{requested_year}\b|\s*\({requested_year}\)", "", title, flags=re.I).strip(" .?!")
     season_match = re.search(r"\bseason\s+(\d+)\s+(?:of\s+)?(.+?)(?:[.!?]|$)", text, re.I)
@@ -1503,7 +1506,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
-            "action": "ensure_available" if re.search(r"\b(get|find|add|request)\b", lowered) else "inspect",
+            "action": "ensure_available" if re.search(r"\b(get|give|grab|find|add|request|want|put)\b", lowered) else "inspect",
             "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope,
             "requested_year": requested_year}
 
