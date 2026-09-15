@@ -71,6 +71,14 @@ This journal records evidence and falsification attempts. Production media write
 - Experiment: added a no-op regression with an enabled executor, stale `SEARCHING` state, exact live `Wanted` evidence, and a pending confirmation. The request produced no external call and invalidated the approval. The full disposable suite passed 108 tests.
 - Fix: Tools `sha-1e7a923` revalidates cli_debrid and canonical Plex before any webhook, refuses writes on provider read failure, and retires pending confirmations when a live no-op is proven.
 - Live replication: production smoke passed through the Assistant network path; runtime/template drift is empty after the template update. No media write was invoked.
+
+## Live TV schema experiment
+
+- Observation: the live cli_debrid database has 48,677 `episode` rows and zero `tv` rows; a Severance sample stores `season_number=2`, while `requested_season=0` is a boolean flag.
+- Hypothesis: the prior TV acknowledgement query (`type='tv'`, `requested_season` as scope) could not confirm season ingestion or report TV progress correctly.
+- Experiment/control: read-only inspection of the live schema and existing Severance rows; disposable fixture with an episode row for TMDB 95396/season 2; full QA passed 109 tests.
+- Fix: Tools `sha-dea4851` accepts the actual episode-backed schema, uses `season_number` for exact scope, and keeps movie matching on `type='movie'`.
+- Live replication: `media_status` for an existing Severance workflow now returned `AVAILABLE` with exact TV identity and episode-backed cli_debrid evidence; production smoke remained green. No TV write was invoked.
 - Live read-only status: The Hobbit is `AVAILABLE` in Movies-DB with exact TMDB 1362 evidence and `storage_class=debrid`; Dumb and Dumber is `NO_CANDIDATE` from cli_debrid `Blacklisted`, with no Plex match. No request was submitted during this hardening pass.
 - Live read-only smoke lane succeeded for containers, Plex, Frigate events, weather, media storage, and SearXNG-backed web search.
 - Isolated qualification lane now has 102 passing tests, including 140 acquisition-language mutations, parallel cross-session confirmation rejection, side-effect tripwires, expiry, provider failure, exact episode fail-closed behavior, restart persistence, and canonical-ID collision checks. A 50-iteration network-isolated safety soak also passed.

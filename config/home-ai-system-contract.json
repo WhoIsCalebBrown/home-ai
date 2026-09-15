@@ -5,7 +5,7 @@
   "network": "voiceai",
   "services": {
     "assistant": {"container": "Home-AI-Assistant", "internal_alias": "assistant", "port": 8088, "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-ea0d383"},
-    "tools": {"container": "Home-AI-Tools", "internal_alias": "server-tools", "port": 8090, "image": "ghcr.io/whoiscalebbrown/home-ai-tools:sha-1e7a923"},
+    "tools": {"container": "Home-AI-Tools", "internal_alias": "server-tools", "port": 8090, "image": "ghcr.io/whoiscalebbrown/home-ai-tools:sha-dea4851"},
     "ollama": {"container": "Ollama", "port": 11434},
     "stt": {"container": "Faster-Whisper", "port": 10300},
     "tts_pocket": {"container": "Pocket-TTS"},
