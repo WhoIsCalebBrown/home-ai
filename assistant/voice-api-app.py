@@ -1512,7 +1512,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # still route to web search below.
     if historical_camera_question(text):
         since, until = historical_camera_window(text)
-        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+        return [("frigate_recent_activity", {"camera": "front_door", "label": "person", "limit": 20, "latest_only": False, "since": since, "until": until})]
     # "right now" is live-camera intent, not a request for the recent event
     # list.  Historical wording has already returned above, so this branch is
     # deterministic and cannot be confused by an inherited camera domain.
@@ -1528,7 +1528,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # "Recent front door events" is local Frigate history, not public web news.
     if re.search(r"\b(front\s+door|camera|frigate)\b", t) and re.search(r"\b(recent|recently|today|earlier|event|events|happened|recorded)\b", t, re.I):
         since, until = historical_camera_window(text)
-        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+        latest_only = bool(re.search(r"\b(?:recent|recently|latest|last)\b", t, re.I)) and not bool(re.search(r"\b(?:two|three|all|everything|multiple|several|timeline|last\s+hour|today|this\s+(?:morning|afternoon|evening))\b", t, re.I))
+        return [("frigate_recent_activity", {"camera": "front_door", "label": "person", "limit": 1 if latest_only else 20, "latest_only": latest_only, "since": since, "until": until})]
     # Explicit current-information intent is a hard domain boundary. It is
     # evaluated after explicit camera/history shapes so "recent front door
     # events" cannot be mistaken for public news, but before any inherited
@@ -1552,6 +1553,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
     if context.get("latest_event_id") and activity_question(text):
         return [("frigate_event_activity", {"event_id": context["latest_event_id"]})]
+    if context.get("latest_event_id") and visual_question(text):
+        return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(?:yeah|yes|that's|that is|exactly|right)\b", t):
         return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(event|detection|image|snapshot|that)\b", t) and visual_question(text):
@@ -2178,13 +2181,28 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # Semantic retrieval supplies the bounded model-facing tool set. Only
         # deterministic arithmetic may bypass Qwen; domain and tool selection
         # is no longer performed by the legacy language-pattern preflight.
-        planned = [plan for plan in deterministic_plan(route_text)
+        # The semantic retriever supplies candidates, but an established hard
+        # invariant (especially a retained Frigate event) must constrain the
+        # actual dispatch.  Previously only calculator/unit conversion used
+        # this deterministic path; Qwen could therefore add a live snapshot
+        # or current_datetime beside an event-scoped plan.  Use the bounded
+        # preflight planner for all known high-confidence routes, while still
+        # leaving genuinely novel/ambiguous requests to semantic retrieval.
+        planned = [plan for plan in preflight_plan(route_text, context)
                    if semantic_preflight_allowed(plan[0])]
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
         context["resolved_request"] = resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)
         context["latest_resolved_request"] = context["resolved_request"]
+        if planned:
+            planned_names = {name for name, _ in planned}
+            # Do not offer unrelated capabilities when deterministic routing
+            # has established a safe, bounded route.  This is particularly
+            # important for historical camera referents: current snapshots
+            # and current_datetime must not compete with event evidence.
+            tools = [tool for tool in tools if tool.get("name") in planned_names]
+            context["resolved_request"]["selected_tools"] = [tool.get("name") for tool in tools]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         if tools:

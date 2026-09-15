@@ -1037,7 +1037,8 @@ async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
 
 async def frigate_recent_activity(args: dict[str, Any]) -> dict[str, Any]:
     """Return review-grouped activity with canonical event timing and evidence links."""
-    params = {"limit": min(int(args.get("limit", 10)), 50)}
+    latest_only = bool(args.get("latest_only", False))
+    params = {"limit": min(int(args.get("limit", 1 if latest_only else 10)), 50)}
     if args.get("camera"):
         params["camera"] = args["camera"]
     if args.get("label"):
@@ -1047,7 +1048,15 @@ async def frigate_recent_activity(args: dict[str, Any]) -> dict[str, Any]:
     since = float(args["since"]) if args.get("since") is not None else None
     until = float(args["until"]) if args.get("until") is not None else None
     reviews = []
-    for review in rows[:50] if isinstance(rows, list) else []:
+    candidates = list(rows) if isinstance(rows, list) else []
+    # Frigate normally returns newest reviews first, but enforce the contract
+    # here so the natural-language "recently" route never depends on API
+    # ordering.  Range queries retain all matching reviews unless latest_only
+    # was explicitly requested.
+    candidates.sort(key=lambda item: float(item.get("start_time", 0) or 0), reverse=True)
+    if latest_only:
+        candidates = candidates[:1]
+    for review in candidates[:50]:
         start = event_time(review.get("start_time"))
         if start is not None and ((since is not None and start < since) or (until is not None and start > until)):
             continue
@@ -1064,7 +1073,7 @@ async def frigate_recent_activity(args: dict[str, Any]) -> dict[str, Any]:
             "genai": metadata if isinstance(metadata, dict) else None,
             "has_visual_evidence": bool(detection_ids),
         })
-    return {"reviews": reviews, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat(), "timezone": HOME_TIMEZONE}
+    return {"reviews": reviews, "latest_only": latest_only, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat(), "timezone": HOME_TIMEZONE}
 
 
 async def frigate_event_context(event_id: str, retrieved: float | None = None) -> dict[str, Any]:
@@ -2560,7 +2569,7 @@ REGISTRY = [
     ("frigate_status", "Check Frigate reachability and version.", "read", "frigate", {}, frigate_status),
     ("frigate_stats", "Get current Frigate camera and detector stats; this does not contain visual content.", "read", "frigate", {}, frigate_stats),
     ("frigate_recent_events", "Get recent or bounded historical Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_events),
-    ("frigate_recent_activity", "Get recent or bounded historical Frigate review activity with normalized timing, camera context, review IDs, and GenAI metadata when available.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_recent_activity),
+    ("frigate_recent_activity", "Get recent or bounded historical Frigate review activity with normalized timing, camera context, review IDs, and GenAI metadata when available. Use latest_only for a natural-language recently/latest question; omit it for explicit ranges or timelines.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "latest_only": {"type": "boolean"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_recent_activity),
     ("frigate_snapshot", "Get one current Frigate camera frame for an explicitly requested vision analysis.", "read", "frigate", {"camera": {"type": "string", "required": True}}, frigate_snapshot),
     ("frigate_event_snapshot", "Get the snapshot belonging to one specific Frigate event ID for grounded visual analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_snapshot),
     ("frigate_event_activity", "Extract up to four bounded representative frames from one Frigate event clip for activity analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_activity),

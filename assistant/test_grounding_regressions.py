@@ -220,7 +220,7 @@ def test_generic_media_and_local_status_variants_route_deterministically():
 
 
 def test_recent_front_door_events_are_local_history_not_web():
-    assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_events"
+    assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_activity"
     assert preflight_plan("Can you check the camera right now?") == [("frigate_snapshot", {"camera": "front_door"})]
     assert preflight_plan("What is happening at the front door?") == [("frigate_snapshot", {"camera": "front_door"})]
     assert preflight_plan("What happened today in Canada?") == [("web_search", {"query": "What happened today in Canada?"})]
@@ -286,9 +286,20 @@ def test_historical_camera_language_uses_bounded_events():
     text = "A little over an hour ago, there were two camera events at the front door."
     assert historical_camera_question(text)
     plan = preflight_plan(text)
-    assert plan[0][0] == "frigate_recent_events"
+    assert plan[0][0] == "frigate_recent_activity"
     assert plan[0][1]["camera"] == "front_door"
+    assert plan[0][1]["latest_only"] is False
     assert "since" in plan[0][1] and "until" in plan[0][1]
+
+
+def test_generic_recent_front_door_question_selects_latest_review_only():
+    plan = preflight_plan("Has anything happened at the front door recently?")
+    assert plan == [
+        ("frigate_recent_activity", {
+            "camera": "front_door", "label": "person", "limit": 1,
+            "latest_only": True, "since": plan[0][1]["since"], "until": plan[0][1]["until"]
+        })
+    ]
 
 
 def test_event_activity_followup_uses_event_id():
@@ -311,6 +322,20 @@ def test_current_presence_followup_switches_from_history_to_live_snapshot():
     assert preflight_plan("Are they still there?", context) == [
         ("frigate_snapshot", {"camera": "front_door"})
     ]
+
+
+def test_historical_appearance_never_uses_current_snapshot():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    assert preflight_plan("What did they look like?", context) == [
+        ("frigate_event_snapshot", {"event_id": "event-123"})
+    ]
+
+
+def test_historical_time_followup_never_uses_current_datetime():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    plan = preflight_plan("What time was that?", context)
+    assert plan == [("frigate_activity_details", {"event_id": "event-123"})]
+    assert all(name != "current_datetime" for name, _ in plan)
 
 
 def test_resolved_event_activity_followup_beats_historical_search():
