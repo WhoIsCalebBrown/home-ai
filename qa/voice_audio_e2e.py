@@ -80,6 +80,42 @@ READ_ONLY_SCENARIOS = {
         "text": "Can you— how many containers are running?",
         "allowed_tools": {"list_containers"},
     },
+    "containers_docker": {
+        "text": "How many Docker containers are currently running?",
+        "allowed_tools": {"list_containers"},
+    },
+    "containers_total": {
+        "text": "What is the total number of containers?",
+        "allowed_tools": {"list_containers"},
+    },
+    "weather_tomorrow": {
+        "text": "What will the weather be tomorrow?",
+        "allowed_tools": {"weather_forecast"},
+    },
+    "weather_filler": {
+        "text": "Uh, could you check the weather for me?",
+        "allowed_tools": {"weather_forecast"},
+    },
+    "plex_recent": {
+        "text": "What was most recently added to Plex?",
+        "allowed_tools": {"plex_recently_added"},
+    },
+    "politics_current": {
+        "text": "What are the latest developments in American politics?",
+        "allowed_tools": {"web_search", "web_fetch"},
+    },
+    "web_explicit": {
+        "text": "Search the web for the latest news about Nvidia.",
+        "allowed_tools": {"web_search", "web_fetch"},
+    },
+    "frigate_live": {
+        "text": "Is anyone at the front door right now?",
+        "allowed_tools": {"frigate_snapshot", "frigate_recent_events"},
+    },
+    "frigate_history": {
+        "text": "What happened at the front door about an hour ago?",
+        "allowed_tools": {"frigate_recent_events"},
+    },
 }
 
 READ_ONLY_CONVERSATIONS = {
