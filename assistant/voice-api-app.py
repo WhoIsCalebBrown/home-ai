@@ -1176,6 +1176,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if media_goal_request(text):
         return [("media_plan_goal", {"goal": text})]
     latest_media = context.get("latest_media_workflow") or {}
+    # Status language must outrank the broad media-goal regex below.  Without
+    # this guard, "How is the movie doing?" is misclassified as a new plan
+    # because the word "doing" appears in the historical acquisition phrase
+    # list.  Only a retained workflow can be executed as a canonical status
+    # read; a fresh title is still resolved by the planner.
     if latest_media.get("workflow_id") and re.search(r"\b(?:how(?:'s| is)|status|progress|doing|find|found|ready|download|downloading|stuck|taking|plex|import|there yet)\b", t, re.I):
         return [("media_status", {"workflow_id": latest_media["workflow_id"]})]
     # Explicit historical camera scope outranks generic freshness words such
@@ -1184,6 +1189,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if historical_camera_question(text):
         since, until = historical_camera_window(text)
         return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+    # "right now" is live-camera intent, not a request for the recent event
+    # list.  Historical wording has already returned above, so this branch is
+    # deterministic and cannot be confused by an inherited camera domain.
+    if front_door_presence_question(text) and re.search(r"\b(?:now|right now|currently|at the moment)\b", t, re.I):
+        return [("frigate_snapshot", {"camera": "front_door"})]
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):

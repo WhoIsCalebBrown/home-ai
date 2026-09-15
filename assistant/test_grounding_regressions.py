@@ -143,6 +143,19 @@ def test_somebody_front_door_phrase_uses_frigate_events():
     assert preflight_plan("Is somebody at my front door?")[0][0] == "frigate_recent_events"
 
 
+def test_explicit_live_front_door_language_uses_current_snapshot():
+    assert preflight_plan("What's happening at the front door right now?") == [
+        ("frigate_snapshot", {"camera": "front_door"})
+    ]
+
+
+def test_retained_media_workflow_status_outranks_new_media_plan():
+    context = {"latest_media_workflow": {"workflow_id": "wf-8467"}}
+    assert preflight_plan("How is Dumb and Dumber doing?", context) == [
+        ("media_status", {"workflow_id": "wf-8467"})
+    ]
+
+
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
     assert grounded_camera_presence_answer(result) == "Yeah, someone's at the front door."
