@@ -1092,7 +1092,7 @@ def media_status_question(text: str) -> bool:
     # as "Is anything in Lidarr going to Plex?".
     if re.search(r"\b(?:anything|pipeline|lidarr|sonarr|radarr)\b", text, re.I):
         return False
-    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|did|where is|what(?:'s| is))\b", text, re.I)
+    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where is|what(?:'s| is))\b", text, re.I)
                 and re.search(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in plex|import(?:ed)?|there yet|status|progress)\b", text, re.I))
 
 
@@ -1106,7 +1106,7 @@ def media_title_status_signal(text: str) -> bool:
         return False
     if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet)\b", text, re.I):
         return True
-    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|did|where\s+is|what(?:'s|\s+is))\s+", "", text, flags=re.I)
+    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where\s+is|what(?:'s|\s+is))\s+", "", text, flags=re.I)
     subject = re.split(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet|status|progress)\b", subject, maxsplit=1, flags=re.I)[0]
     tokens = re.findall(r"[a-z0-9]+", subject.casefold())
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
@@ -1115,7 +1115,7 @@ def media_title_status_signal(text: str) -> bool:
 def media_status_display_title(result: dict, user_text: str) -> str:
     """Extract a short human title for a truthful not-found status response."""
     query = str(result.get("query") or user_text).strip(" .?!")
-    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|did|where\s+is|what(?:'s|\s+is))\s+", "", query, flags=re.I)
+    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|has|did|where\s+is|what(?:'s|\s+is))\s+", "", query, flags=re.I)
     query = re.sub(r"\s+(?:doing|going|ready|found|find|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet|status|progress)\b.*$", "", query, flags=re.I)
     return query.strip(" .?!") or "that media"
 
