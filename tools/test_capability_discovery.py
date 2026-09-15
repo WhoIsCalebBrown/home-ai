@@ -33,6 +33,13 @@ def test_discovery_handles_local_aliases_and_utilities():
     assert names("convert 5 GB to MB")[0] == "unit_convert"
 
 
+def test_media_diagnosis_outranks_broad_download_in_media_context():
+    ranked = module.discover_capabilities("why is Dumb and Dumber stuck", 8,
+                                          {"group": "media", "tools": ["media_plan_goal"], "referents": ["tmdb:8467"]})
+    assert ranked[0]["metadata"]["canonical_name"] == "media_diagnose"
+    assert module.discover_capabilities("what is downloading", 8)[0]["metadata"]["canonical_name"] == "investigate_downloads"
+
+
 def test_calculator_and_units_are_deterministic():
     import asyncio
     assert asyncio.run(module.calculator({"expression": "17.5 * 438 / 100"}))["value"] == 76.65

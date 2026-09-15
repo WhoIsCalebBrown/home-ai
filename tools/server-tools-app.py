@@ -2433,6 +2433,9 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
     prior_group = str(context.get("group", "")).casefold()
     prior_tools = {str(item).casefold() for item in context.get("tools", [])}
     referents = _search_tokens(" ".join(str(item) for item in context.get("referents", [])))
+    media_context = prior_group in {"media", "media_planner"} or any(item.startswith("media_") for item in prior_tools)
+    media_library_signal = bool(re.search(r"\b(plex|movie|film|show|album|season|episode|media|request|download)\b", lowered))
+    diagnosis_signal = bool(re.search(r"\b(stuck|blocking|why|not ready|taking so long|holding up)\b", lowered))
     camera_signal = bool(re.search(r"\b(camera|cameras|frigate|front door|garage|snapshot|detection|detected|person|shirt|wearing|event|events)\b", lowered))
     ranked = []
     for item in REGISTRY:
@@ -2447,6 +2450,9 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
             if name in {"web_search", "web_fetch"} and re.search(r"\b(new|newest|latest|current|today|ongoing|news|policy|policies|version|release)\b", lowered): score += 7
             if name == "web_search" and not re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
             if name == "web_fetch" and re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
+            if name == "media_diagnose" and diagnosis_signal and (media_context or media_library_signal): score += 10
+            if name == "investigate_downloads" and diagnosis_signal and (media_context or media_library_signal): score -= 3
+            if media_context and meta.get("group") == "media" and name.startswith("media_"): score += 4
             if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
             if camera_signal and name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
             if camera_signal and name == "frigate_recent_events" and re.search(r"\b(alert|alerts|event|events|historical|earlier|ago)\b", lowered): score += 9
