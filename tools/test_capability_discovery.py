@@ -97,6 +97,33 @@ def test_media_policy_is_centralized_and_fails_closed():
     assert module.MEDIA_POLICY["anime"]["quality_profile_id"] == 17
 
 
+def test_standard_storage_isolated_from_permanent_paths():
+    assert module.MEDIA_STORAGE_POLICY["movie"]["standard"] == {
+        "library": "Movies-DB", "path": "/data/symlinked/Movies"
+    }
+    assert module.MEDIA_STORAGE_POLICY["tv"]["standard"] == {
+        "library": "TV Shows-DB", "path": "/data/symlinked/TV Shows"
+    }
+    assert module.MEDIA_STORAGE_POLICY["anime"]["standard"] == {
+        "library": "Anime-DB", "path": "/data/symlinked/Anime TV Shows"
+    }
+    assert module.MEDIA_STORAGE_POLICY["movie"]["permanent"]["path"] == "/data/media/movies"
+    assert module.MEDIA_STORAGE_POLICY["tv"]["permanent"]["path"] == "/data/media/tv"
+    assert module.MEDIA_STORAGE_POLICY["anime"]["permanent"]["path"] == "/data/media/anime"
+    assert module._validate_standard_storage_contract("movie", module._build_cli_debrid_request({
+        "media_type": "movie", "canonical_external_id": 1362,
+    })) == (True, "VALID")
+
+
+def test_standard_bridge_rejects_destination_override():
+    import asyncio
+    result = asyncio.run(module.media_standard_request({
+        "workflow_id": "wf", "media_type": "movie", "canonical_external_id": 1362,
+        "root_folder": "/data/media/movies",
+    }))
+    assert result["reason"] == "UNEXPECTED_ARGUMENT"
+
+
 def test_media_confirmation_binds_session_plan_and_expiry():
     from datetime import datetime, timedelta, timezone
 

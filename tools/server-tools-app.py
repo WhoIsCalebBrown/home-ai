@@ -1144,6 +1144,42 @@ MEDIA_POLICY = {
     },
 }
 
+# Storage is deliberately split between the watch-first DB libraries and the
+# permanent manager-owned libraries.  These are planner/executor invariants;
+# they are never inputs supplied by Qwen.
+MEDIA_STORAGE_POLICY = {
+    "movie": {
+        "standard": {"library": "Movies-DB", "path": "/data/symlinked/Movies"},
+        "permanent": {"library": "Movies", "path": "/data/media/movies"},
+    },
+    "tv": {
+        "standard": {"library": "TV Shows-DB", "path": "/data/symlinked/TV Shows"},
+        "permanent": {"library": "TV Shows", "path": "/data/media/tv"},
+    },
+    "anime": {
+        "standard": {"library": "Anime-DB", "path": "/data/symlinked/Anime TV Shows"},
+        "permanent": {"library": "Anime", "path": "/data/media/anime"},
+    },
+}
+STANDARD_FORBIDDEN_PATHS = {"/data/media/movies", "/data/media/tv", "/data/media/anime"}
+
+
+def media_storage_policy_for(media_type: str) -> dict[str, Any]:
+    key = "tv" if media_type == "anime" else media_type
+    return dict(MEDIA_STORAGE_POLICY.get(key, {}))
+
+
+def _validate_standard_storage_contract(media_type: str, payload: dict[str, Any]) -> tuple[bool, str]:
+    """Fail closed if a standard request could select permanent storage."""
+    policy = media_storage_policy_for(media_type)
+    if not policy or "standard" not in policy:
+        return False, "STANDARD_STORAGE_POLICY_MISSING"
+    if payload.get("rootFolder") != "/":
+        return False, "STANDARD_ROOT_MUST_BE_CLI_AUTHORITATIVE"
+    if any(str(value) in STANDARD_FORBIDDEN_PATHS for value in payload.values()):
+        return False, "STANDARD_PERMANENT_PATH_FORBIDDEN"
+    return True, "VALID"
+
 
 def media_policy_for(media_type: str) -> dict[str, Any]:
     """Return a copy so callers cannot mutate the process-wide policy."""
@@ -1633,6 +1669,10 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     except ValueError as exc:
         return {"status": "rejected", "reason": str(exc), "write_executed": False}
 
+    storage_ok, storage_reason = _validate_standard_storage_contract(str(args.get("media_type", "")), payload)
+    if not storage_ok:
+        return {"status": "rejected", "reason": storage_reason, "write_executed": False}
+
     if args.get("episode_scope"):
         return {"status": "rejected", "reason": "STANDARD_EPISODE_SCOPE_UNSUPPORTED", "write_executed": False}
     if not STANDARD_MEDIA_WRITES_ENABLED:
@@ -1661,6 +1701,10 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     rows, workflow = _workflow_for_id(workflow_id)
     if not workflow or workflow.get("mode") != "standard":
         return {"status": "rejected", "reason": "WORKFLOW_NOT_FOUND_OR_MODE_INVALID", "write_executed": False}
+    storage_kind = str(workflow.get("canonical_identity", {}).get("media_type") or payload["mediaType"])
+    storage_policy = media_storage_policy_for(storage_kind)
+    if not storage_policy or not storage_policy.get("standard"):
+        return {"status": "rejected", "reason": "STANDARD_STORAGE_POLICY_MISSING", "write_executed": False}
     if str(workflow.get("plan_version_hash")) != str(binding.get("plan_version_hash")):
         return {"status": "rejected", "reason": "PLAN_HASH_MISMATCH", "write_executed": False}
     if workflow.get("canonical_identity", {}).get("tmdb_id") != payload["mediaId"]:
@@ -1674,12 +1718,22 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
 
     title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
     if title and not payload.get("seasons"):
-        plex_library = "Movies" if payload["mediaType"] == "movie" else "TV Shows"
-        plex = await plex_library_lookup({"query": title, "library": plex_library})
-        if plex.get("available"):
+        permanent_library = storage_policy["permanent"]["library"]
+        standard_library = storage_policy["standard"]["library"]
+        permanent = await plex_library_lookup({"query": title, "library": permanent_library})
+        standard = await plex_library_lookup({"query": title, "library": standard_library})
+        if permanent.get("available") and standard.get("available"):
+            workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "both"})
+            _save_workflow_update(rows, workflow)
+            return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES", "write_executed": False, "workflow_id": workflow_id}
+        if permanent.get("available"):
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "permanent_local"})
             _save_workflow_update(rows, workflow)
-            return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_PLEX", "write_executed": False, "workflow_id": workflow_id}
+            return {"status": "no_op", "reason": "ALREADY_AVAILABLE_PERMANENTLY", "write_executed": False, "workflow_id": workflow_id}
+        if standard.get("available"):
+            workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "debrid"})
+            _save_workflow_update(rows, workflow)
+            return {"status": "no_op", "reason": "ALREADY_AVAILABLE_STANDARD", "write_executed": False, "workflow_id": workflow_id}
 
     # Claim the confirmation before the network write. A replay sees this
     # state and cannot submit the same standard request twice.
@@ -1699,6 +1753,7 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
             _save_workflow_update(rows, workflow)
             raise
     workflow.update({"confirmation_status": "CONSUMED", "current_state": "REQUESTED", "canonical_state": "REQUESTED",
+                     "storage_class": "debrid", "standard_library": storage_policy["standard"]["library"],
                      "cli_debrid_state": "Wanted", "submitted_at": now(), "request_shape": payload,
                      "request_response": {key: body.get(key) for key in ("id", "status", "type", "createdAt", "updatedAt") if key in body}})
     _save_workflow_update(rows, workflow)
@@ -1716,6 +1771,21 @@ async def media_policy_status(args: dict[str, Any]) -> dict[str, Any]:
     requested = str(args.get("media_type", "all")).casefold()
     types = [requested] if requested != "all" else ["music", "movies", "tv", "anime"]
     return {"policies": [await validate_media_policy(media_type) for media_type in types]}
+
+
+async def media_storage_status(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only storage contract exposed for tracing and final verification."""
+    requested = str(args.get("media_type", "all")).casefold()
+    types = [requested] if requested != "all" else ["movie", "tv", "anime"]
+    return {
+        "contracts": [
+            {"media_type": media_type, **media_storage_policy_for(media_type),
+             "standard_write_root_owned_by": "cli_debrid",
+             "standard_forbidden_paths": sorted(STANDARD_FORBIDDEN_PATHS),
+             "standard_cleanup_allowed": False}
+            for media_type in types
+        ]
+    }
 
 
 REGISTRY = [
@@ -1781,6 +1851,7 @@ REGISTRY = [
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
     ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
+    ("media_storage_status", "Show standard DB-library and permanent-library storage contracts without writing.", "read", "media_planner", {"media_type": {"type": "string"}}, media_storage_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
