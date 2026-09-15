@@ -2012,10 +2012,20 @@ def _cli_debrid_exact_item_evidence(payload: dict[str, Any]) -> dict[str, Any]:
         database_uri = f"file:{Path(CLIDEBRID_DB_PATH).as_posix()}?mode=ro&immutable=1"
         connection = sqlite3.connect(database_uri, uri=True, timeout=1)
         connection.row_factory = sqlite3.Row
+        if media_type == "movie":
+            type_clause = "type = ?"
+            type_args = ("movie",)
+        else:
+            # The live cli_debrid schema stores TV/anime lifecycle rows as
+            # individual episodes, not type='tv'.  requested_season is a
+            # boolean flag; season_number is the actual scope field.
+            type_clause = "type IN ('episode', 'tv')"
+            type_args = ()
         rows = connection.execute(
-            "SELECT id, tmdb_id, title, year, state, type, requested_season, location_on_disk, plex_verified "
-            "FROM media_items WHERE tmdb_id = ? AND type = ? ORDER BY id DESC LIMIT 10",
-            (media_id, media_type),
+            "SELECT id, tmdb_id, title, year, state, type, season_number, episode_number, "
+            "requested_season, location_on_disk, plex_verified "
+            f"FROM media_items WHERE tmdb_id = ? AND {type_clause} ORDER BY id DESC LIMIT 200",
+            (media_id, *type_args),
         ).fetchall()
         connection.close()
     except (OSError, sqlite3.Error) as exc:
@@ -2026,10 +2036,10 @@ def _cli_debrid_exact_item_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     if not requested_seasons:
         result["matched"] = bool(rows)
         return result
-    # A TV acknowledgement must retain the requested season scope.  If the
-    # current schema exposes requested_season, accept only an intersecting row;
-    # otherwise fail closed instead of claiming a whole-series acknowledgement.
-    scoped_rows = [row for row in rows if row["requested_season"] is not None and int(row["requested_season"]) in requested_seasons]
+    # A TV acknowledgement must retain the requested season scope.  The live
+    # schema's season_number is authoritative; do not confuse the separate
+    # requested_season boolean with a season index.
+    scoped_rows = [row for row in rows if row["season_number"] is not None and int(row["season_number"]) in requested_seasons]
     result["matched"] = bool(scoped_rows)
     result["scoped_rows"] = [dict(row) for row in scoped_rows]
     return result

@@ -294,8 +294,8 @@ def test_cli_debrid_ingestion_ack_uses_tmdb_not_title(monkeypatch, tmp_path):
     import sqlite3
     db = tmp_path / "media_items.db"
     connection = sqlite3.connect(db)
-    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, requested_season integer, location_on_disk text, plex_verified integer)")
-    connection.execute("insert into media_items values (1, 999, 'The Hobbit', 2012, 'Collected', 'movie', null, '/data/symlinked/Movies', 1)")
+    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
+    connection.execute("insert into media_items values (1, 999, 'The Hobbit', 2012, 'Collected', 'movie', null, null, null, '/data/symlinked/Movies', 1)")
     connection.commit(); connection.close()
     monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
     payload = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
@@ -308,12 +308,28 @@ def test_cli_debrid_true_ingestion_ack_is_exact_tmdb(monkeypatch, tmp_path):
     import sqlite3
     db = tmp_path / "media_items.db"
     connection = sqlite3.connect(db)
-    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, requested_season integer, location_on_disk text, plex_verified integer)")
-    connection.execute("insert into media_items values (2, 1362, 'The Hobbit', 1977, 'Wanted', 'movie', null, null, 0)")
+    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
+    connection.execute("insert into media_items values (2, 1362, 'The Hobbit', 1977, 'Wanted', 'movie', null, null, null, null, 0)")
     connection.commit(); connection.close()
     monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
     payload = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
     assert module._cli_debrid_exact_item_evidence(payload)["matched"] is True
+
+
+def test_cli_debrid_true_season_ack_uses_live_episode_schema_and_scope(monkeypatch, tmp_path):
+    import sqlite3
+    db = tmp_path / "media_items.db"
+    connection = sqlite3.connect(db)
+    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
+    connection.execute("insert into media_items values (3, 95396, 'Severance', 2022, 'Wanted', 'episode', 2, 8, 0, null, 0)")
+    connection.commit(); connection.close()
+    monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
+    payload = module._build_cli_debrid_overseerr_webhook(
+        {"media_type": "tv", "canonical_external_id": 95396, "season_scope": [2]}, "wf-severance"
+    )
+    evidence = module._cli_debrid_exact_item_evidence(payload)
+    assert evidence["matched"] is True
+    assert evidence["scoped_rows"][0]["season_number"] == 2
 
 
 def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow(monkeypatch, tmp_path):
