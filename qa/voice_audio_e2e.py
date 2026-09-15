@@ -145,6 +145,14 @@ READ_ONLY_CONVERSATIONS = {
         ("What were they doing?", {"frigate_event_activity", "frigate_activity_details"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
     ],
+    "camera_visual_memory": [
+        ("Has anything happened at the front door recently?", {"frigate_recent_events", "frigate_recent_activity"}),
+        ("What were they doing?", {"frigate_event_activity", "frigate_activity_details"}),
+        ("What did they look like?", {"frigate_event_snapshot", "frigate_activity_details"}),
+        ("How long were they there?", {"frigate_recent_events", "frigate_activity_details"}),
+        ("What time was that?", {"frigate_recent_events", "frigate_activity_details"}),
+        ("Are they still there?", {"frigate_snapshot", "frigate_recent_events"}),
+    ],
     "media_status_chain": [
         ("How is The Hobbit doing?", {"media_status"}),
         ("What about Dumb and Dumber?", {"media_status"}),

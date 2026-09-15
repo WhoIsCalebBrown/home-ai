@@ -1488,9 +1488,25 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     event_scope = re.search(r"\bfor\s+event\s+([A-Za-z0-9_.-]+)\b", text, re.I)
     if context.get("latest_event_id") and event_scope:
         event_id = context["latest_event_id"]
+        # An explicit present-tense question is a deliberate switch from the
+        # retained historical event to the live camera.  Do this before the
+        # generic visual-follow-up branch so "Are they still there?" cannot
+        # remain attached to the historical clip.
+        if re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment)\b", text, re.I):
+            return [("frigate_snapshot", {"camera": "front_door"})]
+        # Timing questions about a retained event must use the event-scoped
+        # normalized evidence, never a generic current-time capability.
+        if re.search(r"\b(?:how\s+long|duration|what\s+time|when\s+was\s+that|when\s+did\s+that)\b", text, re.I):
+            return [("frigate_activity_details", {"event_id": event_id})]
         if activity_question(text):
             return [("frigate_event_activity", {"event_id": event_id})]
         return [("frigate_event_snapshot", {"event_id": event_id})]
+    if context.get("latest_event_id"):
+        event_id = context["latest_event_id"]
+        if re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment)\b", text, re.I):
+            return [("frigate_snapshot", {"camera": "front_door"})]
+        if re.search(r"\b(?:how\s+long|duration|what\s+time|when\s+was\s+that|when\s+did\s+that)\b", text, re.I):
+            return [("frigate_activity_details", {"event_id": event_id})]
     # Explicit historical camera scope outranks generic freshness words such
     # as "today" and "this morning". A public topic without camera nouns can
     # still route to web search below.

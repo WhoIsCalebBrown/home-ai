@@ -296,6 +296,23 @@ def test_event_activity_followup_uses_event_id():
     assert preflight_plan("What were they doing?", context) == [("frigate_event_activity", {"event_id": "event-123"})]
 
 
+def test_event_timing_followup_uses_event_scoped_normalized_evidence():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    assert preflight_plan("How long were they there?", context) == [
+        ("frigate_activity_details", {"event_id": "event-123"})
+    ]
+    assert preflight_plan("What time was that?", context) == [
+        ("frigate_activity_details", {"event_id": "event-123"})
+    ]
+
+
+def test_current_presence_followup_switches_from_history_to_live_snapshot():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    assert preflight_plan("Are they still there?", context) == [
+        ("frigate_snapshot", {"camera": "front_door"})
+    ]
+
+
 def test_resolved_event_activity_followup_beats_historical_search():
     context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
     assert preflight_plan("analyze activity for event event-123 from camera front_door", context) == [
