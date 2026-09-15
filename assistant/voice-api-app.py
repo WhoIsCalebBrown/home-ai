@@ -2240,6 +2240,21 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     await ws.send_json({"type": "done", "request_id": request_id})
                     return
         if live_results:
+            # The pre-dispatch structured-result guard cannot see results yet.
+            # Apply it again after model-selected tools execute so exact live
+            # fields such as weather location and container counts are not
+            # weakened by an unnecessary second model interpretation.
+            post_direct = direct_structured_answer(user_text, live_results)
+            if post_direct:
+                for item in live_results:
+                    if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
+                        stage_media_confirmation(client_id, request_id, item.get("result") or {})
+                store_provenance(client_id, live_results)
+                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")
+                history.append({"role": "assistant", "content": post_direct})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
             store_provenance(client_id, live_results)
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
             evidence_messages = evidence_message(live_results)
