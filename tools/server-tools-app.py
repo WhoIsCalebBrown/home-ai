@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import socket
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,19 @@ import xml.etree.ElementTree as ET
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# Several test harnesses load this file directly via
+# importlib.util.spec_from_file_location(..., ".../server-tools-app.py")
+# rather than as a package import, and do so with this file's own directory
+# NOT yet on sys.path -- unlike a normal package-relative import,
+# spec_from_file_location never adds the loaded file's own directory to
+# sys.path as a side effect. Whether `from canonical_identity import ...`
+# below resolves then depends entirely on collection order / which other
+# test file happened to add tools/ to sys.path first, which is exactly the
+# kind of order-dependent fragility a full `pytest -q` run at the repo root
+# (no explicit path args) can surface non-deterministically. Make the
+# sibling-module imports work regardless of how this file was loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from canonical_identity import build_canonical_identity
 from workflow_events import log_event_safe
