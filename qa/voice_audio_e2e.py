@@ -124,6 +124,10 @@ READ_ONLY_CONVERSATIONS = {
         ("How many containers are running?", {"list_containers"}),
         ("What about stopped?", {"list_containers"}),
     ],
+    "server_ambiguous_start": [
+        ("How many containers are running?", {"list_containers"}),
+        ("What about start?", set()),
+    ],
     "web_correction": [
         ("What happened today in American politics?", {"web_search", "web_fetch"}),
         ("Can you search the web for that?", {"web_search", "web_fetch"}),
