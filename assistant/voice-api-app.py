@@ -947,7 +947,7 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
         # "current location".  Keep this normalization at the typed tool
         # boundary; it is not a language-domain routing rule.
         location = str(arguments.get("location") or "").strip().casefold()
-        if location in {"current location", "my location", "home location", "the home location", "here", "at home"}:
+        if location in {"current", "current location", "my location", "home location", "the home location", "here", "at home"}:
             arguments = {**arguments, "location": None}
     discovery_audit({"event": "tool_call", "client_id": client_id, "request_id": request_id, "tool": name, "arguments": {k: v for k, v in arguments.items() if not any(secret in k.casefold() for secret in ("key", "token", "password", "secret"))}})
     try:
