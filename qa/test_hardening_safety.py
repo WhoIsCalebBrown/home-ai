@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import asyncio
 import importlib.util
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -63,6 +64,26 @@ def test_confirmation_cannot_cross_session_or_workflow():
     assert not store.authorize(record, session="session-a", workflow="wf-b", canonical_id="tmdb:8467", plan_hash="plan-a", args_hash="args-a", now=1)
     assert store.authorize(record, session="session-a", workflow="wf-a", canonical_id="tmdb:8467", plan_hash="plan-a", args_hash="args-a", now=1)
     assert not store.authorize(record, session="session-a", workflow="wf-a", canonical_id="tmdb:8467", plan_hash="plan-a", args_hash="args-a", now=1)
+
+
+def test_parallel_sessions_cannot_consume_each_others_confirmations():
+    store = ConfirmationStore()
+    records = {
+        "a": Confirmation("a", "wf-a", "tmdb:8467", "pa", "aa", 120),
+        "b": Confirmation("b", "wf-b", "tmdb:1362", "pb", "ab", 120),
+    }
+    attempts = [
+        ("a", "b", "wf-b", "tmdb:1362", "pb", "ab"),
+        ("b", "a", "wf-a", "tmdb:8467", "pa", "aa"),
+    ]
+    def consume(item):
+        session, record_key, workflow, canonical, plan, args = item
+        return store.authorize(records[record_key], session=session, workflow=workflow,
+                               canonical_id=canonical, plan_hash=plan, args_hash=args, now=1)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(consume, attempts))
+    assert results == [False, False]
+    assert all(record.status == "PENDING" for record in records.values())
 
 
 @pytest.mark.parametrize("now", [120, 121, 10_000])
