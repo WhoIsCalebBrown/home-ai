@@ -764,6 +764,24 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         if identity:
             return f"I found {title}, but it isn't in Plex yet."
         return "I couldn't identify a confident media match without changing anything."
+    if tool == "media_status":
+        state = str(result.get("canonical_state") or result.get("status") or "UNKNOWN")
+        title = (result.get("canonical_identity") or {}).get("title") or "That media"
+        if state == "AVAILABLE":
+            return f"{title} is ready in Plex."
+        if state == "ACQUIRED_NOT_VISIBLE":
+            return f"{title} has been collected, but Plex hasn't picked it up yet."
+        if state == "SEARCHING":
+            return f"It's still looking for a suitable copy of {title}."
+        if state == "ACQUIRING":
+            return f"{title} is being acquired now."
+        if state == "VERIFYING":
+            return f"{title} has been acquired and is being checked now."
+        if state == "REQUESTED":
+            return f"{title} is already on the way."
+        if state in {"FAILED", "FAILED_INGESTION"}:
+            return f"The request for {title} did not make it into the media queue."
+        return f"I don't have a confirmed current status for {title} yet."
     if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
         offset = int(result.get("days_from_now") or 0)
         unit = result.get("temperature_unit", "C")
@@ -793,6 +811,46 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         count = result.get("count")
         if count is not None:
             return "Lidarr isn't looking for anything right now." if int(count) == 0 else f"Lidarr is currently looking for {int(count)} albums."
+    return None
+
+
+def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
+    """Ground media planning responses before any generative fallback.
+
+    A planner result is not evidence that a request was accepted.  In
+    particular, an unresolved/ambiguous plan must never be handed to Qwen as
+    the only guard against a false "started" claim.
+    """
+    items = [item for item in live_results if item.get("tool") == "media_plan_goal"]
+    if not items:
+        return None
+    item = items[-1]
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    if item.get("status") != "ok":
+        reason = str(result.get("reason") or result.get("error") or result.get("status") or "").upper()
+        if result.get("ambiguous") or "AMBIGUOUS" in reason or "IDENTITY" in reason:
+            return "I couldn't identify one confident media match without changing anything."
+        return "I couldn't prepare that media request right now, and I haven't changed anything."
+    identity = result.get("canonical_identity") or {}
+    if not identity:
+        candidates = result.get("candidates") or []
+        if candidates:
+            labels = []
+            for candidate in candidates[:3]:
+                title = candidate.get("title") or candidate.get("name")
+                year = candidate.get("year")
+                if title:
+                    labels.append(f"{title} ({year})" if year else str(title))
+            if labels:
+                return "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
+        return "I couldn't identify a confident media match without changing anything."
+    # Only plans with an explicit bounded write are actionable.  This keeps
+    # planner/read results from being mistaken for an accepted request.
+    if not result.get("writes_required"):
+        title = identity.get("title") or result.get("goal", {}).get("title_query") or "that item"
+        if result.get("current_state") == "AVAILABLE_IN_PLEX":
+            return f"You already have {title} in Plex."
+        return f"I found {title}, but there isn't a confirmed request to start yet."
     return None
 
 
@@ -1049,7 +1107,7 @@ def turn_context(client_id: str, text: str) -> dict:
         current = {"domain": "general", "kind": "general", "group": "general", "tools": []}
     elif re.search(r"\b(what about|how about|tomorrow|there|they|them|that|it|look|wear|wearing|snapshot|describe)\b", lowered):
         current = prior
-    for key in ("latest_user_utterance", "latest_resolved_request", "latest_tool_result", "latest_assistant_response", "latest_spoken_response"):
+    for key in ("latest_user_utterance", "latest_resolved_request", "latest_tool_result", "latest_assistant_response", "latest_spoken_response", "latest_media_workflow", "canonical_identity", "workflow_id", "media_type"):
         if key in prior and key not in current:
             current[key] = prior[key]
     if repair:
@@ -1090,6 +1148,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # out of this path by media_goal_request().
     if media_goal_request(text):
         return [("media_plan_goal", {"goal": text})]
+    latest_media = context.get("latest_media_workflow") or {}
+    if latest_media.get("workflow_id") and re.search(r"\b(?:how(?:'s| is)|status|progress|doing|find|found|ready|download|downloading|stuck|taking|plex|import|there yet)\b", t, re.I):
+        return [("media_status", {"workflow_id": latest_media["workflow_id"]})]
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):
@@ -1228,7 +1289,7 @@ def investigation_query_from_speech(text: str) -> str:
 
 def is_confirmation(text: str) -> bool:
     return bool(re.fullmatch(
-        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
+        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
         text,
         re.I,
     ))
@@ -1711,6 +1772,18 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        media_direct = media_plan_response(user_text, live_results)
+        if media_direct:
+            # A planner result is authoritative for whether the request is
+            # identifiable/actionable.  Never let an unresolved or failed
+            # media plan fall through to Qwen, which could invent a started
+            # request from conversational context.
+            store_provenance(client_id, live_results)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
+            history.append({"role": "assistant", "content": media_direct})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         direct = direct_structured_answer(user_text, live_results)
         if direct:
             for item in live_results:

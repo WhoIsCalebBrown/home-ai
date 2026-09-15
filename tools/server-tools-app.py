@@ -1799,6 +1799,71 @@ async def media_get_workflow(args: dict[str, Any]) -> dict[str, Any]:
     return {"found": bool(row), "workflow": row}
 
 
+async def media_status(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only live status for one canonical workflow.
+
+    The persisted workflow is correlation/history, not proof of current state.
+    Provider and Plex evidence are queried by canonical ID and then reduced to
+    a user-facing lifecycle without changing any external system.
+    """
+    workflow_id = str(args.get("workflow_id", "")).strip()
+    row = next((item for item in _media_workflows() if item.get("workflow_id") == workflow_id), None)
+    if not row:
+        return {"found": False, "status": "NOT_FOUND", "workflow_id": workflow_id}
+    identity = row.get("canonical_identity") or {}
+    media_type = str(row.get("media_type") or identity.get("media_type") or "movie").casefold()
+    if media_type == "anime":
+        kind = "show"
+        standard_library = "Anime-DB"
+        permanent_library = "Anime"
+    elif media_type == "tv":
+        kind = "show"
+        standard_library = "TV Shows-DB"
+        permanent_library = "TV Shows"
+    else:
+        kind = "movie"
+        standard_library = "Movies-DB"
+        permanent_library = "Movies"
+    canonical_ids = {key: identity.get(key) for key in ("tmdb_id", "tvdb_id", "imdb_id") if identity.get(key)}
+    plex_args = {"media_type": kind, "title": identity.get("title"), "year": identity.get("year"), "canonical_external_ids": canonical_ids}
+    permanent = await plex_match_canonical_media({**plex_args, "library": permanent_library})
+    standard = await plex_match_canonical_media({**plex_args, "library": standard_library})
+    evidence = {"matched": False, "rows": []}
+    if identity.get("tmdb_id"):
+        evidence = _cli_debrid_exact_item_evidence({
+            "media": {"media_type": "movie" if media_type == "movie" else "tv", "tmdbId": identity["tmdb_id"],
+                      "requested_seasons": row.get("season_scope") or []}
+        })
+    rows = evidence.get("rows") or []
+    raw_states = [str(item.get("state") or "") for item in rows]
+    state_text = " ".join(raw_states).casefold()
+    if permanent.get("matched") and standard.get("matched"):
+        canonical_state, storage_class = "AVAILABLE", "both"
+    elif permanent.get("matched"):
+        canonical_state, storage_class = "AVAILABLE", "permanent_local"
+    elif standard.get("matched"):
+        canonical_state, storage_class = "AVAILABLE", "debrid"
+    elif any(token in state_text for token in ("collect", "complete", "downloaded")):
+        canonical_state, storage_class = "ACQUIRED_NOT_VISIBLE", "debrid"
+    elif any(token in state_text for token in ("check", "verif")):
+        canonical_state, storage_class = "VERIFYING", "debrid"
+    elif any(token in state_text for token in ("add", "acquir", "download")):
+        canonical_state, storage_class = "ACQUIRING", "debrid"
+    elif any(token in state_text for token in ("scrap", "search")):
+        canonical_state, storage_class = "SEARCHING", "debrid"
+    elif evidence.get("matched"):
+        canonical_state, storage_class = "REQUESTED", "debrid"
+    else:
+        canonical_state, storage_class = row.get("current_state", "UNKNOWN"), row.get("storage_class", "unknown")
+    return {
+        "found": True, "workflow_id": workflow_id, "canonical_identity": identity,
+        "mode": row.get("mode", "standard"), "canonical_state": canonical_state,
+        "storage_class": storage_class, "raw_provider_states": raw_states,
+        "cli_debrid": evidence, "plex": {"permanent": permanent, "standard": standard},
+        "source_workflow_state": row.get("current_state"), "last_checked": now(),
+    }
+
+
 def _build_cli_debrid_request(args: dict[str, Any]) -> dict[str, Any]:
     """Translate one bounded Home-AI goal into cli_debrid's request shape."""
     media_type = str(args.get("media_type", "")).casefold()
@@ -2177,6 +2242,7 @@ REGISTRY = [
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_storage_status", "Show standard DB-library and permanent-library storage contracts without writing.", "read", "media_planner", {"media_type": {"type": "string"}}, media_storage_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
+    ("media_status", "Read live canonical media workflow status from cli_debrid and exact Plex identity matches; never writes or retries.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_status),
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
@@ -2210,6 +2276,7 @@ CAPABILITY_METADATA = {
     "plex_library_lookup": {"aliases": ["do i have", "is it in plex", "plex availability"], "examples": ["do I already have Rodeo"], "group": "plex", "freshness": "current"},
     "media_plan_goal": {"aliases": ["get media", "add movie", "request album", "put it in plex", "media goal"], "examples": ["get Rodeo by Travis Scott", "get the original animated Hobbit movie"], "group": "media", "freshness": "current"},
     "media_get_workflow": {"aliases": ["how is it doing", "is it downloading", "did it import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current"},
+    "media_status": {"aliases": ["media status", "how is it doing", "is it ready", "did it find it", "what is taking so long"], "examples": ["is Dumb and Dumber ready"], "group": "media", "freshness": "current"},
     "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
@@ -2255,7 +2322,10 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
             if name == "web_fetch" and re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
             if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
             if name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
+            if name == "frigate_recent_events" and re.search(r"\b(alert|alerts|event|events|historical|earlier|ago)\b", lowered): score += 9
             if name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
+            if name == "frigate_event_snapshot" and re.search(r"\b(event|detection|that|historical|earlier|ago)\b", lowered) and not re.search(r"\b(right now|currently|live|current)\b", lowered): score += 12
+            if name == "frigate_event_activity" and re.search(r"\b(doing|activity|what happened|what were)\b", lowered): score += 12
             if prior_group == "cameras" and meta.get("group") == "frigate": score += 5
             if name.casefold() in prior_tools: score += 4
             if referents & terms: score += 2

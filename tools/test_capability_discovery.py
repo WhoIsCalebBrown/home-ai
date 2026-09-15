@@ -265,3 +265,25 @@ def test_cli_debrid_true_ingestion_ack_is_exact_tmdb(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
     payload = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
     assert module._cli_debrid_exact_item_evidence(payload)["matched"] is True
+
+
+def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module.MEDIA_WORKFLOWS_PATH.write_text(json.dumps([{
+        "workflow_id": "wf-hobbit", "media_type": "movie", "mode": "standard",
+        "current_state": "SEARCHING", "storage_class": "debrid",
+        "canonical_identity": {"title": "The Hobbit", "year": 1977, "tmdb_id": 1362},
+    }]))
+
+    async def no_match(_):
+        return {"matched": False, "match_method": None, "candidates": []}
+
+    monkeypatch.setattr(module, "plex_match_canonical_media", no_match)
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
+        "matched": True, "rows": [{"state": "Collected", "tmdb_id": 1362, "type": "movie"}]
+    })
+    result = asyncio.run(module.media_status({"workflow_id": "wf-hobbit"}))
+    assert result["canonical_state"] == "ACQUIRED_NOT_VISIBLE"
+    assert result["source_workflow_state"] == "SEARCHING"

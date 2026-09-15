@@ -1,0 +1,40 @@
+{
+  "contract_version": "1.0",
+  "generated_for": "production-2026-09-15",
+  "timezone": "America/Toronto",
+  "network": "voiceai",
+  "services": {
+    "assistant": {"container": "Home-AI-Assistant", "internal_alias": "assistant", "port": 8088, "image": "ghcr.io/whoiscalebbrown/home-ai-assistant:sha-8828537"},
+    "tools": {"container": "Home-AI-Tools", "internal_alias": "server-tools", "port": 8090, "image": "ghcr.io/whoiscalebbrown/home-ai-tools:sha-8828537"},
+    "ollama": {"container": "Ollama", "port": 11434},
+    "stt": {"container": "Faster-Whisper", "port": 10300},
+    "tts_pocket": {"container": "Pocket-TTS"},
+    "tts_kokoro": {"container": "Kokoro-FastAPI", "port": 8880},
+    "searxng": {"container": "SearXNG", "port": 8080},
+    "cli_debrid": {"container": "cli_debrid", "port": 5000, "image": "godver3/cli_debrid:dev"},
+    "plex": {"container": "Plex-Media-Server"},
+    "frigate": {"container": "frigate", "port": 5000}
+  },
+  "edges": [
+    {"from": "assistant", "to": "tools", "kind": "READ_WRITE", "strength": "HARD", "endpoint": "http://server-tools:8090"},
+    {"from": "assistant", "to": "ollama", "kind": "READ_WRITE", "strength": "HARD", "endpoint": "http://Ollama:11434"},
+    {"from": "tools", "to": "cli_debrid", "kind": "WRITE_BOUNDED", "strength": "OPTIONAL", "endpoint": "http://cli_debrid:5000/webhook"},
+    {"from": "tools", "to": "plex", "kind": "READ", "strength": "HARD"},
+    {"from": "tools", "to": "frigate", "kind": "READ", "strength": "OPTIONAL"},
+    {"from": "tools", "to": "searxng", "kind": "READ", "strength": "OPTIONAL"}
+  ],
+  "libraries": {
+    "standard": {"Movies-DB": "/data/symlinked/Movies", "TV Shows-DB": "/data/symlinked/TV Shows", "Anime-DB": "/data/symlinked/Anime TV Shows"},
+    "permanent": {"Movies": "/data/media/movies", "TV Shows": "/data/media/tv", "Anime": "/data/media/anime"}
+  },
+  "media_policy": {
+    "standard_movies": {"owner": "cli_debrid", "writes_enabled": true},
+    "standard_seasons": {"owner": "cli_debrid", "writes_enabled": false},
+    "standard_episodes": {"writes_enabled": false},
+    "permanent_movies": {"owner": "radarr", "writes_enabled": false},
+    "permanent_tv": {"owner": "sonarr", "writes_enabled": false},
+    "music": {"owner": "lidarr", "writes_enabled": false}
+  },
+  "confirmation": {"ttl_seconds": 120, "binds": ["session", "workflow", "canonical_identity", "plan_hash", "arguments_hash", "operation"]},
+  "registry": {"minimum_version": "1.0", "required_capabilities": ["media_plan_goal", "media_get_workflow", "media_storage_status", "media_standard_request", "frigate_recent_events", "frigate_snapshot", "web_search"]}
+}

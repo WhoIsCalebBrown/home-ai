@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "is_confirmation"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -39,6 +39,8 @@ repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
 complete_speakable_sentence = namespace["complete_speakable_sentence"]
 direct_structured_answer = namespace["direct_structured_answer"]
+media_plan_response = namespace["media_plan_response"]
+is_confirmation = namespace["is_confirmation"]
 current_external_question = namespace["current_external_question"]
 explicit_web_search_request = namespace["explicit_web_search_request"]
 historical_camera_question = namespace["historical_camera_question"]
@@ -165,6 +167,41 @@ def test_simple_structured_reads_bypass_synthesis_pass():
                "location": {"name": "Welland"}, "current": {"temperature_2m": 20, "weather_code": 0}}
     assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) == "It's about 20 degrees Celsius in Welland with clear skies."
     assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
+
+
+def test_unresolved_media_plan_cannot_claim_request_started():
+    result = [{"tool": "media_plan_goal", "status": "ok", "result": {
+        "goal": {"media_type": "movie", "title_query": "10th Kingdom"},
+        "canonical_identity": None, "current_state": "UNKNOWN",
+        "writes_required": [], "confirmation_required": False,
+    }}]
+    answer = media_plan_response("Please request the 10th Kingdom movie.", result)
+    assert answer is not None
+    assert "started" not in answer.casefold()
+
+
+def test_media_plan_error_cannot_fall_through_to_qwen():
+    result = [{"tool": "media_plan_goal", "status": "error", "result": {"reason": "AMBIGUOUS_IDENTITY"}}]
+    answer = media_plan_response("Get the 10th Kingdom.", result)
+    assert answer == "I couldn't identify one confident media match without changing anything."
+
+
+def test_actionable_media_plan_is_left_for_confirmation_path():
+    result = [{"tool": "media_plan_goal", "status": "ok", "result": {
+        "goal": {"media_type": "movie"},
+        "canonical_identity": {"title": "Dumb and Dumber", "year": 1994, "tmdb_id": 8467},
+        "current_state": "IDENTIFIED",
+        "writes_required": [{"owner": "cli_debrid", "capability": "media.standard_request"}],
+        "confirmation_required": True,
+    }}]
+    assert media_plan_response("Get Dumb and Dumber from 1994.", result) is None
+
+
+def test_common_affirmations_are_confirmation_candidates_but_scope_is_elsewhere():
+    for text in ("please do", "okay", "I confirm", "yeah, go for it", "go ahead"):
+        assert is_confirmation(text)
+    for text in ("maybe", "what happens if I do?", "hold on", "not yet"):
+        assert not is_confirmation(text)
 
 
 def test_external_blackhawk_topic_overrides_camera_context():
