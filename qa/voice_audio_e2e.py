@@ -134,15 +134,15 @@ READ_ONLY_CONVERSATIONS = {
         ("Can you search the web for that?", {"web_search", "web_fetch"}),
     ],
     "camera_history": [
-        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events", "frigate_recent_activity"}),
         # Once an event is selected, visual follow-ups must stay event-scoped;
         # they must not use the current camera snapshot.
-        ("What were they wearing?", {"frigate_event_snapshot"}),
+        ("What were they wearing?", {"frigate_event_snapshot", "frigate_activity_details"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
     ],
     "camera_activity": [
-        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
-        ("What were they doing?", {"frigate_event_activity"}),
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events", "frigate_recent_activity"}),
+        ("What were they doing?", {"frigate_event_activity", "frigate_activity_details"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
     ],
     "media_status_chain": [
