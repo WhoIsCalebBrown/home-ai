@@ -5,11 +5,19 @@ the externally visible contracts and fail closed when an adapter attempts an
 unsafe operation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import asyncio
+import importlib.util
+from pathlib import Path
 
 import pytest
 
 from fake_media_backend import FakeMediaBackend, FakeMediaItem
+
+
+_spec = importlib.util.spec_from_file_location("home_ai_tools_safety", Path(__file__).resolve().parents[1] / "tools/server-tools-app.py")
+_tools = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_tools)
 
 
 class SideEffectTripwire:
@@ -127,3 +135,20 @@ def test_provider_failure_is_not_reported_as_started():
     item = backend.items.setdefault(plan["key"], FakeMediaItem(plan["key"], state="FAILED"))
     assert backend.plan("movie", 8467)["result"] == "PLAN_READY"
     assert item.state == "FAILED"
+
+
+def test_bounded_media_request_rejects_provider_controls():
+    forbidden = {
+        "root_folder": "/data/media/movies",
+        "destination": "/data/media/movies",
+        "url": "https://example.invalid/movie.torrent",
+        "magnet": "magnet:?xt=urn:btih:bad",
+        "torrent": "payload",
+        "scraper": "manual",
+    }
+    for field, value in forbidden.items():
+        result = asyncio.run(_tools.media_standard_request({
+            "workflow_id": "wf", "media_type": "movie", "canonical_external_id": 8467,
+            "confirmation_context": {}, field: value,
+        }))
+        assert result["reason"] == "UNEXPECTED_ARGUMENT"
