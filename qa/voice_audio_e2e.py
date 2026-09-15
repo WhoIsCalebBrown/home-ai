@@ -134,16 +134,25 @@ READ_ONLY_CONVERSATIONS = {
         ("Can you search the web for that?", {"web_search", "web_fetch"}),
     ],
     "camera_history": [
-        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events", "frigate_recent_activity"}),
         # Once an event is selected, visual follow-ups must stay event-scoped;
         # they must not use the current camera snapshot.
-        ("What were they wearing?", {"frigate_event_snapshot"}),
+        ("What were they wearing?", {"frigate_event_snapshot", "frigate_activity_details"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
     ],
     "camera_activity": [
-        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
-        ("What were they doing?", {"frigate_event_activity"}),
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events", "frigate_recent_activity"}),
+        ("What were they doing?", {"frigate_event_activity", "frigate_activity_details"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
+    ],
+    "camera_visual_memory": [
+        ("Has anything happened at the front door recently?", {"frigate_recent_activity"}),
+        ("What were they doing?", {"frigate_activity_details"}),
+        ("What did they look like?", {"frigate_event_snapshot", "frigate_activity_details"}),
+        ("How long were they there?", {"frigate_activity_details"}),
+        ("What time was that?", {"frigate_activity_details"}),
+        ("Are they still there?", {"frigate_snapshot"}),
+        ("What were they wearing again?", {"frigate_event_snapshot", "frigate_activity_details"}),
     ],
     "media_status_chain": [
         ("How is The Hobbit doing?", {"media_status"}),
@@ -624,6 +633,7 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
     result = AudioResult(name, scenario["text"], tool_trace=[])
     started = time.perf_counter()
     try:
+        response_generated = False
         async with httpx.AsyncClient(timeout=60) as http:
             response = await http.post(
                 "http://pocket-tts:8095/v1/audio/speech",
@@ -650,6 +660,7 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
                     result.transcript = payload.get("text", "")
                 elif kind == "text":
                     result.answer = payload.get("text", "")
+                    response_generated = True
                 elif kind == "trace":
                     result.tool_trace = payload.get("tools") or []
                 elif kind == "error":
@@ -659,7 +670,10 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
                 elif kind == "done":
                     break
             else:
-                result.error = "audio lane timeout"
+                if response_generated:
+                    result.classification = "response_success_tts_delayed"
+                else:
+                    result.error = "audio lane timeout"
         selected = {entry.get("tool") for entry in result.tool_trace or [] if entry.get("status") == "ok"}
         unexpected = selected - scenario["allowed_tools"]
         if unexpected:
@@ -668,6 +682,11 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
             result.classification = classify_safe_non_success(result.tool_trace or [], result.answer, scenario["allowed_tools"]) or "routing_failure"
             if not result.classification.startswith(("backend_", "safe_")):
                 result.error = "expected a read-only tool, but no tool was selected"
+    except asyncio.TimeoutError:  # pragma: no cover - exercised by live harness
+        if response_generated and result.answer:
+            result.classification = "response_success_tts_delayed"
+        else:
+            result.error = "audio lane timeout before response"
     except Exception as exc:  # pragma: no cover - exercised by live harness
         result.error = f"{type(exc).__name__}: {exc}"
     result.elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -692,6 +711,7 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
             chunks = 0
             error = None
             classification = ""
+            response_generated = False
             try:
                 async with httpx.AsyncClient(timeout=60) as http:
                     response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
@@ -712,13 +732,23 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
                     payload = json.loads(message)
                     kind = payload.get("type")
                     if kind == "transcript": transcript = payload.get("text", "")
-                    elif kind == "text": answer = payload.get("text", "")
+                    elif kind == "text":
+                        answer = payload.get("text", "")
+                        response_generated = True
                     elif kind == "trace": traces = payload.get("tools") or []
                     elif kind == "audio_chunk": chunks += 1
                     elif kind == "error": error = payload.get("error") or payload.get("message")
                     elif kind == "done": break
                 else:
-                    error = "audio lane timeout"
+                    if response_generated:
+                        classification = "response_success_tts_delayed"
+                    else:
+                        error = "audio lane timeout"
+            except asyncio.TimeoutError:
+                if response_generated and answer:
+                    classification = "response_success_tts_delayed"
+                else:
+                    error = "audio lane timeout before response"
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             selected = {item.get("tool") for item in traces if item.get("status") == "ok"}

@@ -14,6 +14,18 @@ nemo_text_processing/pynini) to import cleanly, which is why this file only
 runs inside qa/Dockerfile.assistant_integration -- see that file and the
 final report for why the plain host venv could not run this.
 
+Since merging main's "dispatch bounded camera plans deterministically" work
+(preflight_plan() now runs live in respond(), where it used to be dead code),
+`preflight_plan()` deterministically routes a much broader set of
+media-shaped phrasing than before -- e.g. "check Plex for X by ARTIST" can
+land on investigate_media_pipeline instead of media_plan_goal depending on
+exact wording. Several turns below intentionally use phrasing verified (via
+a direct preflight_plan() call, not guesswork) to return an EMPTY plan, so
+the turn actually reaches Qwen/discover_tools/the scripted ollama_script
+instead of being intercepted deterministically -- if you change a turn's
+wording, re-check preflight_plan(text, {}) directly before assuming it will
+still reach the fake Ollama script.
+
 Only the network boundary is faked:
   - `discover_tools`     -> replaced with a fake bounded-discovery function
                             returning canned schemas/candidates (never all
@@ -236,6 +248,40 @@ class FakeToolsBackend:
                 self.consumed_confirmations.add(confirmation_id)
             self.submitted_writes.append({"workflow_id": workflow_id, "arguments": dict(arguments)})
             return {"tool": name, "status": "ok", "result": {"status": "submitted", "write_executed": True, "ingestion_confirmed": True, "workflow_id": workflow_id}}
+        if name == "frigate_snapshot":
+            return {"tool": name, "status": "ok", "result": {"camera": arguments.get("camera", "front_door"), "vision_ready": False, "description": "The porch is empty right now."}}
+        if name == "investigate_media_pipeline":
+            # Real preflight_plan() now deterministically routes some
+            # artist-bearing phrasing ("X by ARTIST") to this cross-service
+            # tool rather than media_plan_goal/web_search (found via the
+            # main-merge conversation-integration run, not by inspection).
+            # grounded_investigation_answer() only special-cases a "utopia"
+            # test fixture and returns None otherwise, so a non-"utopia"
+            # turn falls through to stream_final's normal synthesis using
+            # this result as evidence -- status="ok" here is what matters
+            # for all_live_results_failed() to stay False; the exact field
+            # shape mirrors the real tool's (plex/lidarr_artist_status/
+            # lidarr_albums/slskd/music_enricher/beets/torbox/qbittorrent).
+            query = str(arguments.get("query") or arguments.get("focus") or "")
+            identity = None
+            for hits in self.web_index.values():
+                for hit in hits:
+                    if hit["canonical_identity"].get("title", "").casefold() in query.casefold():
+                        identity = hit["canonical_identity"]
+            for entry in self.library.values():
+                if entry["identity"].get("title", "").casefold() in query.casefold():
+                    identity = entry["identity"]
+            return {"tool": name, "status": "ok", "result": {
+                "investigation": "music_pipeline", "query": query,
+                "sources_checked": ["plex_music", "lidarr", "qbittorrent", "slskd", "torbox", "music_enricher", "beets"],
+                "plex": {"matches": [identity] if identity else []},
+                "lidarr_artist_status": {"known": bool(identity), "matches": []},
+                "lidarr_albums": {"matches": [identity] if identity else []},
+                "slskd": {"active_count": 0, "completed_count": 0, "items": []},
+                "music_enricher": {"count": 0, "items": []},
+                "beets": {"count": 0, "items": []},
+                "torbox": {"summary": {"active": 0, "completed": 0, "errored": 0, "pulling": 0}},
+            }}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
 
 
@@ -415,7 +461,7 @@ async def test_full_discover_offer_accept_write_conversation(session):
     assert subject_before and "cowboy bebop" in subject_before.casefold()
 
     reply2 = await session.turn(
-        "Can you check Plex for Cowboy Bebop?",
+        "Is Cowboy Bebop in my library?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
         ]}}],
@@ -681,12 +727,12 @@ async def test_music_discovery_offer_and_status_no_cli_debrid(session):
     # isolating -- so this turn uses the same "Can you check Plex/library
     # for X?" phrasing already proven to route through the Qwen loop in
     # test_full_discover_offer_accept_write_conversation.
-    await session.turn(
-        "Can you check Plex for Rodeo?",
-        ollama_script=[{"message": {"content": "", "tool_calls": [
-            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Rodeo"}}},
-        ]}}],
-    )
+    # "Do I have Rodeo?" is now deterministically routed straight to
+    # media_plan_goal by preflight_plan (media_goal_request matches "have"),
+    # bypassing the ollama_script entirely -- verified directly against
+    # preflight_plan before relying on it here, per this file's module
+    # docstring note on merge-caused routing sensitivity.
+    await session.turn("Do I have Rodeo?")
     assert not any(name in {"radarr_search", "sonarr_search", "media_standard_request"} for name, _ in session.backend.call_log), (
         "a music subject must never route through movie/TV tooling"
     )
@@ -734,7 +780,7 @@ async def test_music_status_followup_same_workflow(session):
     # the Qwen loop elsewhere in this file, to actually create the workflow
     # this test's second turn needs.
     await session.turn(
-        "Can you check Plex for Rodeo by Travis Scott?",
+        "Is Rodeo in my library?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Rodeo"}}},
         ]}}],
@@ -1170,3 +1216,58 @@ async def test_disambiguation_status_combined(session):
     assert "matching live workflow" not in reply.casefold()
     status_calls = [args for name, args in session.backend.call_log if name == "media_status"]
     assert status_calls
+
+
+# --- Camera/media coexistence in one session (post-merge regression) -------
+# Proves main's "dispatch bounded camera plans deterministically" work and
+# this branch's PendingOffer/disambiguation/referent-tracking work coexist
+# correctly: neither side's conversation_context writes clobber the other's
+# fields, and neither side's tool ever fires because of the other's state.
+
+@pytest.mark.asyncio
+async def test_active_media_offer_survives_an_interleaved_camera_question(session):
+    session.backend.seed_web("Cowboy Bebop", media_type="anime", tmdb_id="30991")
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_plan_goal")
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"goal": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    session.app.conversation_context[session.client_id] = {"latest_resolved_referent": "Cowboy Bebop"}
+
+    camera_reply = await session.turn("Is anyone at the front door right now?")
+    assert any(name == "frigate_snapshot" for name, _ in session.backend.call_log)
+    assert not any(name == "media_plan_goal" for name, _ in session.backend.call_log), (
+        "an unrelated camera question must never consume the stale media offer"
+    )
+    # The camera turn's store_provenance-style context write must not have
+    # dropped the referent or the still-pending offer.
+    assert session.client_id in session.app.pending_offers, "the media offer must survive an interleaved camera question"
+    assert session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent") == "Cowboy Bebop"
+
+    calls_before = len(session.backend.call_log)
+    resume_reply = await session.turn("Yeah, check it.")
+    assert len(session.backend.call_log) > calls_before, "returning to the media follow-up must actually invoke the offer's operation"
+    assert session.client_id not in session.app.pending_offers
+
+
+@pytest.mark.asyncio
+async def test_active_camera_context_survives_an_interleaved_media_question(session):
+    session.app.conversation_context[session.client_id] = {
+        "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras",
+        "camera": "front_door", "latest_event_id": "event-777", "latest_review_id": "review-42",
+    }
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+
+    await session.turn(
+        "Do you know Dune?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Dune"}}},
+        ]}}],
+        final_text="Dune is a science fiction movie.",
+    )
+    context_after_media = session.app.conversation_context.get(session.client_id, {})
+    assert context_after_media.get("latest_event_id") == "event-777", "a media discovery turn must not wipe the retained camera event"
+    assert context_after_media.get("latest_review_id") == "review-42"
+    assert "dune" in (context_after_media.get("latest_resolved_referent") or "").casefold()
+
+    camera_reply = await session.turn("Are they still there?")
+    assert any(name == "frigate_snapshot" for name, _ in session.backend.call_log[-1:]), (
+        "the retained camera event must still route a live-presence follow-up correctly after the media detour"
+    )

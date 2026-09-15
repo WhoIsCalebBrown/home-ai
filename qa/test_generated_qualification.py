@@ -43,14 +43,14 @@ def test_historical_camera_mutation_matrix_stays_event_scoped():
         for noun in nouns:
             text = f"{when} there were two {noun} at the front door"
             assert r["historical_camera_question"](text)
-            assert r["preflight_plan"](text)[0][0] == "frigate_recent_events"
+            assert r["preflight_plan"](text)[0][0] == "frigate_recent_activity"
             count += 1
     assert count == 16
 
 
 def test_camera_scope_wins_over_freshness_but_public_topic_wins_without_camera_scope():
     r = load_router()
-    assert r["preflight_plan"]("what happened this morning at the front door")[0][0] == "frigate_recent_events"
+    assert r["preflight_plan"]("what happened this morning at the front door")[0][0] == "frigate_recent_activity"
     assert r["preflight_plan"]("what happened this morning in Nvidia")[0][0] == "web_search"
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 import yaml
-from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_preflight_allowed, semantic_query
+from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
 from subject_model import PendingOffer, ResolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -349,7 +349,9 @@ domain or last-used tool override a new explicit request. If no supplied tool fi
 ask a concise clarification instead of calling an unrelated tool.
 An empty destination library does not mean the acquisition pipeline is empty."""
 PLEX_RULE = "Plex library names are exact live data. When a Plex result contains library_title, copy those strings exactly, including hyphens and capitalization. Never infer or shorten a library name from media type. If results span multiple libraries, name each exact library title in the spoken answer."
-INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language."""
+INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language.
+
+For Frigate evidence, keep occurrence timing and event duration separate. A relative_time or age_seconds value says how long ago an event began; it is never the event's duration. Only state how long an event lasted from time.duration_seconds, and if duration_is_final is false say that it is still active or that the final duration is not known. Use the camera_context field when present. Never infer indoor/outdoor location from a camera name. Current snapshots describe now and must not replace a referenced historical review/event. Activity claims require event-scoped frames or GenAI scene metadata; detection labels and timestamps alone are not evidence of an action. Do not claim that someone entered, exited, arrived, departed, or moved in a direction unless the event-scoped visual sequence clearly shows that transition. Do not infer intent or a carried object from a shape alone. If visual evidence is weak, say what is visible and what is unclear."""
 FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Internal evidence is already available in this conversation. Do not describe where it came from and do not attribute it to the user. Return only a concise natural spoken answer. Every dynamic claim must map to an explicit field in the current evidence."
 
 
@@ -361,7 +363,7 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "route_query": route_text,
         "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
-        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id") if context.get(key)},
+        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
         "retrieval_context": discovery_context(context),
@@ -761,6 +763,11 @@ def front_door_presence_question(text: str) -> bool:
     return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion|alert|alerts|detection|detected)\b", text, re.I))
 
 
+def current_camera_presence_question(text: str) -> bool:
+    """A retained historical referent may be used to ask about the present."""
+    return bool(re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment|what(?:'s| is)\s+(?:happening|there))\b", text, re.I))
+
+
 def dynamic_fact_question(text: str) -> bool:
     return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline|news|policy|policies|president|version|release|product)\b", text, re.I))
 
@@ -924,6 +931,28 @@ def grounded_camera_presence_answer(result: dict) -> str:
             when = f"about {round(age / 60)} minutes ago"
         return f"Yeah, someone was at the front door {when}, but they aren't there now."
     return "Someone was detected at the front door, but I can't tell if they're still there right now."
+
+
+def grounded_recent_activity_answer(result: dict) -> str | None:
+    """Answer a latest-only activity read from deterministic review evidence."""
+    if not result.get("latest_only"):
+        return None
+    reviews = result.get("reviews") or []
+    if not reviews:
+        return "I haven't found any recent activity at the front door."
+    review = reviews[0]
+    timing = review.get("time") or {}
+    start = timing.get("start") or {}
+    when = start.get("relative_time") or "recently"
+    duration = timing.get("duration_seconds")
+    metadata = review.get("genai") or {}
+    summary = metadata.get("shortSummary") or metadata.get("short_summary")
+    if summary:
+        return f"Yes. {when}, {summary}"
+    if isinstance(duration, (int, float)):
+        return f"Yes. {when}, a person was visible for about {duration:g} seconds."
+    objects = ", ".join(review.get("objects") or []) or "activity"
+    return f"Yes. {when}, Frigate recorded {objects} at the front door."
 
 
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
@@ -1540,7 +1569,7 @@ def turn_context(client_id: str, text: str) -> dict:
     # provenance for genuine elliptical follow-ups.
     current = {key: prior[key] for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
@@ -1587,7 +1616,7 @@ def turn_context(client_id: str, text: str) -> dict:
     # resolution is supplied separately through structured context.
     for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
     ):
@@ -1687,15 +1716,31 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     event_scope = re.search(r"\bfor\s+event\s+([A-Za-z0-9_.-]+)\b", text, re.I)
     if context.get("latest_event_id") and event_scope:
         event_id = context["latest_event_id"]
+        # An explicit present-tense question is a deliberate switch from the
+        # retained historical event to the live camera.  Do this before the
+        # generic visual-follow-up branch so "Are they still there?" cannot
+        # remain attached to the historical clip.
+        if re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment)\b", text, re.I):
+            return [("frigate_snapshot", {"camera": "front_door"})]
+        # Timing questions about a retained event must use the event-scoped
+        # normalized evidence, never a generic current-time capability.
+        if re.search(r"\b(?:how\s+long|duration|what\s+time|when\s+was\s+that|when\s+did\s+that)\b", text, re.I):
+            return [("frigate_activity_details", {"event_id": event_id})]
         if activity_question(text):
-            return [("frigate_event_activity", {"event_id": event_id})]
+            return [("frigate_activity_details", {"event_id": event_id})]
         return [("frigate_event_snapshot", {"event_id": event_id})]
+    if context.get("latest_event_id"):
+        event_id = context["latest_event_id"]
+        if re.search(r"\b(?:still\s+there|there\s+now|right\s+now|currently|at\s+the\s+moment)\b", text, re.I):
+            return [("frigate_snapshot", {"camera": "front_door"})]
+        if re.search(r"\b(?:how\s+long|duration|what\s+time|when\s+was\s+that|when\s+did\s+that)\b", text, re.I):
+            return [("frigate_activity_details", {"event_id": event_id})]
     # Explicit historical camera scope outranks generic freshness words such
     # as "today" and "this morning". A public topic without camera nouns can
     # still route to web search below.
     if historical_camera_question(text):
         since, until = historical_camera_window(text)
-        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+        return [("frigate_recent_activity", {"camera": "front_door", "label": "person", "limit": 20, "latest_only": False, "since": since, "until": until})]
     # "right now" is live-camera intent, not a request for the recent event
     # list.  Historical wording has already returned above, so this branch is
     # deterministic and cannot be confused by an inherited camera domain.
@@ -1711,7 +1756,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # "Recent front door events" is local Frigate history, not public web news.
     if re.search(r"\b(front\s+door|camera|frigate)\b", t) and re.search(r"\b(recent|recently|today|earlier|event|events|happened|recorded)\b", t, re.I):
         since, until = historical_camera_window(text)
-        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+        latest_only = bool(re.search(r"\b(?:recent|recently|latest|last)\b", t, re.I)) and not bool(re.search(r"\b(?:two|three|all|everything|multiple|several|timeline|last\s+hour|today|this\s+(?:morning|afternoon|evening))\b", t, re.I))
+        return [("frigate_recent_activity", {"camera": "front_door", "label": "person", "limit": 1 if latest_only else 20, "latest_only": latest_only, "since": since, "until": until})]
     # Explicit current-information intent is a hard domain boundary. It is
     # evaluated after explicit camera/history shapes so "recent front door
     # events" cannot be mistaken for public news, but before any inherited
@@ -1734,7 +1780,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if remove_match:
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
     if context.get("latest_event_id") and activity_question(text):
-        return [("frigate_event_activity", {"event_id": context["latest_event_id"]})]
+        return [("frigate_activity_details", {"event_id": context["latest_event_id"]})]
+    if context.get("latest_event_id") and visual_question(text):
+        return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(?:yeah|yes|that's|that is|exactly|right)\b", t):
         return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(event|detection|image|snapshot|that)\b", t) and visual_question(text):
@@ -2203,10 +2251,13 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         result = last.get("result") if isinstance(last.get("result"), dict) else {}
         if last.get("tool", "").startswith("frigate"):
             events = result.get("events") or []
-            camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
+            reviews = result.get("reviews") or []
             selected = events[0] if events else (prior_state.get("latest_event") or {})
-            event_id = result.get("event_id") or selected.get("id") or prior_state.get("latest_event_id")
-            conversation_context[client_id] = {**prior_state, "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else prior_state.get("subject"), "latest_event_id": event_id, "latest_event": selected or None}
+            selected_review = reviews[0] if reviews else {}
+            camera = result.get("camera") or selected.get("camera") or selected_review.get("camera") or "front_door"
+            event_id = result.get("event_id") or selected.get("event_id") or selected.get("id") or (selected_review.get("event_ids") or [None])[0] or prior_state.get("latest_event_id")
+            review_id = result.get("review_id") or selected.get("review_id") or selected_review.get("review_id") or prior_state.get("latest_review_id")
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) or "person" in (selected_review.get("objects") or []) else prior_state.get("subject"), "latest_event_id": event_id, "latest_review_id": review_id, "latest_event": selected or selected_review or None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
             conversation_context[client_id] = {**prior_state, "domain": "weather", "latest_domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
@@ -2636,6 +2687,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # they do not replace the user turn.  Exclude the just-appended user
         # entry from retained history so referential turns do not duplicate it.
         model_history = history[-7:-1] if has_referential_language(user_text) else []
+        # A current-state camera question must be grounded in the current
+        # snapshot, not in prose from the historical event conversation. The
+        # structured referent is retained separately for routing, but old
+        # assistant wording must not leak historical duration/action claims
+        # into the present-tense answer.
+        if current_camera_presence_question(user_text):
+            model_history = []
         messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": user_text}]
         context = turn_context(client_id, user_text)
         contextual = contextual_entity_resolution(user_text, context)
@@ -2652,13 +2710,27 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # Semantic retrieval supplies the bounded model-facing tool set. Only
         # deterministic arithmetic may bypass Qwen; domain and tool selection
         # is no longer performed by the legacy language-pattern preflight.
-        planned = [plan for plan in deterministic_plan(route_text)
-                   if semantic_preflight_allowed(plan[0])]
+        # The semantic retriever supplies candidates, but an established hard
+        # invariant (especially a retained Frigate event) must constrain the
+        # actual dispatch.  Previously only calculator/unit conversion used
+        # this deterministic path; Qwen could therefore add a live snapshot
+        # or current_datetime beside an event-scoped plan.  Use the bounded
+        # preflight planner for all known high-confidence routes, while still
+        # leaving genuinely novel/ambiguous requests to semantic retrieval.
+        planned = preflight_plan(route_text, context)
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
         context["resolved_request"] = resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)
         context["latest_resolved_request"] = context["resolved_request"]
+        if planned:
+            planned_names = {name for name, _ in planned}
+            # Do not offer unrelated capabilities when deterministic routing
+            # has established a safe, bounded route.  This is particularly
+            # important for historical camera referents: current snapshots
+            # and current_datetime must not compete with event evidence.
+            tools = [tool for tool in tools if tool.get("name") in planned_names]
+            context["resolved_request"]["selected_tools"] = [tool.get("name") for tool in tools]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         if tools:
@@ -2676,7 +2748,23 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 args = {**args, "session_id": request_id}
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
-            live_results.append(await invoke_tool(name, args, client_id, request_id))
+            planned_result = await invoke_tool(name, args, client_id, request_id)
+            live_results.append(planned_result)
+            # preflight_plan now deterministically routes a much broader set
+            # of media/camera requests than the old calculator/unit_convert-
+            # only preflight did (main's "dispatch bounded camera plans
+            # deterministically" change) -- record_tool_referent must run
+            # here too, not only in the Qwen tool-call loop below, or a
+            # deterministically-routed media_plan_goal/media_status call
+            # silently stops updating latest_resolved_referent. Found by
+            # running this branch's conversation-integration suite against
+            # merged main, not by inspection alone.
+            record_tool_referent(client_id, name, args, planned_result)
+        # Planned tools have already been executed against the bounded
+        # arguments. Do not expose the same capability to Qwen for a second
+        # discretionary call; synthesis still receives the evidence below.
+        if planned:
+            tools = []
         if current_external_question(user_text) or context.get("domain") == "web_research":
             search_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "web_search" and item.get("status") == "ok"), None)
             first_url = next((item.get("url") for item in (search_result or {}).get("results", []) if item.get("url")), None)
@@ -2717,6 +2805,17 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        if live_results and any(item.get("tool") == "frigate_recent_activity" for item in live_results):
+            activity_result = next((item.get("result", {}) for item in live_results if item.get("tool") == "frigate_recent_activity" and item.get("status") == "ok"), None)
+            if activity_result is not None:
+                direct = grounded_recent_activity_answer(activity_result)
+                if direct:
+                    store_provenance(client_id, live_results)
+                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_recent_activity")
+                    history.append({"role": "assistant", "content": direct})
+                    await ws.send_json({"type": "done", "request_id": request_id})
+                    return
         if live_results and any(item.get("tool") == "investigate_media_pipeline" and item.get("status") == "ok" for item in live_results):
             investigation = next(item.get("result", {}) for item in live_results if item.get("tool") == "investigate_media_pipeline")
             direct = grounded_investigation_answer(investigation, user_text)

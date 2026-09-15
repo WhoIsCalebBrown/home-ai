@@ -34,7 +34,7 @@ def test_historical_camera_language_does_not_become_live_snapshot():
     router = load_router()
     text = "about an hour ago there were two camera events at the front door"
     assert router["historical_camera_question"](text)
-    assert router["preflight_plan"](text)[0][0] == "frigate_recent_events"
+    assert router["preflight_plan"](text)[0][0] == "frigate_recent_activity"
 
 
 def test_direct_file_and_playback_language_remain_distinct():
