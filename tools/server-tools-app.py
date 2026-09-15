@@ -1817,7 +1817,11 @@ def _cli_debrid_exact_item_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     media_type = str(payload["media"]["media_type"])
     result: dict[str, Any] = {"matched": False, "media_type": media_type, "tmdb_id": media_id, "rows": []}
     try:
-        connection = sqlite3.connect(CLIDEBRID_DB_PATH, timeout=1)
+        # The cli_debrid database is mounted read-only in Home-AI-Tools.
+        # SQLite's default connection may try to create a journal; immutable
+        # URI mode makes this an explicitly read-only acknowledgement check.
+        database_uri = f"file:{Path(CLIDEBRID_DB_PATH).as_posix()}?mode=ro&immutable=1"
+        connection = sqlite3.connect(database_uri, uri=True, timeout=1)
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT id, tmdb_id, title, year, state, type, requested_season, location_on_disk, plex_verified "
