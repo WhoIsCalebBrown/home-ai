@@ -1092,12 +1092,19 @@ def media_status_question(text: str) -> bool:
     # as "Is anything in Lidarr going to Plex?".
     if re.search(r"\b(?:anything|pipeline|lidarr|sonarr|radarr)\b", text, re.I):
         return False
-    return bool(re.search(r"\b(?:how(?:'s| is)|is|did|where is|what(?:'s| is))\b", text, re.I)
+    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|did|where is|what(?:'s| is))\b", text, re.I)
                 and re.search(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in plex|import(?:ed)?|there yet|status|progress)\b", text, re.I))
 
 
 def media_nouns_for_status(text: str) -> bool:
     return bool(re.search(r"\b(?:movie|film|show|series|season|episode|album|music|anime|plex|lidarr|sonarr|radarr|hobbit|rodeo|astroworld|dragon\s+ball)\b", text, re.I))
+
+
+def media_title_status_signal(text: str) -> bool:
+    """Recognize a likely title in a status frame when STT drops the title's type word."""
+    if re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage)\b", text, re.I):
+        return False
+    return bool(re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet)\b", text, re.I))
 
 
 def social_acknowledgement(text: str) -> bool:
@@ -1254,7 +1261,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
-    if media_status_question(text) and media_nouns and not media_acquisition_language(text):
+    if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and not media_acquisition_language(text):
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:
@@ -1888,7 +1895,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             evidence_messages = evidence_message(live_results)
             evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
             messages.extend(evidence_messages)
-        if not live_results and media_status_question(user_text) and (context.get("domain") == "media" or media_nouns_for_status(user_text)):
+        if not live_results and media_status_question(user_text) and (context.get("domain") == "media" or media_nouns_for_status(user_text) or media_title_status_signal(user_text)):
             full = "I couldn't verify the current media status because I don't have a matching live workflow."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="media_status_without_live_evidence")
             history.append({"role": "assistant", "content": full})
