@@ -1947,6 +1947,71 @@ def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result
     conversation_context[client_id] = context
 
 
+_DISAMBIGUATION_TTL_SECONDS = 90
+
+
+def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str) -> None:
+    """Persist an ambiguous media_plan_goal's candidate set so the next
+    turn's natural-language reply ("the new one", "2021", "the movie") can
+    resolve against it, instead of the assistant losing the candidates the
+    moment it asks "which one do you mean?". Small, additive extension of
+    conversation_context -- not a new state store (spec item #14)."""
+    if not candidates:
+        return
+    context = dict(conversation_context.get(client_id, {}))
+    context["pending_disambiguation"] = {
+        "candidates": candidates, "original_goal": original_goal, "created_at": time.time(),
+    }
+    conversation_context[client_id] = context
+
+
+def _disambiguation_expired(entry: dict) -> bool:
+    return time.time() - float(entry.get("created_at", 0)) > _DISAMBIGUATION_TTL_SECONDS
+
+
+def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | None:
+    """Match a natural reply to exactly one candidate, or return None.
+
+    Never guesses: an unrecognized or genuinely ambiguous reply (a bare
+    "yeah" with no distinguishing language) returns None so the caller can
+    ask again rather than silently picking one -- this is the same
+    never-guess discipline as disambiguate_subjects() in subject_model.py,
+    applied to raw plan candidates (title/year/media_type dicts) since that
+    is the shape media_plan_goal's ambiguous results actually carry, not
+    ResolvedSubject instances.
+    """
+    lowered = text.strip().casefold().rstrip(".!?")
+    if not lowered:
+        return None
+    years = [c.get("year") for c in candidates if c.get("year")]
+    numeric_years = sorted({int(y) for y in years if str(y).isdigit()})
+    year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
+    if year_match:
+        matches = [c for c in candidates if str(c.get("year")) == year_match.group(0)]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\b(new|newest|latest|recent)\b", lowered) and numeric_years:
+        matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[-1])]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\b(old|oldest|original|first)\b", lowered) and numeric_years:
+        matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[0])]
+        if len(matches) == 1:
+            return matches[0]
+    if re.search(r"\bfirst\s+one\b", lowered) and len(candidates) >= 1:
+        return candidates[0]
+    if re.search(r"\bsecond\s+one\b", lowered) and len(candidates) >= 2:
+        return candidates[1]
+    media_type_words = {"movie": "movie", "film": "movie", "album": "album", "record": "album",
+                         "show": "tv", "series": "tv", "anime": "anime", "game": "game"}
+    for word, media_type in media_type_words.items():
+        if re.search(rf"\bthe\s+{word}\b", lowered):
+            matches = [c for c in candidates if str(c.get("media_type", "")).casefold() == media_type]
+            if len(matches) == 1:
+                return matches[0]
+    return None
+
+
 def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     """Compute the next-best read-only action for an identified-but-not-yet-
     actionable (or already-available) media plan, stage it as a PendingOffer,
@@ -2320,6 +2385,71 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
+    disambiguation = conversation_context.get(client_id, {}).get("pending_disambiguation")
+    if disambiguation and _disambiguation_expired(disambiguation):
+        context_after_expiry = dict(conversation_context.get(client_id, {}))
+        context_after_expiry.pop("pending_disambiguation", None)
+        conversation_context[client_id] = context_after_expiry
+        disambiguation = None
+    if disambiguation and not pending.get(client_id):
+        candidates = disambiguation.get("candidates", [])
+        # A genuinely new explicit request (a different domain) always
+        # outranks a stale disambiguation prompt -- same newest-intent-wins
+        # rule as offers. A bare, non-distinguishing reply must never guess.
+        # Unlike the offer precedent below, "media" itself is never treated
+        # as a competing domain here: a disambiguation reply is inherently
+        # media-flavored language ("the album", "the movie", a bare year),
+        # which explicit_domain correctly classifies as domain="media" via
+        # its own noun/status regexes -- treating that as "competing" would
+        # block every media-type-word reply from ever resolving.
+        disambiguation_domain = explicit_domain(user_text)
+        has_competing_intent = disambiguation_domain is not None and disambiguation_domain != "media"
+        resolved = None if has_competing_intent else resolve_disambiguation_reply(user_text, candidates)
+        if resolved is not None:
+            context_cleared = dict(conversation_context.get(client_id, {}))
+            context_cleared.pop("pending_disambiguation", None)
+            conversation_context[client_id] = context_cleared
+            title = resolved.get("title") or ""
+            year = resolved.get("year")
+            media_type = resolved.get("media_type")
+            type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
+            disambiguated_goal = f"{disambiguation.get('original_goal', '')} {title} {year or ''} {type_word}".strip()
+            result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": request_id}, client_id, request_id)
+            live_results_resolved = [result]
+            resolved_text = media_plan_response(user_text, live_results_resolved)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if resolved_text is None:
+                post_direct_resolved = direct_structured_answer(user_text, live_results_resolved)
+                resolved_text = post_direct_resolved or f"I found {title}."
+                if plan_result.get("confirmation_required"):
+                    stage_media_confirmation(client_id, request_id, plan_result)
+            elif plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                offer_question = stage_media_offer(client_id, plan_result)
+                if offer_question:
+                    resolved_text = f"{resolved_text} {offer_question}"
+            store_provenance(client_id, live_results_resolved)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="disambiguation_resolved")
+            history.append({"role": "assistant", "content": resolved_text})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if not has_competing_intent:
+            # Ambiguous or unrecognized reply against a live candidate set:
+            # ask again rather than guessing. A bare "yeah" must not select
+            # a subject.
+            labels = []
+            for candidate in candidates[:3]:
+                candidate_title = candidate.get("title") or candidate.get("name")
+                candidate_year = candidate.get("year")
+                if candidate_title:
+                    labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
+            full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="disambiguation_reprompt")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # Competing explicit intent: leave the stale disambiguation entry in
+        # place (mirrors the offer precedent) and fall through to normal routing.
     action = pending.get(client_id)
     if action and action.get("expires", 0) <= time.time():
         pending.pop(client_id, None)
@@ -2592,6 +2722,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 offer_question = stage_media_offer(client_id, plan_result)
                 if offer_question:
                     media_direct = f"{media_direct} {offer_question}"
+            if plan_result and plan_result.get("ambiguous") and plan_result.get("candidates"):
+                stage_disambiguation(client_id, plan_result["candidates"], user_text)
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
@@ -2751,6 +2883,26 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                             offer_question = stage_media_offer(client_id, plan_result)
                             if offer_question:
                                 post_direct = f"{post_direct} {offer_question}"
+                        if plan_result.get("ambiguous") and plan_result.get("candidates"):
+                            # Same dead-path class as stage_media_offer
+                            # above: this is the actual response path for a
+                            # Qwen-driven ambiguous result, so disambiguation
+                            # must be staged here, not only at the pre-loop
+                            # media_plan_response call site (which never
+                            # sees a populated live_results for a
+                            # Qwen-driven call). direct_structured_answer's
+                            # own ambiguous text has no candidate labels;
+                            # replace it with the labeled version so the
+                            # user actually hears what to choose between.
+                            stage_disambiguation(client_id, plan_result["candidates"], user_text)
+                            labels = []
+                            for candidate in plan_result["candidates"][:3]:
+                                candidate_title = candidate.get("title") or candidate.get("name")
+                                candidate_year = candidate.get("year")
+                                if candidate_title:
+                                    labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
+                            if labels:
+                                post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")
