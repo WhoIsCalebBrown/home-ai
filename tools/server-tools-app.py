@@ -2056,6 +2056,14 @@ def _save_workflow_update(rows: list[dict[str, Any]], row: dict[str, Any]) -> No
     _save_media_workflows(rows)
 
 
+def _invalidate_confirmation(workflow: dict[str, Any], reason: str) -> None:
+    """Retire a pending approval when live revalidation proves no write is needed."""
+    if workflow.get("confirmation_status") == "PENDING":
+        workflow.update({"confirmation_status": "INVALIDATED",
+                         "confirmation_invalidated_reason": reason,
+                         "confirmation_invalidated_at": now()})
+
+
 async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     """Bounded standard/watch-first bridge; execution is disabled by default."""
     allowed_keys = {"workflow_id", "media_type", "canonical_external_id", "canonical_title", "season_scope",
@@ -2122,11 +2130,27 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
         return {"status": "rejected", "reason": "CONFIRMATION_ID_MISMATCH", "write_executed": False}
     if workflow.get("confirmation_status") != "PENDING":
         return {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}
-    if workflow.get("current_state") in {"REQUESTED", "SEARCHING", "ACQUIRING", "VERIFYING", "ACQUIRED", "AVAILABLE_IN_PLEX"}:
-        return {"status": "no_op", "reason": "STANDARD_WORKFLOW_ALREADY_ACTIVE_OR_SATISFIED", "write_executed": False, "workflow_id": workflow_id}
-
     title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
-    if title and not payload.get("seasons"):
+    # Persisted lifecycle state is correlation/history, not proof of a live
+    # request. Revalidate the provider first so stale REQUESTED/SEARCHING
+    # records cannot suppress a legitimate retry or authorize a duplicate.
+    webhook_payload = _build_cli_debrid_overseerr_webhook(args, workflow_id)
+    live_evidence = _cli_debrid_exact_item_evidence(webhook_payload)
+    if live_evidence.get("error"):
+        return {"status": "unavailable", "reason": "CLIDEBRID_STATE_UNAVAILABLE",
+                "write_executed": False, "workflow_id": workflow_id,
+                "evidence": live_evidence}
+    if live_evidence.get("matched"):
+        _invalidate_confirmation(workflow, "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
+        raw = [str(item.get("state") or "") for item in live_evidence.get("rows", [])]
+        workflow.update({"current_state": raw[0] if raw else workflow.get("current_state"),
+                         "canonical_state": "REQUESTED", "storage_class": "debrid"})
+        _save_workflow_update(rows, workflow)
+        return {"status": "no_op", "reason": "STANDARD_WORKFLOW_ALREADY_ACTIVE_OR_SATISFIED",
+                "write_executed": False, "workflow_id": workflow_id,
+                "evidence": live_evidence}
+
+    if title:
         permanent_library = storage_policy["permanent"]["library"]
         standard_library = storage_policy["standard"]["library"]
         identity = workflow.get("canonical_identity", {})
@@ -2138,14 +2162,17 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                                       "title": title, "year": identity.get("year"),
                                                       "canonical_external_ids": canonical_ids, "library": standard_library})
         if permanent.get("matched") and standard.get("matched"):
+            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "both"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES", "write_executed": False, "workflow_id": workflow_id}
         if permanent.get("matched"):
+            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_PERMANENTLY")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "permanent_local"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_PERMANENTLY", "write_executed": False, "workflow_id": workflow_id}
         if standard.get("matched"):
+            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_STANDARD")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "debrid"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_STANDARD", "write_executed": False, "workflow_id": workflow_id}
@@ -2155,7 +2182,6 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     workflow.update({"confirmation_status": "SUBMITTING", "canonical_state": "REQUESTED", "mode": "standard"})
     _save_workflow_update(rows, workflow)
 
-    webhook_payload = _build_cli_debrid_overseerr_webhook(args, workflow_id)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     headers["X-Home-AI-Bridge-Token"] = _standard_bridge_secret()
     transport_success = False

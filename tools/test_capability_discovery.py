@@ -227,6 +227,45 @@ def test_cli_debrid_standard_request_accepts_bound_standard_mode():
     assert result["reason"] != "UNEXPECTED_ARGUMENT"
 
 
+def test_pending_confirmation_is_invalidated_when_live_provider_already_has_item():
+    workflow = {"confirmation_status": "PENDING"}
+    module._invalidate_confirmation(workflow, "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
+    assert workflow["confirmation_status"] == "INVALIDATED"
+    assert workflow["confirmation_invalidated_reason"] == "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS"
+
+
+def test_enabled_executor_revalidates_provider_before_using_stale_active_state(monkeypatch, tmp_path):
+    import asyncio
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module.STANDARD_MEDIA_BACKEND_READY = True
+    module.STANDARD_MEDIA_WRITES_ENABLED = True
+    module.STANDARD_MOVIE_WRITES_ENABLED = True
+    module._standard_bridge_secret = lambda: "test-secret"
+    args = {"workflow_id": "wf-stale-active", "mode": "standard", "media_type": "movie",
+            "canonical_external_id": 8467, "canonical_title": "Dumb and Dumber", "season_scope": [],
+            "episode_scope": [], "session_id": "session-a"}
+    plan = {"canonical_identity": {"media_type": "movie", "tmdb_id": 8467, "title": "Dumb and Dumber", "year": 1994}}
+    confirmation_args = {key: args[key] for key in ("workflow_id", "mode", "media_type",
+                                                      "canonical_external_id", "season_scope", "episode_scope")}
+    record = module.media_confirmation_record(workflow_id=args["workflow_id"], plan=plan,
+                                              session_id="session-a", operation="cli_debrid.webhook",
+                                              arguments=confirmation_args)
+    module._save_media_workflows([{
+        "workflow_id": args["workflow_id"], "media_type": "movie", "mode": "standard",
+        "canonical_identity": plan["canonical_identity"], "current_state": "SEARCHING",
+        "plan_version_hash": record["plan_version_hash"], "confirmation_id": record["confirmation_id"],
+        "confirmation_status": "PENDING",
+    }])
+    args["confirmation_context"] = record
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
+        "matched": True, "rows": [{"state": "Wanted", "tmdb_id": 8467, "type": "movie"}]
+    })
+    result = asyncio.run(module.media_standard_request(args))
+    assert result["status"] == "no_op", result
+    assert result["write_executed"] is False
+    assert module._media_workflows()[0]["confirmation_status"] == "INVALIDATED"
+
+
 def test_standard_binding_changes_when_scope_or_identity_changes():
     movie = {"workflow_id": "wf", "media_type": "movie", "canonical_external_id": 1362}
     season = {"workflow_id": "wf", "media_type": "tv", "canonical_external_id": 95396, "season_scope": [2]}
