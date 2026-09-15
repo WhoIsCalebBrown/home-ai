@@ -1588,6 +1588,16 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
                                                "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
                                                "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
                                                "canonical_identity": identity, "media_type": result.get("goal", {}).get("media_type")}
+        elif last.get("tool") == "media_status" and result.get("found") and result.get("workflow_id"):
+            identity = result.get("canonical_identity") or {}
+            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names,
+                                               "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
+                                               "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
+                                               "canonical_identity": identity, "media_type": result.get("media_type") or identity.get("media_type"),
+                                               "latest_media_workflow": {"workflow_id": result.get("workflow_id"),
+                                                                          "canonical_external_id": identity.get("tmdb_id") or identity.get("tvdb_id") or identity.get("foreign_album_id"),
+                                                                          "media_type": result.get("media_type") or identity.get("media_type"),
+                                                                          "title": identity.get("title"), "mode": result.get("mode", "standard")}}
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
     for item in reversed(results):

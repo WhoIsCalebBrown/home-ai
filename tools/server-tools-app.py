@@ -1864,7 +1864,7 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         # intentionally lossy for acquisition planning (it removes articles
         # and media-type words), which is unsafe for exact workflow lookup.
         title_query = query
-        title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did)\s+", "", title_query, flags=re.I)
+        title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did|what about|how about)\s+", "", title_query, flags=re.I)
         title_query = re.sub(r"\s+(?:doing|going|ready|found|find|downloading|downloaded|in plex|there yet)\b.*$", "", title_query, flags=re.I).strip(" .?!")
         requested_year = parts.get("requested_year")
         parenthesized_year = re.search(r"\((?:19|20)\d{2}\)", title_query)
