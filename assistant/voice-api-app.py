@@ -960,6 +960,11 @@ def routing_aliases(text: str) -> str:
     # explicit Plex plus recency/addition language.
     if re.search(r"\bplex\b", text, re.I) and re.search(r"\b(?:latest|newest|recent|last|added|addition)\b", text, re.I):
         text = re.sub(r"\bedition\b", "addition", text, flags=re.I)
+    # In a Plex recency question, Whisper can drop the opening "what's" and
+    # leave "was new in Plex". Repair only this complete library-recency shape;
+    # do not globally alias "was" or "new".
+    if re.search(r"\bwas\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", text, re.I):
+        text = re.sub(r"\bwas\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", "what's new in Plex", text, flags=re.I)
     # Bounded voice repair: Whisper can render "Plex edition" as "flex
     # edition" in a recency question. Require the full recency shape before
     # repairing; ordinary uses of "flex" remain untouched.
