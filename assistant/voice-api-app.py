@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 import yaml
-from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_preflight_allowed, semantic_query
+from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -2188,8 +2188,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # or current_datetime beside an event-scoped plan.  Use the bounded
         # preflight planner for all known high-confidence routes, while still
         # leaving genuinely novel/ambiguous requests to semantic retrieval.
-        planned = [plan for plan in preflight_plan(route_text, context)
-                   if semantic_preflight_allowed(plan[0])]
+        planned = preflight_plan(route_text, context)
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
