@@ -13,9 +13,23 @@ def names(query):
 
 def test_discovery_distinguishes_camera_capabilities():
     assert names("is the front door camera working")[:1] == ["frigate_stats"]
-    assert names("was someone at the front door recently")[:1] == ["frigate_recent_events"]
+    assert names("was someone at the front door recently")[:1] in [["frigate_recent_events"], ["frigate_recent_activity"]]
     assert names("describe the front door right now")[:1] == ["frigate_snapshot"]
     assert names("describe the image from that detection")[:1] == ["frigate_event_snapshot"]
+
+
+def test_frigate_time_contract_separates_age_from_duration():
+    details = module.frigate_time_range(1789496112, 1789496120, 1789496712)
+    assert details["duration_seconds"] == 8
+    assert details["duration_is_final"] is True
+    assert details["start"]["age_seconds"] == 600
+    assert details["start"]["relative_time"] == "about 10 minutes ago"
+
+
+def test_frigate_activity_capabilities_are_registered():
+    discovered = {item["metadata"]["canonical_name"] for item in module.discover_capabilities("what happened at the front door recently", 8)}
+    assert "frigate_recent_activity" in discovered or "frigate_recent_events" in discovered
+    assert "frigate_activity_details" in {item["metadata"]["canonical_name"] for item in module.discover_capabilities("what were they doing in that event", 8)}
 
 
 def test_online_research_paraphrases_do_not_depend_on_phrase_router_or_prior_weather():

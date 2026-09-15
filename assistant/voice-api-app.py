@@ -212,7 +212,9 @@ domain or last-used tool override a new explicit request. If no supplied tool fi
 ask a concise clarification instead of calling an unrelated tool.
 An empty destination library does not mean the acquisition pipeline is empty."""
 PLEX_RULE = "Plex library names are exact live data. When a Plex result contains library_title, copy those strings exactly, including hyphens and capitalization. Never infer or shorten a library name from media type. If results span multiple libraries, name each exact library title in the spoken answer."
-INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language."""
+INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language.
+
+For Frigate evidence, keep occurrence timing and event duration separate. A relative_time or age_seconds value says how long ago an event began; it is never the event's duration. Only state how long an event lasted from time.duration_seconds, and if duration_is_final is false say that it is still active or that the final duration is not known. Use the camera_context field when present. Never infer indoor/outdoor location from a camera name. Current snapshots describe now and must not replace a referenced historical review/event. Activity claims require event-scoped frames or GenAI scene metadata; detection labels and timestamps alone are not evidence of an action. If visual evidence is weak, say what is visible and what is unclear."""
 FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Internal evidence is already available in this conversation. Do not describe where it came from and do not attribute it to the user. Return only a concise natural spoken answer. Every dynamic claim must map to an explicit field in the current evidence."
 
 
@@ -224,7 +226,7 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "route_query": route_text,
         "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
-        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id") if context.get(key)},
+        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
         "retrieval_context": discovery_context(context),
@@ -1831,10 +1833,13 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         result = last.get("result") if isinstance(last.get("result"), dict) else {}
         if last.get("tool", "").startswith("frigate"):
             events = result.get("events") or []
-            camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
+            reviews = result.get("reviews") or []
             selected = events[0] if events else (prior_state.get("latest_event") or {})
-            event_id = result.get("event_id") or selected.get("id") or prior_state.get("latest_event_id")
-            conversation_context[client_id] = {**prior_state, "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else prior_state.get("subject"), "latest_event_id": event_id, "latest_event": selected or None}
+            selected_review = reviews[0] if reviews else {}
+            camera = result.get("camera") or selected.get("camera") or selected_review.get("camera") or "front_door"
+            event_id = result.get("event_id") or selected.get("event_id") or selected.get("id") or (selected_review.get("event_ids") or [None])[0] or prior_state.get("latest_event_id")
+            review_id = result.get("review_id") or selected.get("review_id") or selected_review.get("review_id") or prior_state.get("latest_review_id")
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) or "person" in (selected_review.get("objects") or []) else prior_state.get("subject"), "latest_event_id": event_id, "latest_review_id": review_id, "latest_event": selected or selected_review or None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
             conversation_context[client_id] = {**prior_state, "domain": "weather", "latest_domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):

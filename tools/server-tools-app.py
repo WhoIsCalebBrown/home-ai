@@ -68,6 +68,19 @@ PROTECTED = {x.strip().lower() for x in os.getenv(
     "PROTECTED_CONTAINERS",
     "voice-api,voice-ollama,voice-whisper,voice-kokoro,voice-piper,Nginx-Proxy-Manager-Official,adguardhome,cloudflare-tunnel,mariadb,postgres,redis"
 ).split(",") if x.strip()}
+HOME_TIMEZONE = os.getenv("HOME_TIMEZONE", os.getenv("TZ", "America/Toronto"))
+try:
+    HOME_ZONE = ZoneInfo(HOME_TIMEZONE)
+except Exception:
+    HOME_TIMEZONE = "America/Toronto"
+    HOME_ZONE = ZoneInfo(HOME_TIMEZONE)
+
+try:
+    FRIGATE_CAMERA_CONTEXTS = json.loads(os.getenv("FRIGATE_CAMERA_CONTEXTS", "{}"))
+    if not isinstance(FRIGATE_CAMERA_CONTEXTS, dict):
+        FRIGATE_CAMERA_CONTEXTS = {}
+except json.JSONDecodeError:
+    FRIGATE_CAMERA_CONTEXTS = {}
 
 SERVICES = {
     "plex": (f"{TOWER}:32400", "Plex-Media-Server/Library/Application Support/Plex Media Server/Preferences.xml"),
@@ -111,6 +124,51 @@ def event_time(value: Any) -> float | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def frigate_camera_context(camera: Any) -> str | None:
+    """Return configured camera semantics; never infer them from a camera name."""
+    value = FRIGATE_CAMERA_CONTEXTS.get(str(camera or "").strip())
+    return str(value).strip() if value else None
+
+
+def frigate_time_details(value: Any, retrieved: float | None = None) -> dict[str, Any] | None:
+    epoch = event_time(value)
+    if epoch is None:
+        return None
+    local = datetime.fromtimestamp(epoch, HOME_ZONE)
+    age = max(0.0, (retrieved if retrieved is not None else time.time()) - epoch)
+    if age < 10:
+        relative = "just now"
+    elif age < 60:
+        relative = f"about {round(age)} seconds ago"
+    elif age < 3600:
+        relative = f"about {round(age / 60)} minutes ago"
+    elif age < 86400:
+        relative = f"about {round(age / 3600, 1)} hours ago"
+    else:
+        relative = f"about {round(age / 86400, 1)} days ago"
+    return {
+        "unix": epoch,
+        "iso": local.isoformat(),
+        "display": local.strftime("%Y-%m-%d %I:%M:%S %p"),
+        "relative_time": relative,
+        "age_seconds": round(age, 1),
+    }
+
+
+def frigate_time_range(start_value: Any, end_value: Any, retrieved: float) -> dict[str, Any]:
+    start = frigate_time_details(start_value, retrieved)
+    end = frigate_time_details(end_value, retrieved) if end_value is not None else None
+    duration = None
+    if start and end:
+        duration = round(max(0.0, end["unix"] - start["unix"]), 3)
+    return {
+        "start": start,
+        "end": end,
+        "duration_seconds": duration,
+        "duration_is_final": bool(end),
+    }
 
 
 def safe_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -942,18 +1000,148 @@ async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
     events = []
     for x in rows[:50]:
         start = event_time(x.get("start_time"))
-        end = event_time(x.get("end_time"))
-        age = max(0, retrieved - start) if start is not None else None
         since = float(args["since"]) if args.get("since") is not None else None
         until = float(args["until"]) if args.get("until") is not None else None
         if start is not None and ((since is not None and start < since) or (until is not None and start > until)):
             continue
-        events.append({"id": x.get("id"), "camera": x.get("camera"), "label": x.get("label"),
-                       "start_time": x.get("start_time"), "end_time": x.get("end_time"),
-                       "age_seconds": round(age, 1) if age is not None else None,
-                       "active": end is None, "has_clip": x.get("has_clip"),
-                       "has_snapshot": x.get("has_snapshot")})
+        event_id = x.get("id")
+        review = None
+        if event_id:
+            try:
+                review = await get_json("frigate", f"/api/review/event/{event_id}")
+            except Exception:
+                review = None
+        review_data = (review or {}).get("data") if isinstance(review, dict) else {}
+        metadata = review_data.get("metadata") if isinstance(review_data, dict) else None
+        time_range = frigate_time_range(x.get("start_time"), x.get("end_time"), retrieved)
+        events.append({
+            "id": event_id,
+            "event_id": event_id,
+            "review_id": (review or {}).get("id") if isinstance(review, dict) else None,
+            "camera": x.get("camera"),
+            "camera_context": frigate_camera_context(x.get("camera")),
+            "label": x.get("label"),
+            "objects": review_data.get("objects", []) if isinstance(review_data, dict) else [],
+            "start_time": x.get("start_time"),
+            "end_time": x.get("end_time"),
+            "time": time_range,
+            # Kept for compatibility, but explicitly named as occurrence age.
+            "age_seconds": time_range["start"]["age_seconds"] if time_range["start"] else None,
+            "active": not time_range["duration_is_final"],
+            "has_clip": x.get("has_clip"),
+            "has_snapshot": x.get("has_snapshot"),
+            "genai": metadata if isinstance(metadata, dict) else None,
+        })
     return {"events": events, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat()}
+
+
+async def frigate_recent_activity(args: dict[str, Any]) -> dict[str, Any]:
+    """Return review-grouped activity with canonical event timing and evidence links."""
+    params = {"limit": min(int(args.get("limit", 10)), 50)}
+    if args.get("camera"):
+        params["camera"] = args["camera"]
+    if args.get("label"):
+        params["label"] = args["label"]
+    rows = await get_json("frigate", "/api/review", params)
+    retrieved = time.time()
+    since = float(args["since"]) if args.get("since") is not None else None
+    until = float(args["until"]) if args.get("until") is not None else None
+    reviews = []
+    for review in rows[:50] if isinstance(rows, list) else []:
+        start = event_time(review.get("start_time"))
+        if start is not None and ((since is not None and start < since) or (until is not None and start > until)):
+            continue
+        data = review.get("data") or {}
+        detection_ids = data.get("detections") if isinstance(data, dict) else []
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        reviews.append({
+            "review_id": review.get("id"),
+            "camera": review.get("camera"),
+            "camera_context": frigate_camera_context(review.get("camera")),
+            "objects": data.get("objects", []) if isinstance(data, dict) else [],
+            "event_ids": detection_ids[:20] if isinstance(detection_ids, list) else [],
+            "time": frigate_time_range(review.get("start_time"), review.get("end_time"), retrieved),
+            "genai": metadata if isinstance(metadata, dict) else None,
+            "has_visual_evidence": bool(detection_ids),
+        })
+    return {"reviews": reviews, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat(), "timezone": HOME_TIMEZONE}
+
+
+async def frigate_event_context(event_id: str, retrieved: float | None = None) -> dict[str, Any]:
+    """Read the event/review relationship without fetching visual bytes."""
+    retrieved = retrieved or time.time()
+    event = await get_json("frigate", f"/api/events/{event_id}")
+    review = None
+    try:
+        review = await get_json("frigate", f"/api/review/event/{event_id}")
+    except Exception:
+        review = None
+    review_data = (review or {}).get("data") if isinstance(review, dict) else {}
+    metadata = review_data.get("metadata") if isinstance(review_data, dict) else None
+    return {
+        "camera": event.get("camera"),
+        "camera_context": frigate_camera_context(event.get("camera")),
+        "label": event.get("label"),
+        "review_id": (review or {}).get("id") if isinstance(review, dict) else None,
+        "objects": review_data.get("objects", []) if isinstance(review_data, dict) else [],
+        "time": frigate_time_range(event.get("start_time"), event.get("end_time"), retrieved),
+        "genai": metadata if isinstance(metadata, dict) else None,
+        "has_clip": event.get("has_clip"),
+        "has_snapshot": event.get("has_snapshot"),
+    }
+
+
+async def frigate_activity_details(args: dict[str, Any]) -> dict[str, Any]:
+    """Return one review/event's bounded metadata and visual activity evidence."""
+    event_id = str(args.get("event_id", "")).strip()
+    review_id = str(args.get("review_id", "")).strip()
+    if event_id and not re.fullmatch(r"[A-Za-z0-9_.-]+", event_id):
+        return {"ok": False, "error": "event_id is invalid"}
+    if review_id and not re.fullmatch(r"[A-Za-z0-9_.-]+", review_id):
+        return {"ok": False, "error": "review_id is invalid"}
+    if not event_id and not review_id:
+        return {"ok": False, "error": "event_id or review_id is required"}
+    if event_id and not review_id:
+        mapping = await get_json("frigate", f"/api/review/event/{event_id}")
+        review_id = str(mapping.get("id") or mapping.get("review_id") or "")
+    if not review_id:
+        return {"ok": False, "error": "review could not be resolved"}
+    review = await get_json("frigate", f"/api/review/{review_id}")
+    data = review.get("data") or {}
+    event_ids = data.get("detections") if isinstance(data, dict) else []
+    event_ids = event_ids if isinstance(event_ids, list) else []
+    selected_event_id = event_id or (event_ids[0] if event_ids else None)
+    events = []
+    if selected_event_id:
+        # Reuse the normalized event contract for the selected event.
+        event = await get_json("frigate", f"/api/events/{selected_event_id}")
+        retrieved = time.time()
+        event_time_data = frigate_time_range(event.get("start_time"), event.get("end_time"), retrieved)
+        events.append({
+            "event_id": selected_event_id,
+            "camera": event.get("camera"),
+            "label": event.get("label"),
+            "camera_context": frigate_camera_context(event.get("camera")),
+            "time": event_time_data,
+            "has_clip": event.get("has_clip"),
+            "has_snapshot": event.get("has_snapshot"),
+        })
+    result = {
+        "ok": True,
+        "review_id": review_id,
+        "event_id": selected_event_id,
+        "event_ids": event_ids[:20],
+        "camera": review.get("camera"),
+        "camera_context": frigate_camera_context(review.get("camera")),
+        "objects": data.get("objects", []) if isinstance(data, dict) else [],
+        "time": frigate_time_range(review.get("start_time"), review.get("end_time"), time.time()),
+        "genai": data.get("metadata") if isinstance(data.get("metadata"), dict) else None,
+        "events": events,
+    }
+    if selected_event_id:
+        activity = await frigate_event_activity({"event_id": selected_event_id})
+        result.update({k: activity[k] for k in ("frames_base64", "frame_count", "evidence", "vision_ready") if k in activity})
+    return result
 
 
 async def frigate_event_activity(args: dict[str, Any]) -> dict[str, Any]:
@@ -984,8 +1172,9 @@ async def frigate_event_activity(args: dict[str, Any]) -> dict[str, Any]:
         if end < 0: break
         frames.append(base64.b64encode(out[start:end + 2]).decode("ascii"))
         cursor = end + 2
+    context = await frigate_event_context(event_id)
     return {"ok": True, "event_id": event_id, "frames_base64": frames,
-            "frame_count": len(frames), "evidence": "event_clip", "vision_ready": bool(frames)}
+            "frame_count": len(frames), "evidence": "event_clip", "vision_ready": bool(frames), **context}
 
 
 async def arr_missing(service: str, _: dict[str, Any]) -> dict[str, Any]:
@@ -2371,9 +2560,11 @@ REGISTRY = [
     ("frigate_status", "Check Frigate reachability and version.", "read", "frigate", {}, frigate_status),
     ("frigate_stats", "Get current Frigate camera and detector stats; this does not contain visual content.", "read", "frigate", {}, frigate_stats),
     ("frigate_recent_events", "Get recent or bounded historical Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_events),
+    ("frigate_recent_activity", "Get recent or bounded historical Frigate review activity with normalized timing, camera context, review IDs, and GenAI metadata when available.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_recent_activity),
     ("frigate_snapshot", "Get one current Frigate camera frame for an explicitly requested vision analysis.", "read", "frigate", {"camera": {"type": "string", "required": True}}, frigate_snapshot),
     ("frigate_event_snapshot", "Get the snapshot belonging to one specific Frigate event ID for grounded visual analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_snapshot),
     ("frigate_event_activity", "Extract up to four bounded representative frames from one Frigate event clip for activity analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_activity),
+    ("frigate_activity_details", "Get one exact Frigate review/event with normalized timing, camera context, GenAI metadata, and bounded representative activity frames.", "read", "frigate", {"review_id": {"type": "string"}, "event_id": {"type": "string"}}, frigate_activity_details),
     ("netdata_system_summary", "Get current Netdata host monitoring identity.", "read", "netdata", {}, netdata_summary),
     ("qbittorrent_summary", "Get current qBittorrent speeds, active downloads, stalls, and disk space.", "read", "qbittorrent", {}, qbittorrent_summary),
     ("qbittorrent_list", "List normalized qBittorrent items using a safe filter.", "read", "qbittorrent", {"filter": {"type": "string"}}, qbittorrent_list),
@@ -2428,9 +2619,11 @@ GROUP_SERVICES = {
 CAPABILITY_METADATA = {
     "frigate_stats": {"aliases": ["camera health", "camera status", "fps", "detector"], "examples": ["is my camera working", "is the front door camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
     "frigate_recent_events": {"aliases": ["motion", "person detected", "recent camera event", "historical camera activity", "camera alerts"], "examples": ["was someone at the door recently", "what happened at the front door earlier", "any alerts from the front camera"], "freshness": "current", "visual_evidence": False},
+    "frigate_recent_activity": {"aliases": ["recent activity", "what happened recently", "review activity", "historical camera activity"], "examples": ["what happened at the front door this morning", "did anything happen there recently"], "freshness": "historical", "visual_evidence": False},
     "frigate_snapshot": {"aliases": ["see camera", "what does it look like", "current image"], "examples": ["describe the front door right now"], "freshness": "current", "visual_evidence": True},
     "frigate_event_snapshot": {"aliases": ["event image", "detection image", "snapshot from that event"], "examples": ["describe the image from that detection"], "freshness": "event-scoped", "visual_evidence": True},
     "frigate_event_activity": {"aliases": ["event activity", "activity in that event", "event clip"], "examples": ["what was the person doing in that event", "what happened during that detection"], "freshness": "event-scoped", "visual_evidence": True},
+    "frigate_activity_details": {"aliases": ["event details", "what were they doing", "what did they look like", "what were they carrying"], "examples": ["what was that person doing", "what did they look like in that event"], "freshness": "event-scoped", "visual_evidence": True, "requires_referent": True},
     "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline", "current downloads"], "examples": ["what is downloading", "is anything stuck", "what is currently downloading"], "group": "downloads", "freshness": "current"},
     "investigate_media_pipeline": {"aliases": ["music pipeline", "missing media", "artist status"], "examples": ["what is going on with UTOPIA", "how is Travis Scott coming along"], "group": "media_pipeline", "freshness": "current"},
     "get_storage_status": {"aliases": ["disk space", "free space", "storage"], "examples": ["how much storage do I have left"], "freshness": "current"},
