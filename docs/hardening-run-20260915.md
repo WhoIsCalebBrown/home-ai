@@ -119,3 +119,10 @@ This journal records evidence and falsification attempts. Production media write
 - Final targeted real-audio validation passed for the corrected Docker/weather/server, media status, 10th Kingdom status, web correction, Frigate→web, and server follow-up conversations. Three concurrent isolated sessions also passed tool/session separation. Web responses are now guarded against claiming no web access after an actual search attempt.
 - Final Assistant runtime is owned image `ghcr.io/whoiscalebbrown/home-ai-assistant:sha-5227f9f`; Tools remains `ghcr.io/whoiscalebbrown/home-ai-tools:sha-3904414`; cli_debrid and all other third-party images are unchanged. Health is READY, Tools exposes 68 capabilities, the contract is 1.0, and Unraid runtime/template drift is empty.
 - Remaining evidence gap: the full post-final-deployment 101-turn corpus was not rerun after the last two focused fixes; the preceding full run had one remaining `stops` transcript failure, which was then fixed and passed in a real audio conversation. A full clean rerun remains P1 if additional runtime is available. Severe transcript collapse remains fail-closed rather than guessed, and production write execution remains excluded from autonomous QA.
+
+## 2026-09-15 post-final-deployment qualification update
+
+- The full post-`sha-5227f9f` real-audio corpus was rerun through the live Assistant WebSocket and existing Pocket-generated audio lane: 50 conversations, 101 audio turns, 0 harness errors, exit 0.
+- The disposable network-isolated qualification runner passed 141 tests. The conversation matrix passed 31 scenarios and 12 confirmation forms with no failures.
+- Read-only production smoke passed: Assistant/Tools health, 68-tool discovery, container status, media storage contract, Frigate status, and web/media discovery. Unraid runtime/template drift remained empty.
+- This closes the previously noted post-final audio-corpus evidence gap. It does not close the deliberate safety boundary around real media writes, nor the broader coverage gaps called out below: prolonged production soak, full fault-injection permutations, and complete TV/anime/music lifecycle voice coverage.
