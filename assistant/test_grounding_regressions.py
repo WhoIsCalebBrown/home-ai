@@ -3,10 +3,11 @@
 import ast
 import json
 import re
+import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -15,7 +16,7 @@ def is_needed_assignment(node):
 
 
 nodes = [node for node in tree.body if getattr(node, "name", None) in needed or is_needed_assignment(node)]
-namespace = {"json": json, "re": re}
+namespace = {"json": json, "re": re, "time": time}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "voice-api-app.py", "exec"), namespace)
 SOURCE_NAMES = namespace["SOURCE_NAMES"]
 evidence_supported_answer = namespace["evidence_supported_answer"]
@@ -38,6 +39,10 @@ repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
 complete_speakable_sentence = namespace["complete_speakable_sentence"]
 direct_structured_answer = namespace["direct_structured_answer"]
+current_external_question = namespace["current_external_question"]
+explicit_web_search_request = namespace["explicit_web_search_request"]
+historical_camera_question = namespace["historical_camera_question"]
+historical_camera_window = namespace["historical_camera_window"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -68,6 +73,33 @@ def test_camera_stats_cannot_ground_visual_claims():
 def test_current_external_questions_prefer_research():
     assert preflight_plan("What are Donald Trump's latest trade policies?") == [("web_search", {"query": "What are Donald Trump's latest trade policies?"})]
     assert preflight_plan("What's the newest version of Ollama?") == [("web_search", {"query": "What's the newest version of Ollama?"})]
+
+
+def test_politics_today_is_web_not_camera():
+    assert current_external_question("Can you give me a rundown of what happened today in American politics?")
+    assert preflight_plan("Can you give me a rundown of what happened today in American politics?") == [("web_search", {"query": "Can you give me a rundown of what happened today in American politics?"})]
+
+
+def test_explicit_web_search_retries_unresolved_topic():
+    conversation_context.clear()
+    turn_context("web", "What happened today in American politics?")
+    assert explicit_web_search_request("Can't you do a web search?")
+    context = turn_context("web", "Can't you do a web search?")
+    assert preflight_plan("Can't you do a web search?", context) == [("web_search", {"query": "What happened today in American politics?"})]
+
+
+def test_historical_camera_language_uses_bounded_events():
+    text = "A little over an hour ago, there were two camera events at the front door."
+    assert historical_camera_question(text)
+    plan = preflight_plan(text)
+    assert plan[0][0] == "frigate_recent_events"
+    assert plan[0][1]["camera"] == "front_door"
+    assert "since" in plan[0][1] and "until" in plan[0][1]
+
+
+def test_event_activity_followup_uses_event_id():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    assert preflight_plan("What were they doing?", context) == [("frigate_event_activity", {"event_id": "event-123"})]
 
 
 def test_recent_frigate_event_does_not_prove_current_presence():

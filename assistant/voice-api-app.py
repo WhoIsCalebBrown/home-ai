@@ -594,6 +594,10 @@ def visual_question(text: str) -> bool:
     return bool(re.search(r"\b(wearing|wear|shirt|hat|hoodie|clothes?|color|colour|look like|see|screenshot|snapshot|photo|image|describe)\b", text, re.I))
 
 
+def activity_question(text: str) -> bool:
+    return bool(re.search(r"\b(what were they doing|what did they do|what happened|activity| 행동|action)\b", text, re.I))
+
+
 def front_door_presence_question(text: str) -> bool:
     return bool(re.search(r"\b(front door|door)\b", text, re.I) and re.search(r"\b(anyone|someone|somebody|person|people|anything|there|now|motion|alert|alerts|detection|detected)\b", text, re.I))
 
@@ -604,12 +608,37 @@ def dynamic_fact_question(text: str) -> bool:
 
 def current_external_question(text: str) -> bool:
     fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this week|breaking|updated|update|release|version)\b"
-    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue)\b"
+    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?)\b"
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
     return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
             or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
             or bool(re.search(r"\bblack\s*hawk\b", text, re.I))
             or bool(re.search(external_story, text, re.I) and re.search(r"\b(toronto|canada|city|over|above|world|government|technology|ai)\b", text, re.I)))
+
+
+def explicit_web_search_request(text: str) -> bool:
+    return bool(re.search(r"\b(?:search|look)\b.{0,24}\b(?:web|online|internet)\b|\bweb\s+search\b", text, re.I))
+
+
+def historical_camera_question(text: str) -> bool:
+    return bool(
+        re.search(r"\b(?:ago|earlier|yesterday|last\s+(?:night|hour|evening)|this\s+(?:morning|afternoon)|at\s+\d|around\s+\d|about\s+\d|over\s+\d)\b", text, re.I)
+        and re.search(r"\b(?:camera|cameras|front\s+door|door|event|detection|detected|person|people|wearing|shirt|doing)\b", text, re.I)
+    )
+
+
+def historical_camera_window(text: str) -> tuple[float, float]:
+    """Return a conservative UTC epoch window for historical camera language."""
+    now_ts = time.time()
+    if re.search(r"\b(?:a\s+little\s+over|just\s+over|over)\s+an?\s+hour\b|\ban?\s+hour\s+ago\b", text, re.I):
+        return now_ts - 2 * 3600, now_ts - 45 * 60
+    if re.search(r"\b(?:about|around)\s+an?\s+hour\b", text, re.I):
+        return now_ts - 90 * 60, now_ts - 30 * 60
+    minutes = re.search(r"\b(\d+)\s+minutes?\s+ago\b", text, re.I)
+    if minutes:
+        center = int(minutes.group(1)) * 60
+        return now_ts - center - 15 * 60, now_ts - max(0, center - 15 * 60)
+    return now_ts - 24 * 3600, now_ts
 
 
 def unavailable_live_answer(text: str) -> str:
@@ -936,7 +965,7 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
         return "server"
     if re.search(r"\b(weather|forecast|temperature|rain|snow)\b", lowered):
         return "weather"
-    if re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|president|prime minister|trump|trade war|trade dispute)\b", lowered):
+    if explicit_web_search_request(text) or re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|political|government|congress|election|president|prime minister|trump|trade war|trade dispute)\b", lowered):
         return "web_research"
     if re.search(r"\b(lidarr|lidar|plexium|plex|sonarr|radarr|qbittorrent|slskd|torbox|music|album|artist|download|downloading|travis|utopia|media pipeline)\b", lowered):
         return "media"
@@ -964,7 +993,9 @@ def turn_context(client_id: str, text: str) -> dict:
         location = weather_location_from_text(text) or prior.get("location", "")
         current = {"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": location}
     elif domain == "web_research":
-        current = {"domain": "web_research", "kind": "web_research", "group": "internet", "tools": [], "topic": text}
+        topic = prior.get("unresolved_request") if explicit_web_search_request(text) and prior.get("unresolved_request") else text
+        current = {"domain": "web_research", "kind": "web_research", "group": "internet", "tools": [], "topic": topic,
+                   "unresolved_request": topic}
     elif domain == "media":
         current = {"domain": "media", "kind": "media", "group": "media", "tools": [], "entities": routing_aliases(text)}
     elif domain == "camera":
@@ -1008,6 +1039,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    # Explicit current external-information intent outranks inherited camera/media
+    # context and visual words such as "what happened".
+    if explicit_web_search_request(text) or current_external_question(text):
+        query = context.get("unresolved_request") if explicit_web_search_request(text) else text.strip()
+        return [("web_search", {"query": query or text.strip()})]
     list_match = re.search(r"\b(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     list_name = (list_match.group(0).rsplit(" ", 1)[0].casefold() if list_match else "grocery")
     if re.search(r"\b(?:what(?:'s| is)|show|read)\b.*\blist\b", text, re.I):
@@ -1022,6 +1058,13 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     remove_match = re.search(r"\b(?:remove|take)\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     if remove_match:
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
+    if historical_camera_question(text):
+        since, until = historical_camera_window(text)
+        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
+    if context.get("latest_event_id") and activity_question(text):
+        return [("frigate_event_activity", {"event_id": context["latest_event_id"]})]
+    if context.get("latest_event_id") and re.search(r"\b(?:yeah|yes|that's|that is|exactly|right)\b", t):
+        return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(event|detection|image|snapshot|that)\b", t) and visual_question(text):
         return [("frigate_event_snapshot", {"event_id": context["latest_event_id"]})]
     if context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t):
@@ -1071,9 +1114,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
             location = active_location
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
-    if current_external_question(text):
-        return [("web_search", {"query": text.strip()})]
-    if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events)\b", t):
+    if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events|politics?|government|congress)\b", t):
         return [("web_search", {"query": text.strip()})]
     if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:added|in plex|to plex)\b|\bwhat(?:'s| is) the last thing added\b", t):
         return [("plex_recently_added", {"limit": 1})]
@@ -1136,10 +1177,35 @@ def investigation_query_from_speech(text: str) -> str:
 
 def is_confirmation(text: str) -> bool:
     return bool(re.fullmatch(
-        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed))?|do it|go ahead|go for it|proceed)\s*[.!]?\s*",
+        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
         text,
         re.I,
     ))
+
+
+def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> None:
+    """Retain the exact planner-issued media binding for a later approval turn."""
+    if not result.get("confirmation_required"):
+        return
+    record = result.get("confirmation_record")
+    if not isinstance(record, dict):
+        return
+    arguments = dict(record.get("arguments") or {})
+    if not arguments.get("workflow_id") or not arguments.get("canonical_external_id"):
+        return
+    arguments["confirmation_context"] = record
+    arguments["session_id"] = request_id
+    pending[client_id] = {
+        "name": "media_standard_request" if record.get("operation", "").startswith("cli_debrid.") else "media_execute_goal",
+        "arguments": arguments,
+        "action_id": record.get("confirmation_id") or str(uuid.uuid4()),
+        "conversation_id": client_id,
+        "session_id": request_id,
+        "expires": time.time() + 120,
+        "workflow_id": record.get("workflow_id"),
+        "canonical_external_id": record.get("canonical_external_id"),
+        "plan_version_hash": record.get("plan_version_hash"),
+    }
 
 
 def visible_model_text(text: str) -> str:
@@ -1226,6 +1292,9 @@ def evidence_message(results: list[dict]) -> list[dict]:
     for item in results:
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         copy = dict(item)
+        if result.get("frames_base64"):
+            images.extend(result["frames_base64"][:4])
+            copy["result"] = {k: v for k, v in result.items() if k not in {"frames_base64", "image_base64"}}
         if result.get("image_base64"):
             images.append(result["image_base64"])
             copy["result"] = {k: v for k, v in result.items() if k != "image_base64"}
@@ -1234,7 +1303,7 @@ def evidence_message(results: list[dict]) -> list[dict]:
     if images:
         messages.append({
             "role": "user",
-            "content": "A current camera snapshot is attached. Describe only visual details actually visible in this image.",
+            "content": "Camera evidence is attached. For event_clip evidence, use the sequence to describe activity; for event snapshots, describe only visible details.",
             "images": images,
         })
     return messages
@@ -1260,8 +1329,9 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         if last.get("tool", "").startswith("frigate"):
             events = result.get("events") or []
             camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
-            selected = events[0] if events else {}
-            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else None, "latest_event_id": result.get("event_id") or selected.get("id"), "latest_event": selected or None}
+            selected = events[0] if events else (prior_state.get("latest_event") or {})
+            event_id = result.get("event_id") or selected.get("id") or prior_state.get("latest_event_id")
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else prior_state.get("subject"), "latest_event_id": event_id, "latest_event": selected or None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
             conversation_context[client_id] = {**prior_state, "domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
@@ -1328,8 +1398,9 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         location = candidate or (context.get("location") or "")
         offset = 1 if "tomorrow" in lowered else 0
         return f"weather in {location} {'tomorrow' if offset else 'today'}"
-    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour)\b", lowered):
-        return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
+    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):
+        verb = "analyze activity" if activity_question(text) else "describe the event image"
+        return f"{verb} for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
         explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr|blackhawk|flying|helicopter|toronto|heard|search|look into|technology|ai)\b", lowered)
         followup = re.search(r"\b(they|them|that|it|there|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find)\b", lowered)
@@ -1346,8 +1417,9 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"how many containers are {lowered}"
     if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):
         return "what movies are currently being acquired, queued, downloaded, or imported"
-    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour)\b", lowered):
-        return f"describe the event image for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
+    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):
+        verb = "analyze activity" if activity_question(text) else "describe the event image"
+        return f"{verb} for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     return text
 
 
@@ -1457,6 +1529,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         for name, planned_args in planned:
             args = planned_args
+            if name == "media_plan_goal" and isinstance(args, dict):
+                args = {**args, "session_id": request_id}
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             live_results.append(await invoke_tool(name, args, client_id, request_id))
@@ -1512,6 +1586,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 return
         direct = direct_structured_answer(user_text, live_results)
         if direct:
+            for item in live_results:
+                if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
+                    stage_media_confirmation(client_id, request_id, item.get("result") or {})
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_structured")

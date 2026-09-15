@@ -916,12 +916,48 @@ async def frigate_events(args: dict[str, Any]) -> dict[str, Any]:
         start = event_time(x.get("start_time"))
         end = event_time(x.get("end_time"))
         age = max(0, retrieved - start) if start is not None else None
+        since = float(args["since"]) if args.get("since") is not None else None
+        until = float(args["until"]) if args.get("until") is not None else None
+        if start is not None and ((since is not None and start < since) or (until is not None and start > until)):
+            continue
         events.append({"id": x.get("id"), "camera": x.get("camera"), "label": x.get("label"),
                        "start_time": x.get("start_time"), "end_time": x.get("end_time"),
                        "age_seconds": round(age, 1) if age is not None else None,
                        "active": end is None, "has_clip": x.get("has_clip"),
                        "has_snapshot": x.get("has_snapshot")})
     return {"events": events, "retrieved_at": datetime.fromtimestamp(retrieved, timezone.utc).isoformat()}
+
+
+async def frigate_event_activity(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only, bounded activity evidence from one Frigate event clip."""
+    event_id = str(args.get("event_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", event_id):
+        return {"ok": False, "error": "event_id is required"}
+    clip, content_type = await service_bytes("frigate", f"/api/events/{event_id}/clip.mp4")
+    if content_type not in {"video/mp4", "application/octet-stream"} or len(clip) > 80_000_000:
+        raise RuntimeError("Frigate event clip is unavailable or too large")
+    # Fixed, bounded extraction: at most four half-second-spaced representative
+    # frames, with no caller-controlled command, path, or duration.
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-vf", "fps=2,scale=960:-2", "-frames:v", "4", "-f", "image2pipe",
+        "-vcodec", "mjpeg", "pipe:1", stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(clip)
+    if proc.returncode != 0 or not out:
+        raise RuntimeError("Frigate event clip could not be decoded")
+    frames = []
+    cursor = 0
+    while len(frames) < 4:
+        start = out.find(b"\xff\xd8", cursor)
+        if start < 0: break
+        end = out.find(b"\xff\xd9", start + 2)
+        if end < 0: break
+        frames.append(base64.b64encode(out[start:end + 2]).decode("ascii"))
+        cursor = end + 2
+    return {"ok": True, "event_id": event_id, "frames_base64": frames,
+            "frame_count": len(frames), "evidence": "event_clip", "vision_ready": bool(frames)}
 
 
 async def arr_missing(service: str, _: dict[str, Any]) -> dict[str, Any]:
@@ -1714,13 +1750,13 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                   else {"workflow_id": workflow["workflow_id"], "plan_version": "read-only-dry-run",
                                         "canonical_identity": identity, "bounded_write_plan": plan.get("bounded_write_plan", [])})
         plan["confirmation_record"] = media_confirmation_record(
-            workflow_id=workflow["workflow_id"],
-            plan=confirmation_plan,
-            session_id=str(args.get("session_id") or "plan-only"),
-            operation=("cli_debrid.media_standard_request"
-                       if plan.get("mode") == "standard" and kind in {"movie", "tv", "anime"}
-                       else f"{plan['writes_required'][0].get('owner')}.media_execute_goal"),
-            arguments=confirmation_arguments,
+                workflow_id=workflow["workflow_id"],
+                plan=confirmation_plan,
+                session_id=str(args.get("session_id") or "plan-only"),
+                operation=("cli_debrid.media_standard_request"
+                           if plan.get("mode") == "standard" and kind in {"movie", "tv", "anime"}
+                           else f"{plan['writes_required'][0].get('owner')}.media_execute_goal"),
+                arguments=confirmation_arguments,
         )
         workflow.update({"plan_version_hash": plan["confirmation_record"]["plan_version_hash"],
                          "confirmation_id": plan["confirmation_record"]["confirmation_id"],
@@ -2074,9 +2110,10 @@ REGISTRY = [
     ("lidarr_missing_tracks", "Get Lidarr missing tracks.", "read", "lidarr", {}, lambda a: arr_missing("lidarr", a)),
     ("frigate_status", "Check Frigate reachability and version.", "read", "frigate", {}, frigate_status),
     ("frigate_stats", "Get current Frigate camera and detector stats; this does not contain visual content.", "read", "frigate", {}, frigate_stats),
-    ("frigate_recent_events", "Get recent Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}}, frigate_events),
+    ("frigate_recent_events", "Get recent or bounded historical Frigate object events.", "read", "frigate", {"camera": {"type": "string"}, "label": {"type": "string"}, "limit": {"type": "integer"}, "since": {"type": "number"}, "until": {"type": "number"}}, frigate_events),
     ("frigate_snapshot", "Get one current Frigate camera frame for an explicitly requested vision analysis.", "read", "frigate", {"camera": {"type": "string", "required": True}}, frigate_snapshot),
     ("frigate_event_snapshot", "Get the snapshot belonging to one specific Frigate event ID for grounded visual analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_snapshot),
+    ("frigate_event_activity", "Extract up to four bounded representative frames from one Frigate event clip for activity analysis.", "read", "frigate", {"event_id": {"type": "string", "required": True}}, frigate_event_activity),
     ("netdata_system_summary", "Get current Netdata host monitoring identity.", "read", "netdata", {}, netdata_summary),
     ("qbittorrent_summary", "Get current qBittorrent speeds, active downloads, stalls, and disk space.", "read", "qbittorrent", {}, qbittorrent_summary),
     ("qbittorrent_list", "List normalized qBittorrent items using a safe filter.", "read", "qbittorrent", {"filter": {"type": "string"}}, qbittorrent_list),
@@ -2104,7 +2141,7 @@ REGISTRY = [
     ("investigate_downloads", "Correlate qBittorrent, Sonarr, Radarr, Lidarr, Slskd, and Torbox download state.", "read", "media_pipeline", {}, investigate_downloads),
     ("investigate_media_pipeline", "Investigate an artist or music item across Plex Music, Lidarr, qBittorrent, Slskd, Torbox, Music Enricher, and Beets. Destination absence does not stop the investigation.", "read", "media_pipeline", {"query": {"type": "string", "required": True}, "entity_type": {"type": "string"}, "focus": {"type": "string"}}, investigate_media_pipeline),
     ("investigate_plex_missing", "Investigate why a requested show or episode is not visible in Plex using Plex, Sonarr, qBittorrent, and Docker status.", "read", "media_pipeline", {"query": {"type": "string", "required": True}}, investigate_plex_missing),
-    ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}}, media_plan_goal),
+    ("media_plan_goal", "Resolve a media goal into canonical identity, current library/manager state, bounded workflow steps, and any required confirmation. Planning only: never adds, searches, downloads, imports, or changes provider state.", "read", "media_planner", {"goal": {"type": "string", "required": True}, "media_type": {"type": "string"}, "session_id": {"type": "string"}}, media_plan_goal),
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_storage_status", "Show standard DB-library and permanent-library storage contracts without writing.", "read", "media_planner", {"media_type": {"type": "string"}}, media_storage_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
