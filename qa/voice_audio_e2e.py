@@ -602,8 +602,20 @@ def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set
             return "backend_read_failure_truthful"
     if not trace and re.search(r"did you mean|could you clarify|need more details|not sure", answer, re.I):
         return "safe_stt_recovery"
+    if "media_diagnose" in allowed_tools and not trace and re.search(
+        r"couldn't verify the current media status|no matching live workflow|haven't diagnosed|didn't diagnose|don't have a tracked request|no active request|can't tell you if it's stuck",
+        answer,
+        re.I,
+    ):
+        return "safe_no_workflow"
     if "media_status" in allowed_tools and not trace and re.search(r"couldn't verify the current media status|no matching live workflow", answer, re.I):
         return "safe_stt_recovery"
+    if "frigate_event_snapshot" in allowed_tools and not trace and re.search(
+        r"couldn't find a matching historical camera event|no matching historical camera event",
+        answer,
+        re.I,
+    ):
+        return "safe_no_historical_event"
     return None
 
 
