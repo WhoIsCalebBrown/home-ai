@@ -95,6 +95,23 @@ def test_staging_a_new_offer_replaces_the_previous_one_for_the_same_client():
     assert len(pending_offers) == 1  # never accumulates a second live offer for one client
 
 
+def test_staged_offer_arguments_match_the_target_tools_real_contract():
+    """A real bug found via qa/test_assistant_conversation_integration.py:
+    the offer's staged arguments must match whichever tool.tool_name it
+    names -- media_plan_goal takes `goal` (free text), media_status takes
+    `workflow_id`/`title`, everything else takes structured identity
+    fields. A single generic argument dict silently broke media_plan_goal
+    (it received no `goal` key and returned an empty plan)."""
+    pending_offers.clear()
+    stage_media_offer("client-6", _plan_result(current_state="IDENTIFIED"))
+    entry = pending_offers["client-6"]
+    if entry["offer"].operation == "media_plan_goal":
+        assert "goal" in entry["arguments"]
+        assert entry["arguments"]["goal"] == "Segua"
+    elif entry["offer"].operation in {"media_status", "media_diagnose"}:
+        assert "workflow_id" in entry["arguments"] or "title" in entry["arguments"]
+
+
 def test_no_write_state_ever_reaches_stage_media_offer_as_an_offer():
     """REQUEST_MEDIA/PLAN_MEDIA_REQUEST are the only write-shaped actions in
     the action catalog; stage_media_offer must never stage one as a

@@ -20,7 +20,7 @@ RUN apt-get update \
 WORKDIR /repo
 COPY assistant/requirements.txt /repo/assistant/requirements.txt
 RUN pip install --no-cache-dir -r /repo/assistant/requirements.txt \
-    && pip install --no-cache-dir pytest==8.3.5 pydantic==2.10.6
+    && pip install --no-cache-dir pytest==8.3.5 pydantic==2.10.6 pytest-asyncio==0.24.0
 
 COPY assistant /repo/assistant
 COPY tools /repo/tools

@@ -1786,6 +1786,58 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     conversation_context[client_id] = prior
 
 
+# Which argument key names the subject of a call to this tool. This is the
+# only place a tool name is associated with "what did this call try to
+# identify" -- adding a new identification-capable tool means adding one
+# entry here, not a new phrase-router branch. How the assistant learned
+# about the subject (this tool) is deliberately kept separate from what the
+# subject turns out to be (set below from the tool's *result*, when the
+# result carries a resolved title/canonical identity; the argument is only
+# the fallback when the result does not).
+_REFERENT_ARGUMENT_KEYS = {
+    "web_search": "query",
+    "web_fetch": "url",
+    "media_plan_goal": "goal",
+    "media_resolve": "title",
+    "media_status": "title",
+    "media_diagnose": "title",
+    "plex_search": "query",
+    "plex_match_canonical_media": "title",
+}
+
+
+def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result: dict) -> None:
+    """After any identification-capable tool call, keep the subject it was
+    asked about (or, if the result resolved a cleaner canonical title,
+    that) as this session's latest_resolved_referent -- regardless of which
+    tool answered it. This is the fix for the gap where a web_search result
+    never fed back into conversation_context: without this, "do I have it?"
+    after "can you find X online?" had no referent to resolve "it" against.
+    Never overwrites an established canonical_identity with a bare string;
+    only ever supplements latest_resolved_referent, which downstream
+    referent resolution already treats as lower-priority than
+    canonical_identity (see discovery_context() in semantic_routing.py).
+    """
+    argument_key = _REFERENT_ARGUMENT_KEYS.get(tool_name)
+    if not argument_key:
+        return
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    subject = None
+    if isinstance(payload, dict):
+        identity = payload.get("canonical_identity")
+        if isinstance(identity, dict) and identity.get("title"):
+            subject = identity["title"]
+    if not subject and isinstance(arguments, dict):
+        raw = arguments.get(argument_key)
+        if isinstance(raw, str) and raw.strip():
+            subject = raw.strip()
+    if not subject:
+        return
+    context = dict(conversation_context.get(client_id, {}))
+    context["latest_resolved_referent"] = subject
+    conversation_context[client_id] = context
+
+
 def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     """Compute the next-best read-only action for an identified-but-not-yet-
     actionable (or already-available) media plan, stage it as a PendingOffer,
@@ -1814,9 +1866,25 @@ def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     if action is None or action.side_effect != "read":
         return None
     offer = PendingOffer.create(session_id=client_id, subject_ref=subject.subject_id, operation=action.tool_name)
+    # Each read tool has its own real argument contract (see
+    # tools/server-tools-app.py): media_plan_goal takes a free-text `goal`,
+    # media_status/media_diagnose take a workflow_id or a title/query
+    # fallback, plex_match_canonical_media/media_resolve take structured
+    # identity fields. Building one generic argument dict here and handing
+    # it to whichever tool the offer names was wrong -- caught by
+    # qa/test_assistant_conversation_integration.py driving this through the
+    # real invoke_tool boundary, not by unit-testing this function alone.
+    workflow_id = plan_result.get("workflow_id")
+    title = identity.get("title") or "that"
+    if action.tool_name == "media_plan_goal":
+        offer_arguments: dict = {"goal": title, "media_type": identity.get("media_type")}
+    elif action.tool_name in {"media_status", "media_diagnose"}:
+        offer_arguments = {"workflow_id": workflow_id, "title": title, "media_type": identity.get("media_type")}
+    else:
+        offer_arguments = {"title": title, "canonical_identity": identity, "media_type": identity.get("media_type")}
     pending_offers[client_id] = {
         "offer": offer,
-        "arguments": {"title": identity.get("title"), "canonical_identity": identity, "media_type": identity.get("media_type")},
+        "arguments": offer_arguments,
         "description": action.description,
     }
     discovery_audit({"event": "offer_presented", "client_id": client_id, "offer_id": offer.offer_id,
@@ -2165,14 +2233,33 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         has_competing_intent = explicit_domain(user_text) is not None or media_goal_request(user_text)
         if reply_kind == "accept" and not has_competing_intent:
             pending_offers.pop(client_id, None)
+            offer_arguments = dict(offer_entry.get("arguments", {}))
+            # "Yeah, get it." both accepts the offer AND escalates it: the
+            # offer replays a read-only media_plan_goal call by design (its
+            # stored arguments never change from what was originally
+            # vetted), but a bare accept-plus-acquisition-verb utterance
+            # must not silently downgrade the user's actual request-shaped
+            # intent into a read-only replay just because it also matched
+            # the accept grammar. Only escalates the *action* the
+            # (still-authoritative, still server-side) media_plan_goal call
+            # resolves -- it does not skip straight to a write.
+            if offer.operation == "media_plan_goal" and media_acquisition_language(user_text):
+                offer_arguments["goal"] = f"get {offer_arguments.get('goal', '')}".strip()
             discovery_audit({"event": "offer_accepted", "client_id": client_id, "offer_id": offer.offer_id, "operation": offer.operation})
-            result = await invoke_tool(offer.operation, offer_entry.get("arguments", {}), client_id, request_id)
-            messages = [
-                {"role": "system", "content": SYSTEM},
-                {"role": "tool", "name": offer.operation, "content": json.dumps(result.get("result", {}), separators=(",", ":"))},
-                {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE},
-            ]
-            full = await generate_final(messages)
+            result = await invoke_tool(offer.operation, offer_arguments, client_id, request_id)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if offer.operation == "media_plan_goal" and plan_result:
+                stage_media_confirmation(client_id, request_id, plan_result)
+                full = direct_structured_answer(user_text, [{"tool": "media_plan_goal", "status": result.get("status"), "result": plan_result}])
+                if not full:
+                    full = "I couldn't confirm that without changing anything."
+            else:
+                messages = [
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "tool", "name": offer.operation, "content": json.dumps(result.get("result", {}), separators=(",", ":"))},
+                    {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE},
+                ]
+                full = await generate_final(messages)
             await emit_answer(ws, request_id, full, client_id=client_id, origin="offer_accepted")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -2495,12 +2582,29 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
+                    record_tool_referent(client_id, name, arguments, result)
         if live_results:
             post_direct = direct_structured_answer(user_text, live_results)
             if post_direct:
                 for item in live_results:
                     if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
-                        stage_media_confirmation(client_id, request_id, item.get("result") or {})
+                        plan_result = item.get("result") or {}
+                        stage_media_confirmation(client_id, request_id, plan_result)
+                        # media_plan_goal is almost always reached through
+                        # this Qwen tool-call loop, not the deterministic
+                        # preflight list (semantic_preflight_allowed only
+                        # allows calculator/unit_convert to bypass Qwen) --
+                        # stage_media_offer must run here too, not only in
+                        # the pre-loop media_plan_response branch, or a
+                        # PendingOffer is never actually created in a real
+                        # conversation. No-op when a write confirmation was
+                        # already staged above (plan_result carries
+                        # confirmation_required=True in that case, and
+                        # stage_media_offer only offers a *read* action).
+                        if not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                            offer_question = stage_media_offer(client_id, plan_result)
+                            if offer_question:
+                                post_direct = f"{post_direct} {offer_question}"
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")

@@ -46,6 +46,7 @@ real, unmodified production code.
 
 import importlib.util
 import json
+import re
 import sys
 import time
 import uuid
@@ -138,7 +139,13 @@ class FakeToolsBackend:
             entry = self.library.get(str(canonical_id))
             state = entry["state"] if entry else "IDENTIFIED"
             workflow_id = f"wf-{canonical_id}"
-            confirmation_required = state in {"IDENTIFIED", "ABSENT", "NOT_FOUND"} and state != "NOT_FOUND"
+            # Mirrors the real media_plan_goal: confirmation_required is only
+            # set when the parsed goal action is "ensure_available" (a
+            # request-shaped ask), never merely because the item is
+            # identified/absent -- "do I have it?" must not itself produce a
+            # write confirmation.
+            is_request_shaped = bool(re.search(r"\b(get|request|add|download|acquire)\b", goal, re.I))
+            confirmation_required = state != "AVAILABLE_IN_PLEX" and state != "NOT_FOUND" and is_request_shaped
             result = {"canonical_identity": identity, "current_state": state, "ambiguous": False,
                       "confirmation_required": confirmation_required, "workflow_id": workflow_id,
                       "writes_required": bool(confirmation_required)}
@@ -201,9 +208,37 @@ class _FakeOllamaResponse:
         return self._payload
 
 
+class _FakeStreamResponse:
+    def __init__(self, text: str):
+        self._text = text
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_lines(self):
+        yield json.dumps({"message": {"content": self._text}, "done": True})
+
+
+class _FakeStreamContext:
+    def __init__(self, text: str):
+        self._text = text
+
+    async def __aenter__(self):
+        return _FakeStreamResponse(self._text)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 class _FakeOllamaClient:
-    def __init__(self, script: list[dict]):
+    """Fakes the two shapes respond()/stream_final/generate_final use:
+    non-streaming `.post()` (tool-dispatch rounds and generate_final) served
+    from `script`, and the streaming `.stream()` context manager (final
+    synthesis) which always yields exactly `final_text`."""
+
+    def __init__(self, script: list[dict], final_text: str):
         self._script = script
+        self._final_text = final_text
 
     async def __aenter__(self):
         return self
@@ -217,15 +252,21 @@ class _FakeOllamaClient:
             return _FakeOllamaResponse(message)
         raise RuntimeError(f"OllamaFake received unexpected POST {url}")
 
+    def stream(self, method, url, json=None, **kwargs):
+        if "/api/chat" in url:
+            return _FakeStreamContext(self._final_text)
+        raise RuntimeError(f"OllamaFake received unexpected stream {method} {url}")
+
 
 class _FakeHttpxModule:
     """Rebinds only voice_api_app's own `httpx` name -- see module docstring."""
 
-    def __init__(self, script: list[dict]):
+    def __init__(self, script: list[dict], final_text: str = ""):
         self._script = script
+        self._final_text = final_text
 
     def AsyncClient(self, *args, **kwargs):
-        return _FakeOllamaClient(self._script)
+        return _FakeOllamaClient(self._script, self._final_text)
 
 
 @pytest.fixture
@@ -277,15 +318,193 @@ def session(app, backend):
             self.backend = backend
             self.app = app
 
-        async def turn(self, user_text: str, ollama_script: list[dict] | None = None) -> str:
+        async def turn(self, user_text: str, ollama_script: list[dict] | None = None, final_text: str = "") -> str:
             """Run one respond() turn with the fakes wired in, return the
-            final spoken/text answer for convenience."""
+            final spoken/text answer for convenience.
+
+            `ollama_script` scripts non-streaming dispatch-round responses
+            (each entry consumed by one tool-dispatch POST). `final_text` is
+            what the streaming final-synthesis call (stream_final) always
+            yields when a turn falls through to generic Qwen synthesis
+            rather than being answered by a deterministic branch."""
             request_id = str(uuid.uuid4())
             app.invoke_tool = invoke_tool_fake
             app.discover_tools = discover_tools_fake
-            app.httpx = _FakeHttpxModule(ollama_script if ollama_script is not None else [{"message": {"content": "", "tool_calls": []}}])
+            app.httpx = _FakeHttpxModule(ollama_script if ollama_script is not None else [{"message": {"content": "", "tool_calls": []}}], final_text)
             before = len(ws.sent)
             await app.respond(ws, client_id, request_id, user_text)
             return "\n".join(m["text"] for m in ws.sent[before:] if m.get("type") == "text")
 
     return Driver()
+
+
+# --- Scenario: discover -> offer -> accept -> cross-capability -> offer ->
+# explicit write intent -> strict confirmation -> fake write (spec #2, #24) --
+
+@pytest.mark.asyncio
+async def test_full_discover_offer_accept_write_conversation(session):
+    session.backend.seed_web("Cowboy Bebop", media_type="anime", tmdb_id="30991")
+
+    reply1 = await session.turn(
+        "Do you know Cowboy Bebop?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Cowboy Bebop"}}},
+        ]}}],
+        final_text="Cowboy Bebop is an anime series.",
+    )
+    assert "cowboy bebop" in reply1.casefold()
+
+    subject_before = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
+    assert subject_before and "cowboy bebop" in subject_before.casefold()
+
+    reply2 = await session.turn(
+        "Can you check Plex for Cowboy Bebop?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
+        ]}}],
+        final_text="It's not in Plex yet.",
+    )
+    assert session.client_id not in session.app.pending  # no write confirmation yet
+    assert not session.backend.submitted_writes
+
+    reply3 = await session.turn(
+        "Yeah, get it.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Cowboy Bebop"}}},
+        ]}}],
+    )
+    action = session.app.pending.get(session.client_id)
+    assert action is not None, "media_plan_goal's confirmation_required result must stage a real PendingConfirmation"
+    assert action["name"] in {"media_standard_request", "media_execute_goal"}
+    assert not session.backend.submitted_writes  # still no write -- confirmation only
+
+    reply4 = await session.turn("Go for it.")
+    assert len(session.backend.submitted_writes) == 1, "exactly one execution"
+    assert session.client_id not in session.app.pending  # single-use, consumed
+
+    reply5 = await session.turn("Go for it.")
+    assert len(session.backend.submitted_writes) == 1, "a stale/replayed confirmation must never submit twice"
+
+
+# --- Offer decline (#9) ------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_offer_decline_no_write_no_rediscovery(session):
+    session.backend.seed_library("Cowboy Bebop", media_type="anime", state="ABSENT", tmdb_id="30991")
+    await session.turn(
+        "Do I have Cowboy Bebop?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
+        ]}}, {"message": {"content": "Not yet.", "tool_calls": []}}],
+    )
+    session.app.pending_offers[session.client_id] = {
+        "offer": session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_status"),
+        "arguments": {"title": "Cowboy Bebop"}, "description": "check whether it's in Plex",
+    }
+    decline_reply = await session.turn("No.")
+    assert session.client_id not in session.app.pending_offers
+    assert session.client_id not in session.app.pending
+    assert not session.backend.submitted_writes
+    assert not any(name == "media_standard_request" for name, _ in session.backend.call_log)
+
+
+# --- Offer expiry (#10) -------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_offer_expiry_does_not_execute_stale_offer(session):
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_status", ttl_seconds=1)
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"title": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    # Force expiry deterministically rather than sleeping in a test.
+    object.__setattr__(offer, "expires_at", time.time() - 1)
+    await session.turn("Yeah.")
+    assert not any(name == "media_status" for name, _ in session.backend.call_log)
+    assert not session.backend.submitted_writes
+
+
+# --- Offer topic-switch (#8) --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_topic_switch_does_not_consume_offer(session):
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_status")
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"title": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    await session.turn(
+        "Actually what's the weather tomorrow?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {}}},
+        ]}}, {"message": {"content": "It'll be sunny.", "tool_calls": []}}],
+    )
+    assert not any(name == "media_status" for name, _ in session.backend.call_log)
+    # The offer is not required to survive a topic switch in this
+    # implementation (it is popped on any non-accept classification), but a
+    # write must never have happened, and the underlying subject must remain
+    # available in conversation_context for a later continuation.
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_accept_prefix_with_topic_switch_does_not_execute_offer(session):
+    """'Yeah, but first what's the weather tomorrow?' must not silently
+    perform the offered action (spec #8)."""
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="media_status")
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"title": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    await session.turn(
+        "Yeah, but first what's the weather tomorrow?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {}}},
+        ]}}, {"message": {"content": "It'll be sunny.", "tool_calls": []}}],
+    )
+    assert not any(name == "media_status" for name, _ in session.backend.call_log)
+    assert not session.backend.submitted_writes
+
+
+# --- Multiple subjects (#11) --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_explicit_subject_override_does_not_execute_stale_offer_for_other_subject(session):
+    dune_offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-dune", operation="media_status")
+    session.app.pending_offers[session.client_id] = {"offer": dune_offer, "arguments": {"title": "Dune"}, "description": "check whether Dune is in Plex"}
+    session.backend.seed_library("Cowboy Bebop", media_type="anime", state="ABSENT", tmdb_id="30991")
+    await session.turn(
+        "Check Cowboy Bebop instead.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
+        ]}}, {"message": {"content": "Checked Cowboy Bebop.", "tool_calls": []}}],
+    )
+    dune_calls = [args for name, args in session.backend.call_log if "dune" in json.dumps(args).casefold()]
+    assert not dune_calls, "the stale Dune offer must never execute just because 'yeah'-shaped routing ran"
+
+
+# --- Web -> Plex -> request (#12) ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_web_to_plex_to_request_same_subject(session):
+    session.backend.seed_web("Segua", media_type="tv", tvdb_id="999")
+    await session.turn(
+        "Can you find this show called Segua online?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Segua"}}},
+        ]}}, {"message": {"content": "Segua is a TV series.", "tool_calls": []}}],
+    )
+    referent = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
+    assert referent and "segua" in referent.casefold()
+
+    await session.turn(
+        "Do I have it?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Segua"}}},
+        ]}}, {"message": {"content": "Not yet.", "tool_calls": []}}],
+    )
+    plan_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
+    assert any("segua" in str(a.get("goal", "")).casefold() for a in plan_calls), "no repeated title required from the user, but the same subject must reach media_plan_goal"
+
+    await session.turn(
+        "No? Then get it.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
+        ]}}],
+    )
+    assert session.client_id in session.app.pending
+    assert not session.backend.submitted_writes
+
+    await session.turn("Go ahead.")
+    assert len(session.backend.submitted_writes) == 1
