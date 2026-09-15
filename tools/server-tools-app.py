@@ -1265,7 +1265,7 @@ MEDIA_CAPABILITY_REGISTRY = {
 MEDIA_LIFECYCLE = ["UNKNOWN", "IDENTIFIED", "ALREADY_AVAILABLE", "WANTED", "REQUESTED", "SEARCHING",
                    "CANDIDATE_FOUND", "QUEUED", "ACQUIRING", "DOWNLOADED", "PENDING_IMPORT", "IMPORTED",
                    "ENRICHING", "ACQUIRED_NOT_VISIBLE", "AVAILABLE_IN_PLEX", "NO_CANDIDATE", "FAILED",
-                   "FAILED_INGESTION", "BLOCKED", "NOT_FOUND"]
+                   "FAILED_INGESTION", "PARTIAL_STATUS", "BACKEND_UNAVAILABLE", "BLOCKED", "NOT_FOUND"]
 
 # Central, planner-owned policy.  Provider IDs and paths are never selected by
 # Qwen.  A null policy is intentional: planning must fail closed until the
@@ -1858,7 +1858,11 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
     rows = evidence.get("rows") or []
     raw_states = [str(item.get("state") or "") for item in rows]
     state_text = " ".join(raw_states).casefold()
-    if permanent.get("matched") and standard.get("matched"):
+    if evidence.get("error"):
+        # A persisted workflow is history, not proof of current provider state.
+        # Never turn a read failure into stale progress or availability.
+        canonical_state, storage_class = "PARTIAL_STATUS", "unknown"
+    elif permanent.get("matched") and standard.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "both"
     elif permanent.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "permanent_local"
@@ -1885,7 +1889,9 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         "mode": row.get("mode", "standard"), "canonical_state": canonical_state,
         "storage_class": storage_class, "raw_provider_states": raw_states,
         "cli_debrid": evidence, "plex": {"permanent": permanent, "standard": standard},
-        "source_workflow_state": row.get("current_state"), "last_checked": now(),
+        "source_workflow_state": row.get("current_state"),
+        "status_reason": "CLI_DEBRID_READ_FAILED" if evidence.get("error") else None,
+        "last_checked": now(),
     }
 
 

@@ -311,6 +311,25 @@ def test_media_status_does_not_report_blacklisted_item_as_requested(monkeypatch,
     assert result["canonical_state"] == "NO_CANDIDATE"
 
 
+def test_media_status_never_falls_back_to_stale_workflow_on_provider_read_failure(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module.MEDIA_WORKFLOWS_PATH.write_text(json.dumps([{
+        "workflow_id": "wf-stale", "media_type": "movie", "mode": "standard",
+        "current_state": "SEARCHING", "canonical_identity": {"title": "Example", "year": 2020, "tmdb_id": 123}
+    }]))
+    async def no_match(_): return {"matched": False, "candidates": []}
+    monkeypatch.setattr(module, "plex_match_canonical_media", no_match)
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
+        "matched": False, "rows": [], "error": "OperationalError"
+    })
+    result = asyncio.run(module.media_status({"workflow_id": "wf-stale"}))
+    assert result["canonical_state"] == "PARTIAL_STATUS"
+    assert result["status_reason"] == "CLI_DEBRID_READ_FAILED"
+    assert result["storage_class"] == "unknown"
+
+
 def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypatch, tmp_path):
     import asyncio
     module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
