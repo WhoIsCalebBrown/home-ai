@@ -612,8 +612,8 @@ def dynamic_fact_question(text: str) -> bool:
 
 
 def current_external_question(text: str) -> bool:
-    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this week|breaking|updated|update|release|version)\b"
-    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?)\b"
+    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this morning|this week|breaking|updated|update|release|version)\b"
+    subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?|world|event|events?|company|companies|business|stock|stocks?|nvidia|openai|microsoft|apple|google|tesla)\b"
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
     return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
             or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
@@ -1178,6 +1178,12 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     latest_media = context.get("latest_media_workflow") or {}
     if latest_media.get("workflow_id") and re.search(r"\b(?:how(?:'s| is)|status|progress|doing|find|found|ready|download|downloading|stuck|taking|plex|import|there yet)\b", t, re.I):
         return [("media_status", {"workflow_id": latest_media["workflow_id"]})]
+    # Explicit historical camera scope outranks generic freshness words such
+    # as "today" and "this morning". A public topic without camera nouns can
+    # still route to web search below.
+    if historical_camera_question(text):
+        since, until = historical_camera_window(text)
+        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):
@@ -1197,9 +1203,6 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     remove_match = re.search(r"\b(?:remove|take)\s+(.+?)\s+(?:from|off)\s+(?:my\s+)?(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     if remove_match:
         return [("remove_list_item", {"list": list_name, "item": remove_match.group(1).strip(" .?!")})]
-    if historical_camera_question(text):
-        since, until = historical_camera_window(text)
-        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
     if context.get("latest_event_id") and activity_question(text):
         return [("frigate_event_activity", {"event_id": context["latest_event_id"]})]
     if context.get("latest_event_id") and re.search(r"\b(?:yeah|yes|that's|that is|exactly|right)\b", t):
@@ -1211,7 +1214,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("list_containers", {"status": status})]
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", t):
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
-    # Semantic media goals are planned above the service layer.  This is
+    # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|how(?:'s| is)\s+.+\b(?:doing|going)|did it import|is it downloading|where is)\b", t)
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
