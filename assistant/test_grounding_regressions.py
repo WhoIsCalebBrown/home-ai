@@ -343,6 +343,20 @@ def test_plex_recency_repair_handles_dropped_opening_frame():
     assert preflight_plan("was new in Plex") == [("plex_recently_added", {"limit": 1})]
 
 
+def test_plex_recency_repair_handles_its_new_dropped_frame():
+    repaired = routing_aliases("it's new in Plex")
+    assert repaired == "what's new in Plex"
+    assert preflight_plan("it's new in Plex") == [("plex_recently_added", {"limit": 1})]
+
+
+def test_standalone_title_where_question_is_media_status_read():
+    assert media_title_status_signal("Where's Dumb and Dumber?")
+    assert preflight_plan("Where's Dumb and Dumber?") == [
+        ("media_status", {"query": "Where's Dumb and Dumber?"})
+    ]
+    assert not media_title_status_signal("Where is my package?")
+
+
 def test_active_frigate_event_can_ground_current_presence():
     result = {"events": [{"label": "person", "camera": "front_door", "age_seconds": 2, "active": True}]}
     assert grounded_camera_presence_answer(result) == "Yeah, someone's at the front door."

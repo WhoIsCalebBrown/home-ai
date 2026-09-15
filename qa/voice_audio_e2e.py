@@ -326,6 +326,188 @@ for _family, _first_turns, _second_turns in _GENERATED_CONVERSATION_FAMILIES:
             (_first, _first_tools), (_second, _second_tools)
         ]
 
+# Additional multi-turn families used for the long-form voice qualification
+# lane.  Every turn is read-only; these deliberately exercise context changes
+# and status/diagnostic boundaries rather than repeating one happy path.
+_ADVERSARIAL_CONVERSATION_FAMILIES = [
+    (
+        "media_diagnostics",
+        [
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("Is Dumb and Dumber ready yet?", {"media_status"}),
+            ("Where is The 10th Kingdom in the pipeline?", {"media_status"}),
+            ("Did Dumb and Dumber get found?", {"media_status"}),
+            ("What's the status of The Hobbit?", {"media_status"}),
+        ],
+        [
+            ("Why isn't it ready?", {"media_diagnose"}),
+            ("What's taking so long?", {"media_diagnose"}),
+            ("Can you diagnose that request?", {"media_diagnose"}),
+            ("Is it stuck?", {"media_diagnose"}),
+            ("Is it in Plex yet?", {"media_status"}),
+        ],
+    ),
+    (
+        "media_to_local",
+        [
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("Is Dumb and Dumber ready?", {"media_status"}),
+            ("What's happening with The 10th Kingdom?", {"media_status"}),
+            ("Did The Hobbit finish?", {"media_status"}),
+            ("Where is Dumb and Dumber?", {"media_status"}),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+        ],
+    ),
+    (
+        "local_to_media",
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+            ("What's happening at the front door right now?", {"frigate_snapshot"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+        ],
+        [
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("Is Dumb and Dumber ready?", {"media_status"}),
+            ("What is happening with The 10th Kingdom?", {"media_status"}),
+            ("Did The Hobbit get found?", {"media_status"}),
+            ("Where is Dumb and Dumber in the pipeline?", {"media_status"}),
+        ],
+    ),
+    (
+        "history_live_boundary",
+        [
+            ("What happened at the front door about an hour ago?", {"frigate_recent_events"}),
+            ("Show me recent front door events.", {"frigate_recent_events"}),
+            ("What did the camera record this morning?", {"frigate_recent_events"}),
+            ("Were there people at the front door recently?", {"frigate_recent_events"}),
+            ("What happened at the door earlier today?", {"frigate_recent_events"}),
+        ],
+        [
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("Is anyone there currently?", {"frigate_snapshot"}),
+            ("Can you show the live front door view?", {"frigate_snapshot"}),
+            ("What's happening outside now?", {"frigate_snapshot"}),
+            ("Who is at the door right now?", {"frigate_snapshot"}),
+        ],
+    ),
+    (
+        "web_local_boundary",
+        [
+            ("What happened today in American politics?", {"web_search", "web_fetch"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("Search the web for current SpaceX news.", {"web_search", "web_fetch"}),
+            ("What are today's major world events?", {"web_search", "web_fetch"}),
+            ("Look up current technology developments.", {"web_search", "web_fetch"}),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+        ],
+    ),
+    (
+        "weather_location_retention",
+        [
+            ("What's the weather in Welland today?", {"weather_forecast"}),
+            ("What are conditions in Welland?", {"weather_forecast"}),
+            ("Will it rain tomorrow?", {"weather_forecast"}),
+            ("How cold is it outside?", {"weather_forecast"}),
+            ("Give me the forecast for tomorrow.", {"weather_forecast"}),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("Is The Hobbit ready?", {"media_status"}),
+        ],
+    ),
+    (
+        "server_plex_boundary",
+        [
+            ("How many containers are running?", {"list_containers"}),
+            ("How many containers are stopped?", {"list_containers"}),
+            ("What Docker services are up?", {"list_containers"}),
+            ("What's the container total?", {"list_containers"}),
+            ("What is the server status?", {"list_containers", "get_server_overview"}),
+        ],
+        [
+            ("What's the last thing added to Plex?", {"plex_recently_added"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+            ("Which movie did Plex add last?", {"plex_recently_added"}),
+            ("How much storage do I have left?", {"get_storage_status"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+        ],
+    ),
+    (
+        "safe_delivery_contrast",
+        [
+            ("Send me the Dumb and Dumber movie file here.", set()),
+            ("Upload Dumb and Dumber into this chat.", set()),
+            ("Play the movie inside this conversation.", set()),
+            ("Stream Dumb and Dumber here.", set()),
+            ("Attach the video file.", set()),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("How many containers are running?", {"list_containers"}),
+        ],
+    ),
+    (
+        "referential_repair",
+        [
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("What happened today in American politics?", {"web_search", "web_fetch"}),
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+        ],
+        [
+            ("What about Dumb and Dumber?", {"media_status"}),
+            ("What's happening in American politics today?", {"web_search", "web_fetch"}),
+            ("Is anyone at the front door now?", {"frigate_snapshot"}),
+            ("How cold is it outside?", {"weather_forecast"}),
+            ("What about stopped?", {"list_containers"}),
+        ],
+    ),
+    (
+        "current_info_switch",
+        [
+            ("What's happening at the front door right now?", {"frigate_snapshot"}),
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How many containers are running?", {"list_containers"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+        ],
+        [
+            ("What's happening in American politics today?", {"web_search", "web_fetch"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("What happened today in Canada?", {"web_search", "web_fetch"}),
+            ("What's the latest news about technology?", {"web_search", "web_fetch"}),
+            ("Can you search the web for current AI news?", {"web_search", "web_fetch"}),
+        ],
+    ),
+]
+for _family, _first_turns, _second_turns in _ADVERSARIAL_CONVERSATION_FAMILIES:
+    for _index, (_first, _first_tools) in enumerate(_first_turns):
+        _second, _second_tools = _second_turns[_index]
+        READ_ONLY_CONVERSATIONS[f"adversarial_{_family}_{_index:02d}"] = [
+            (_first, _first_tools), (_second, _second_tools)
+        ]
+
 # Independent read-only voice variants. These are intentionally phrased as
 # different user requests rather than repeated invocations of one sentence.
 # The matrix is executed through the real audio lane; it never includes a

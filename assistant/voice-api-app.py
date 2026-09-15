@@ -977,6 +977,9 @@ def routing_aliases(text: str) -> str:
     # do not globally alias "was" or "new".
     if re.search(r"\bwas\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", text, re.I):
         text = re.sub(r"\bwas\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", "what's new in Plex", text, flags=re.I)
+    # The same dropped-question-frame failure can retain "it's new in Plex".
+    if re.search(r"\bit(?:'s|\s+is)\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", text, re.I):
+        text = re.sub(r"\bit(?:'s|\s+is)\s+new\s+(?:in|on)\s+(?:my\s+)?plex\b", "what's new in Plex", text, flags=re.I)
     # Bounded voice repair: Whisper can render "Plex edition" as "flex
     # edition" in a recency question. Require the full recency shape before
     # repairing; ordinary uses of "flex" remain untouched.
@@ -1169,6 +1172,8 @@ def media_status_question(text: str) -> bool:
     routed_text = routing_aliases(text)
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
+    if re.search(r"\bwhere(?:'s|\s+is)\b", routed_text, re.I) and media_title_status_signal(routed_text):
+        return True
     question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was)|i\s+was|can i)\b", routed_text, re.I)
     status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already)\b", routed_text, re.I)
     if question_frame and status_word:
@@ -1193,7 +1198,15 @@ def media_title_status_signal(text: str) -> bool:
         return True
     if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|watch|pipeline)\b", text, re.I):
         return True
-    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+(?:was|watch(?:ed)?)|(?:gotta|going\s+to)\s+watch)\s+", "", text, flags=re.I)
+    # A standalone "where's <title>?" is a read-only lifecycle question when
+    # the subject is title-shaped. Keep this bounded to multi-token subjects
+    # and reject common non-media/location nouns.
+    where_match = re.search(r"\bwhere(?:'s|\s+is)\s+(.+?)\s*[?.!]*$", text, re.I)
+    if where_match:
+        subject_tokens = re.findall(r"[a-z0-9]+", where_match.group(1).casefold())
+        blocked = {"my", "our", "your", "package", "car", "keys", "phone", "house", "home", "dog", "cat", "person", "server", "container", "camera", "door", "weather", "news"}
+        return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 2 and not (set(subject_tokens) & blocked)
+    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)(?:\s+(?:a|the))?|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+(?:was|watch(?:ed)?)|(?:gotta|going\s+to)\s+watch)\s+", "", text, flags=re.I)
     subject = re.split(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b", subject, maxsplit=1, flags=re.I)[0]
     tokens = re.findall(r"[a-z0-9]+", subject.casefold())
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
