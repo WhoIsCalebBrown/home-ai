@@ -214,6 +214,7 @@ def test_temperature_outside_routes_to_weather():
 
 def test_home_weather_can_use_configured_default():
     assert preflight_plan("What's the weather?") == [("weather_forecast", {"location": None, "days_from_now": 0})]
+    assert weather_location_from_text("Uh, could you check the weather for me?") is None
 
 
 def test_simple_structured_reads_bypass_synthesis_pass():

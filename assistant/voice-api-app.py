@@ -1026,8 +1026,9 @@ def weather_location_from_text(text: str) -> str | None:
             # commas, but discard the repeated question tail before routing.
             value = re.split(r",\s*(?:what|how|is|the)\b", value, maxsplit=1, flags=re.I)[0]
             value = re.split(r"\s+(?:what|how)\s+is\s+the\b", value, maxsplit=1, flags=re.I)[0]
+            value = re.sub(r"\s+(?:for|to)\s+(?:me|us|you)\b.*$", "", value, flags=re.I)
             value = value.strip(" ,.!?\t\r\n")
-            if value and value.casefold() not in {"one", "it", "that"}:
+            if value and value.casefold() not in {"one", "it", "that", "me", "us", "you"}:
                 return value
     return None
 
