@@ -2124,6 +2124,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         context["latest_resolved_request"] = context["resolved_request"]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if tools:
+            # Qwen3.5 can still emit a prose refusal when the long global
+            # contract and the structured request are both present, even
+            # with tool_choice=required.  Make the dispatch boundary explicit
+            # without selecting a capability in language-specific code.
+            messages.append({
+                "role": "system",
+                "content": "Dispatch now: call the best supplied live capability to answer the current request. Do not answer in prose before making that tool call.",
+            })
         for name, planned_args in planned:
             args = planned_args
             if name == "media_plan_goal" and isinstance(args, dict):
