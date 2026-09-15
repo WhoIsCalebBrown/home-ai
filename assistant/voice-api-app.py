@@ -62,6 +62,115 @@ pending: dict[str, dict] = {}
 # a `pending_offers[...]` entry. See respond()'s offer-handling block.
 pending_offers: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
+# conversation_context field contract (documentation-level, not a typed
+# migration -- see the final report for why a full dataclass rewrite of
+# every read/write site was judged out of scope for this pass). Keyed by
+# client_id; each field below is read via .get() by convention, so an
+# absent field is never distinguished from an explicitly-cleared one.
+#
+# domain / kind / group / tools / entities / camera / subject
+#   OWNER: turn_context() (explicit_domain's classification for THIS turn only)
+#   WRITERS: turn_context() only
+#   READERS: narrow_capability_entries() (via discovery_context's "group"),
+#     the confirmed-action branch in respond() (media_standard_request path)
+#   EXPIRY: none -- overwritten every turn turn_context() runs; never a
+#     sticky "last known domain" by design (explicit_domain intentionally
+#     omits prior domain from routing -- see its docstring)
+#   OVERRIDE RULE: the newest turn's explicit_domain() result always wins;
+#     no turn ever inherits a prior turn's domain as its own intent
+#   PERSISTENCE: in-process only, lost on restart (see RESTART/PERSISTENCE below)
+#
+# latest_resolved_referent
+#   OWNER: whichever mechanism most recently identified a subject
+#   WRITERS: turn_context()'s discovery_question() branch, record_tool_referent()
+#     (after web_search/media_plan_goal/media_resolve/media_status/
+#     media_diagnose/plex_search/plex_match_canonical_media/web_fetch calls)
+#   READERS: discovery_context() in semantic_routing.py (feeds bounded
+#     capability retrieval), underspecified_read_request() (referent-presence
+#     guard), stage_media_offer() indirectly via canonical_identity
+#   EXPIRY: none; persists until overwritten by a newer resolution
+#   OVERRIDE RULE: record_tool_referent() prefers a tool result's own
+#     canonical_identity.title over the raw call argument, but never
+#     downgrades an established value to a weaker one within one call
+#   PERSISTENCE: in-process only
+#   KNOWN GAP: no single explicit "recent_subjects" list exists -- only the
+#     single latest value. Multiple concurrently-live subjects (e.g. a
+#     multi-subject conversation) are not tracked as a set; see
+#     test_explicit_subject_switch_replaces_offer_without_executing_it for
+#     how offer-vs-subject-switch is handled without one.
+#
+# canonical_identity
+#   OWNER: whichever media_plan_goal/media_resolve call last set it
+#   WRITERS: stage_media_confirmation(), stage_media_offer() (read-only, does
+#     not write it back), the confirmed media_standard_request branch in respond()
+#   READERS: discovery_context(), turn_context()'s carry-forward loop
+#   EXPIRY: none; overwritten by the next resolution
+#   OVERRIDE RULE: never overwritten with a weaker/partial identity by
+#     record_tool_referent() (title-only fallback never replaces a dict
+#     already containing canonical IDs) -- see canonical_identity.py's merge()
+#     for the equivalent rule on the Tools side
+#   PERSISTENCE: in-process only
+#
+# latest_media_workflow (workflow_id, canonical_external_id, media_type,
+#     title, mode, execution_status, reason)
+#   OWNER: stage_media_confirmation() / the confirmed-action branch
+#   WRITERS: stage_media_confirmation(), the media_standard_request-confirmed
+#     branch in respond()
+#   READERS: the is_confirmation()-without-pending-action branch (checks
+#     execution_status to phrase a failure message), retained_media_status_repair()
+#   EXPIRY: none
+#   OVERRIDE RULE: newest confirmation/execution always replaces it
+#   PERSISTENCE: in-process only. KNOWN GAP: this is NOT the same as
+#     tools/server-tools-app.py's persisted JSON workflow row or
+#     workflow_events -- if the Assistant process restarts, this pointer is
+#     lost even though the Tools-side workflow and its event history survive
+#     (see RESTART/PERSISTENCE below).
+#
+# pending_offers[client_id] (offer, arguments, description)
+#   OWNER: stage_media_offer()
+#   WRITERS: stage_media_offer() only (always replaces, never appends --
+#     see test_staging_a_new_offer_replaces_the_previous_one_for_the_same_client)
+#   READERS: the offer-handling block in respond() (expiry check, accept/
+#     decline/ambiguous classification)
+#   EXPIRY: PendingOffer.expires_at (default 90s), checked before every use
+#   OVERRIDE RULE: a newer explicit intent (explicit_domain() match or
+#     media_acquisition_language()-bearing accept) outranks a stale offer;
+#     see test_topic_switch_does_not_consume_offer /
+#     test_explicit_subject_switch_replaces_offer_without_executing_it
+#   PERSISTENCE: in-process only, deliberately ephemeral (see below)
+#
+# pending[client_id] (PENDING_CONFIRMATION -- name, arguments, action_id,
+#     conversation_id, session_id, expires, workflow_id,
+#     canonical_external_id, plan_version_hash)
+#   OWNER: stage_media_confirmation() / the confirmation_required branch in
+#     the Qwen tool-dispatch loop
+#   WRITERS: same two sites only
+#   READERS: the is_confirmation()-with-action branch
+#   EXPIRY: 60-120s depending on staging site (see stage_media_confirmation)
+#   OVERRIDE RULE: single-use -- popped the instant a confirmation turn is
+#     processed, regardless of outcome
+#   PERSISTENCE: in-process only. The authoritative, durable version of this
+#     binding is tools/server-tools-app.py's workflow row
+#     (plan_version_hash/confirmation_id/confirmation_status), which is what
+#     actually enforces single-use server-side -- this in-process copy is a
+#     convenience for phrasing the next response, not a second source of truth.
+#
+# latest_assistant_response / latest_user_utterance / latest_tool_result /
+#     latest_spoken_response
+#   OWNER: emit_answer()/record_assistant_response(), respond()'s entry
+#   WRITERS: as named
+#   READERS: repeat_intent/rephrase_intent handling, provenance_question handling
+#   EXPIRY: none; single most-recent value
+#   PERSISTENCE: in-process only
+#
+# No explicit "latest_failed_interpretation" or "unresolved_web_topic" field
+# exists as such today -- the closest equivalents are "unresolved_request"/
+# "topic" (set by turn_context's web_research branch) and clarification
+# text returned directly by underspecified_read_request()/
+# disambiguate_subjects()-shaped responses, which are not themselves stored
+# back into conversation_context. KNOWN GAP, not fixed in this pass: a
+# genuinely distinct "the last thing we tried to resolve and could not"
+# field, separate from "the last thing we did resolve", does not exist.
 conversation_context: dict[str, dict] = {}
 tts_lock = asyncio.Lock()
 normalizer_lock = asyncio.Lock()
