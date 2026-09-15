@@ -1204,7 +1204,7 @@ def media_title_status_signal(text: str) -> bool:
     where_match = re.search(r"\bwhere(?:'s|\s+is)\s+(.+?)\s*[?.!]*$", text, re.I)
     if where_match:
         subject_tokens = re.findall(r"[a-z0-9]+", where_match.group(1).casefold())
-        blocked = {"my", "our", "your", "package", "car", "keys", "phone", "house", "home", "dog", "cat", "person", "server", "container", "camera", "door", "weather", "news"}
+        blocked = {"my", "our", "your", "package", "car", "keys", "phone", "house", "home", "dog", "cat", "person", "server", "container", "camera", "door", "weather", "news", "outside", "now", "currently"}
         return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 2 and not (set(subject_tokens) & blocked)
     subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)(?:\s+(?:a|the))?|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+(?:was|watch(?:ed)?)|(?:gotta|going\s+to)\s+watch)\s+", "", text, flags=re.I)
     subject = re.split(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b", subject, maxsplit=1, flags=re.I)[0]
@@ -1391,6 +1391,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
             and not re.search(r"\b(?:recent|recently|earlier|event|events|recorded)\b", t, re.I)
             and not historical_camera_question(text)):
         return [("frigate_snapshot", {"camera": "front_door"})]
+    # resolved_followup_text() makes an already-selected event explicit as
+    # "... for event <id>".  That event-scoped identity must outrank the
+    # broad historical-camera matcher below; otherwise a visual follow-up is
+    # re-run as a new event search and loses its evidence binding.
+    event_scope = re.search(r"\bfor\s+event\s+([A-Za-z0-9_.-]+)\b", text, re.I)
+    if context.get("latest_event_id") and event_scope:
+        event_id = context["latest_event_id"]
+        if activity_question(text):
+            return [("frigate_event_activity", {"event_id": event_id})]
+        return [("frigate_event_snapshot", {"event_id": event_id})]
     # Explicit historical camera scope outranks generic freshness words such
     # as "today" and "this morning". A public topic without camera nouns can
     # still route to web search below.

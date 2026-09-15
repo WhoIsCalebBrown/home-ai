@@ -598,7 +598,7 @@ def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set
             return "backend_read_failure_truthful"
     if not trace and re.search(r"did you mean|could you clarify|need more details|not sure", answer, re.I):
         return "safe_stt_recovery"
-    if not trace and re.search(r"couldn't verify the current media status|no matching live workflow", answer, re.I):
+    if "media_status" in allowed_tools and not trace and re.search(r"couldn't verify the current media status|no matching live workflow", answer, re.I):
         return "safe_stt_recovery"
     return None
 
@@ -662,7 +662,12 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
     """Run multiple real audio turns on one WebSocket/session context."""
     turns = READ_ONLY_CONVERSATIONS[name]
     results = []
-    async with websockets.connect("ws://127.0.0.1:8088/ws", max_size=20 * 1024 * 1024) as ws:
+    async with websockets.connect(
+        "ws://127.0.0.1:8088/ws",
+        max_size=20 * 1024 * 1024,
+        open_timeout=15,
+        close_timeout=5,
+    ) as ws:
         for index, (text, allowed_tools) in enumerate(turns):
             started = time.perf_counter()
             transcript = ""
@@ -676,10 +681,12 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
                     response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
                     response.raise_for_status()
                     wav = response.content
-                await ws.send(json.dumps({"type": "start", "client_id": client_id}))
-                await ws.recv()
-                await ws.send(wav)
-                await ws.send(json.dumps({"type": "audio_end"}))
+                await asyncio.wait_for(
+                    ws.send(json.dumps({"type": "start", "client_id": client_id})), timeout=10
+                )
+                await asyncio.wait_for(ws.recv(), timeout=15)
+                await asyncio.wait_for(ws.send(wav), timeout=15)
+                await asyncio.wait_for(ws.send(json.dumps({"type": "audio_end"})), timeout=10)
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
                     message = await asyncio.wait_for(ws.recv(), timeout=20)
@@ -719,13 +726,36 @@ async def main() -> int:
     parser.add_argument("--scenario", choices=[*sorted(READ_ONLY_SCENARIOS), "all"], default="containers")
     parser.add_argument("--conversation", choices=[*sorted(READ_ONLY_CONVERSATIONS), "all"])
     parser.add_argument("--client-id", default="qa-audio-e2e")
+    parser.add_argument(
+        "--conversation-timeout",
+        type=float,
+        default=240.0,
+        help="maximum seconds allowed for one multi-turn conversation",
+    )
     args = parser.parse_args()
     if args.conversation == "all":
         results = []
         for index, name in enumerate(sorted(READ_ONLY_CONVERSATIONS)):
-            turns = await run_conversation(name, f"{args.client_id}-{index}")
+            started = time.perf_counter()
+            try:
+                turns = await asyncio.wait_for(
+                    run_conversation(name, f"{args.client_id}-{index}"),
+                    timeout=args.conversation_timeout,
+                )
+            except asyncio.TimeoutError:
+                turns = [{
+                    "turn": 0,
+                    "source_text": "",
+                    "transcript": "",
+                    "answer": "",
+                    "tools": [],
+                    "audio_chunks": 0,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "error": "conversation timeout",
+                    "classification": "harness_timeout",
+                }]
             results.append({"conversation": name, "turns": turns})
-            print(json.dumps(results[-1], ensure_ascii=False, sort_keys=True))
+            print(json.dumps(results[-1], ensure_ascii=False, sort_keys=True), flush=True)
         return 1 if any(turn.get("error") for item in results for turn in item["turns"]) else 0
     if args.conversation:
         results = await run_conversation(args.conversation, args.client_id)

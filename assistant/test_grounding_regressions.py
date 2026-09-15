@@ -277,6 +277,13 @@ def test_event_activity_followup_uses_event_id():
     assert preflight_plan("What were they doing?", context) == [("frigate_event_activity", {"event_id": "event-123"})]
 
 
+def test_resolved_event_activity_followup_beats_historical_search():
+    context = {"domain": "camera", "group": "cameras", "latest_event_id": "event-123"}
+    assert preflight_plan("analyze activity for event event-123 from camera front_door", context) == [
+        ("frigate_event_activity", {"event_id": "event-123"})
+    ]
+
+
 def test_historical_camera_zero_results_never_fall_back_to_live_snapshot():
     assert preflight_plan("What were they wearing?", {"domain": "camera", "group": "cameras"}) == []
 
@@ -362,6 +369,10 @@ def test_title_status_turn_overrides_inherited_weather_domain():
     assert preflight_plan("That's the Hobbit ready.", {"domain": "weather"}) == [
         ("media_status", {"query": "That's the Hobbit ready."})
     ]
+
+
+def test_live_outside_now_does_not_look_like_media_title_status():
+    assert not media_title_status_signal("What's happening outside now?")
 
 
 def test_active_frigate_event_can_ground_current_presence():
