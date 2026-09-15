@@ -81,7 +81,7 @@ def test_disambiguate_requires_at_least_one_candidate():
 
 @pytest.mark.parametrize("text", [
     "yes", "yeah", "yep", "sure", "go ahead", "do it", "check it", "please",
-    "okay", "ok", "why not", "sure.", "yeah!",
+    "okay", "ok", "why not", "sure.", "yeah!", "get it", "get it.", "request it", "add it",
 ])
 def test_accept_language(text):
     assert classify_offer_reply(text) == "accept"

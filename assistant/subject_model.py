@@ -200,6 +200,13 @@ def disambiguate_subjects(candidates: list[ResolvedSubject]) -> ResolvedSubject 
 _ACCEPT_PHRASES = frozenset({
     "yes", "yeah", "yea", "yep", "yup", "sure", "go ahead", "do it", "check it",
     "please", "okay", "ok", "why not", "sounds good", "please do", "go for it",
+    # Parity with is_confirmation()'s strict grammar in voice-api-app.py,
+    # which already accepts these for PENDING_CONFIRMATION -- an offer
+    # reply classifier that disagreed with the confirmation classifier on
+    # ordinary acceptance language ("get it", "request it") would silently
+    # fall through as "ambiguous" and strand the offer. Found by
+    # qa/test_assistant_conversation_integration.py's music scenario.
+    "get it", "request it", "add it",
 })
 _DECLINE_PHRASES = frozenset({
     "no", "nope", "not now", "never mind", "nevermind", "hold on", "don't", "do not",
