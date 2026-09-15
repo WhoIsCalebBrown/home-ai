@@ -1088,7 +1088,15 @@ def weather_location_from_text(text: str) -> str | None:
             value = re.split(r"\s+(?:what|how)\s+is\s+the\b", value, maxsplit=1, flags=re.I)[0]
             value = re.sub(r"\s+(?:for|to)\s+(?:me|us|you)\b.*$", "", value, flags=re.I)
             value = value.strip(" ,.!?\t\r\n")
-            if value and value.casefold() not in {"one", "it", "that", "me", "us", "you"}:
+            # ASR can drop the opening frame and leave forms such as
+            # "for weather today".  ``weather`` is not a city; treating it as
+            # one poisons the retained location for subsequent turns.  The
+            # same applies to temporal/function words that are only request
+            # framing.  Fall back to the configured home location instead.
+            if value and value.casefold() not in {
+                "one", "it", "that", "me", "us", "you", "weather", "forecast",
+                "today", "tomorrow", "now", "right now", "outside",
+            }:
                 return value
     return None
 

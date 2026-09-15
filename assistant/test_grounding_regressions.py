@@ -363,6 +363,12 @@ def test_home_weather_can_use_configured_default():
     assert weather_location_from_text("Uh, could you check the weather for me?") is None
 
 
+def test_weather_asr_frame_does_not_become_a_location():
+    assert weather_location_from_text("for weather today") is None
+    assert weather_location_from_text("weather forecast for tomorrow") is None
+    assert preflight_plan("for weather today") == [("weather_forecast", {"location": None, "days_from_now": 0})]
+
+
 def test_simple_structured_reads_bypass_synthesis_pass():
     weather = {"source": "Open-Meteo", "days_from_now": 0, "temperature_unit": "C",
                "location": {"name": "Welland"}, "current": {"temperature_2m": 20, "weather_code": 0}}
