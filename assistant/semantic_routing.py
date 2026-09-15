@@ -17,6 +17,18 @@ REFERENTIAL_WORDS = frozenset(
 )
 
 
+# This is a capability-policy boundary, not a natural-language vocabulary.
+# Once the current turn has been resolved to a structured domain, unrelated
+# capabilities must not be offered to the small model as competing choices.
+_CAPABILITY_GROUP_ALIASES = {
+    "weather": frozenset({"weather"}),
+    "server": frozenset({"server", "docker", "system"}),
+    "internet": frozenset({"internet", "web", "knowledge"}),
+    "cameras": frozenset({"cameras", "frigate"}),
+    "media": frozenset({"media", "plex", "movies", "tv", "music", "downloads", "requests"}),
+}
+
+
 def _tokens(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.casefold()))
 
@@ -103,3 +115,28 @@ def semantic_preflight_allowed(tool_name: str) -> bool:
     model tool loop.
     """
     return tool_name in {"calculator", "unit_convert"}
+
+
+def narrow_capability_entries(
+    entries: list[dict[str, Any]],
+    context: dict[str, Any] | None,
+    max_results: int = 5,
+) -> list[dict[str, Any]]:
+    """Keep model-facing retrieval inside the current explicit capability group.
+
+    Semantic retrieval ranks candidates, but a small model should not have to
+    choose between weather, web, and Docker tools for one explicit weather
+    question.  The group is produced by the current-turn resolver; previous
+    domain/tool state is never consulted here.  If no structured group exists,
+    the retriever's ranking remains authoritative.
+    """
+    bounded = entries[:max_results]
+    group = (context or {}).get("group")
+    allowed = _CAPABILITY_GROUP_ALIASES.get(str(group), frozenset())
+    if not allowed:
+        return bounded
+    matching = [
+        entry for entry in entries
+        if str(entry.get("metadata", {}).get("group", "")).casefold() in allowed
+    ]
+    return (matching or bounded)[:max_results]

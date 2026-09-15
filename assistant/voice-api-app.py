@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 import yaml
-from semantic_routing import discovery_context, has_referential_language, retrieval_confidence, semantic_preflight_allowed, semantic_query
+from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_preflight_allowed, semantic_query
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -550,7 +550,7 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             payload = response.json()
             if str(payload.get("contract_version", "")) != TOOLS_CONTRACT_VERSION:
                 raise RuntimeError("incompatible tool contract")
-            entries = payload.get("tools", [])
+            entries = narrow_capability_entries(payload.get("tools", []), context, max_results=5)
             metadata = [item.get("metadata", {}) for item in entries]
             return [item["function"] for item in entries], metadata, round((time.perf_counter() - started) * 1000, 2)
     except Exception as exc:
@@ -1902,7 +1902,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     # These are referent resolutions, not new intent decisions. They are
     # narrowly scoped to an already-established object and never include the
     # generic discovery verbs that caused the weather regression.
-    if context.get("kind") == "weather" and re.search(r"\b(?:what about|how about|tomorrow|today)\b", lowered):
+    if context.get("kind") == "weather" and context.get("location") and re.search(r"\b(?:what about|how about|tomorrow|today)\b", lowered):
         explicit = re.search(r"\b(?:what|how) about\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
         candidate = explicit.group(1).strip(" .!?\t\r\n") if explicit else ""
         location = candidate if candidate.casefold() not in {"today", "tomorrow", "now"} else ""
