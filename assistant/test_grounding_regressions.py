@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -43,6 +43,9 @@ current_external_question = namespace["current_external_question"]
 explicit_web_search_request = namespace["explicit_web_search_request"]
 historical_camera_question = namespace["historical_camera_question"]
 historical_camera_window = namespace["historical_camera_window"]
+direct_file_request = namespace["direct_file_request"]
+playback_request = namespace["playback_request"]
+media_goal_request = namespace["media_goal_request"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -56,6 +59,31 @@ def test_lidar_alias_resolves_to_canonical_lidarr():
 
 def test_confirmation_target_is_canonical_in_plan():
     assert preflight_plan("Restart Lidarr") == [("restart_container", {"name": "lidarr"})]
+
+
+def test_natural_media_acquisition_language_resolves_to_planner():
+    variants = [
+        "Get me Dumb and Dumber from 1994.",
+        "Give me Dumb and Dumber from 1994.",
+        "Grab me Dumb and Dumber from 1994.",
+        "Can you add Dumb and Dumber from 1994?",
+        "Put Dumb and Dumber from 1994 on Plex.",
+        "I want Dumb and Dumber from 1994.",
+        "Find Dumb and Dumber from 1994 for me.",
+    ]
+    for text in variants:
+        assert media_goal_request(text)
+        assert explicit_domain(text) == "media"
+        assert preflight_plan(text) == [("media_plan_goal", {"goal": text})]
+
+
+def test_direct_file_and_playback_requests_do_not_become_acquisition():
+    assert direct_file_request("Send me the Dumb and Dumber movie file here.")
+    assert direct_file_request("Upload Dumb and Dumber into this chat.")
+    assert not media_goal_request("Send me the Dumb and Dumber movie file here.")
+    assert not media_goal_request("Upload Dumb and Dumber into this chat.")
+    assert playback_request("Play Dumb and Dumber.")
+    assert not media_goal_request("Play Dumb and Dumber.")
 
 
 def test_visual_claim_without_image_is_rejected():

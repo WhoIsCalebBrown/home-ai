@@ -950,6 +950,47 @@ def explicit_topic(text: str) -> bool:
     )
 
 
+def direct_file_request(text: str) -> bool:
+    """Recognize a request to transfer a media file, not add media to a library."""
+    return bool(
+        re.search(r"\b(?:send|upload|attach|share)\b", text, re.I)
+        and re.search(r"\b(?:file|video|movie|film|show|episode|chat|here|upload)\b", text, re.I)
+    ) or bool(re.search(r"\b(?:movie|video|film)\s+file\b", text, re.I))
+
+
+def playback_request(text: str) -> bool:
+    """Keep playback/control language distinct from library acquisition."""
+    if direct_file_request(text):
+        return False
+    return bool(re.search(r"\b(?:play|stream)\b", text, re.I))
+
+
+def media_identity_signal(text: str) -> bool:
+    """Detect a media identity without requiring a particular title vocabulary."""
+    return bool(
+        re.search(r"\b(?:movie|film|show|series|season|episode|album|music|anime|plex)\b", text, re.I)
+        or re.search(r"(?:\b(?:from|in)\s+|\()(?:(?:19|20)\d{2})\)?\b", text, re.I)
+    )
+
+
+def media_acquisition_language(text: str) -> bool:
+    """Recognize natural goal language used to make media available."""
+    return bool(
+        re.search(r"\b(?:get|give|grab|add|find|request|want|obtain)\b", text, re.I)
+        or re.search(r"\b(?:put|add)\b.{0,60}\bon\s+(?:my\s+)?plex\b", text, re.I)
+    )
+
+
+def media_goal_request(text: str) -> bool:
+    """True only for library-goal language, never direct file delivery/playback."""
+    return (
+        media_acquisition_language(text)
+        and media_identity_signal(text)
+        and not direct_file_request(text)
+        and not playback_request(text)
+    )
+
+
 def social_acknowledgement(text: str) -> bool:
     return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks)[.!]?\s*", text, re.I))
 
@@ -965,6 +1006,8 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
         return "server"
     if re.search(r"\b(weather|forecast|temperature|rain|snow)\b", lowered):
         return "weather"
+    if media_goal_request(text) or (media_identity_signal(text) and (direct_file_request(text) or playback_request(text))):
+        return "media"
     if explicit_web_search_request(text) or re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|political|government|congress|election|president|prime minister|trump|trade war|trade dispute)\b", lowered):
         return "web_research"
     if re.search(r"\b(lidarr|lidar|plexium|plex|sonarr|radarr|qbittorrent|slskd|torbox|music|album|artist|download|downloading|travis|utopia|media pipeline)\b", lowered):
@@ -1039,6 +1082,14 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    if direct_file_request(text) or playback_request(text):
+        return []
+    # A named media identity plus acquisition language is a semantic media goal,
+    # even when the title is not in a fixed vocabulary (for example, "give me
+    # Dumb and Dumber from 1994").  Direct file delivery and playback are kept
+    # out of this path by media_goal_request().
+    if media_goal_request(text):
+        return [("media_plan_goal", {"goal": text})]
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):
@@ -1074,7 +1125,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
     # Semantic media goals are planned above the service layer.  This is
     # intentionally read/plan-only: it does not add or search anything.
-    media_goal = re.search(r"\b(get|find|add|request|do i have|is it in plex|how(?:'s| is)\s+.+\b(?:doing|going)|did it import|is it downloading|where is)\b", t)
+    media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|how(?:'s| is)\s+.+\b(?:doing|going)|did it import|is it downloading|where is)\b", t)
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
     if media_goal and media_nouns:
         return [("media_plan_goal", {"goal": text})]
@@ -1450,6 +1501,22 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         else:
             full = "I don't have a previous answer to rephrase."
         await emit_answer(ws, request_id, full, client_id=client_id, origin="rephrase")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    # Do not let a direct file-transfer or playback request enter the media
+    # acquisition planner.  Library-goal language is handled deterministically
+    # later; these are separate capabilities and must remain unsupported unless
+    # an explicit bounded capability exists.
+    if direct_file_request(user_text):
+        full = "I can't send or upload a movie file in this chat, but I can help make it available in your media library."
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="direct_file_unsupported")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    if playback_request(user_text):
+        full = "I can't play a movie inside this chat, but I can help make it available in your media library."
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="playback_unsupported")
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
