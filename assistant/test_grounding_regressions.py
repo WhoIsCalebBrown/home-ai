@@ -106,6 +106,13 @@ def test_not_found_media_status_retains_domain_for_next_title_followup():
     assert preflight_plan("What about Dumb and Dumber?", state) == [("media_status", {"query": "What about Dumb and Dumber?"})]
 
 
+def test_explicit_container_domain_beats_repair_inheritance():
+    conversation_context["repair-domain"] = {"domain": "weather", "group": "internet", "last_route_text": "weather today"}
+    state = turn_context("repair-domain", "I mean, containers are stopped.")
+    assert state["domain"] == "server"
+    assert preflight_plan("I mean, containers are stopped.", state) == [("list_containers", {"status": "exited"})]
+
+
 def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Send me the Dumb and Dumber movie file here.")
     assert direct_file_request("Upload Dumb and Dumber into this chat.")

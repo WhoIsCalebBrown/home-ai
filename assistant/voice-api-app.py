@@ -1203,7 +1203,7 @@ def turn_context(client_id: str, text: str) -> dict:
     domain = explicit_domain(text, prior)
     # A correction without a new action is a patch to the immediately preceding
     # resolved request. Do not let the corrected service name create a new intent.
-    if repair and not re.search(r"\b(?:weather|news|camera|front door|gpu|storage|download|restart|turn|dim)\b", lowered):
+    if repair and not re.search(r"\b(?:weather|news|camera|front door|gpu|storage|download|restart|turn|dim|docker|containers?|services?|server|media|movie|show|album|plex|lidarr|sonarr|radarr)\b", lowered):
         current = dict(prior)
         current["repair"] = True
         current["repair_text"] = text
@@ -1371,7 +1371,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         if re.search(r"\b(gpu|gpus|vram)\b", t):
             plan.append(("get_gpu_status", {}))
         if re.search(r"\b(container|containers|docker|service|services)\b", t) or (context.get("referent_type") == "containers" and re.search(r"\b(running|stopped|exited|paused|restarting|dead)\b", t)):
-            status = next((value for value in ("running", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t)), None)
+            status = next((value for value in ("running", "stopped", "paused", "restarting", "dead", "exited") if re.search(rf"\b{value}\b", t)), None)
+            if status == "stopped":
+                status = "exited"
             plan.append(("list_containers", {"status": status} if status else {}))
         if plan:
             return plan
