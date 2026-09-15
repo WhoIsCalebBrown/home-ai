@@ -1763,6 +1763,14 @@ def resolved_followup_text(client_id: str, text: str) -> str:
     return text
 
 
+def ambiguous_container_status_followup(text: str, context: dict) -> bool:
+    """Detect a likely ASR collision without converting it into a write."""
+    if context.get("referent_type") != "containers":
+        return False
+    lowered = text.casefold().strip(" .?!")
+    return bool(re.fullmatch(r"(?:what|how) about start", lowered))
+
+
 async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str) -> None:
     history = sessions.setdefault(client_id, [])
     history.append({"role": "user", "content": user_text})
@@ -1806,6 +1814,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if playback_request(user_text):
         full = "I can't play a movie inside this chat, but I can help make it available in your media library."
         await emit_answer(ws, request_id, full, client_id=client_id, origin="playback_unsupported")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    # Do not let an ASR collision between "stopped" and "start" silently
+    # become a container-management action. A bare follow-up is ambiguous.
+    if ambiguous_container_status_followup(user_text, conversation_context.get(client_id, {})):
+        full = "Did you mean the stopped containers, or are you asking to start one?"
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="ambiguous_container_status")
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
