@@ -941,6 +941,14 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
     started = time.perf_counter()
+    if name == "weather_forecast" and isinstance(arguments, dict):
+        # The model sometimes fills an optional location with a placeholder.
+        # It must mean the configured home location, not a literal place named
+        # "current location".  Keep this normalization at the typed tool
+        # boundary; it is not a language-domain routing rule.
+        location = str(arguments.get("location") or "").strip().casefold()
+        if location in {"current location", "my location", "home location", "the home location", "here", "at home"}:
+            arguments = {**arguments, "location": None}
     discovery_audit({"event": "tool_call", "client_id": client_id, "request_id": request_id, "tool": name, "arguments": {k: v for k, v in arguments.items() if not any(secret in k.casefold() for secret in ("key", "token", "password", "secret"))}})
     try:
         async with httpx.AsyncClient(timeout=15) as http:
