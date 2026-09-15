@@ -1165,8 +1165,7 @@ STANDARD_FORBIDDEN_PATHS = {"/data/media/movies", "/data/media/tv", "/data/media
 
 
 def media_storage_policy_for(media_type: str) -> dict[str, Any]:
-    key = "tv" if media_type == "anime" else media_type
-    return dict(MEDIA_STORAGE_POLICY.get(key, {}))
+    return dict(MEDIA_STORAGE_POLICY.get(media_type, {}))
 
 
 def _validate_standard_storage_contract(media_type: str, payload: dict[str, Any]) -> tuple[bool, str]:
