@@ -166,6 +166,68 @@ READ_ONLY_CONVERSATIONS = {
     ],
 }
 
+# Independent read-only voice variants. These are intentionally phrased as
+# different user requests rather than repeated invocations of one sentence.
+# The matrix is executed through the real audio lane; it never includes a
+# write-capable tool.
+READ_ONLY_VARIANTS = [
+    ("How many Docker containers are up?", {"list_containers"}),
+    ("Tell me the running container count.", {"list_containers"}),
+    ("Are any containers stopped?", {"list_containers"}),
+    ("Which containers are currently running?", {"list_containers"}),
+    ("Can you report the Docker service status?", {"list_containers"}),
+    ("What's the weather like in Welland today?", {"weather_forecast"}),
+    ("Give me tomorrow's forecast.", {"weather_forecast"}),
+    ("Will it rain tomorrow?", {"weather_forecast"}),
+    ("How cold is it outside today?", {"weather_forecast"}),
+    ("What are the conditions in Welland right now?", {"weather_forecast"}),
+    ("What's new in Plex?", {"plex_recently_added"}),
+    ("Show me the latest Plex addition.", {"plex_recently_added"}),
+    ("What was most recently added to my library?", {"plex_recently_added"}),
+    ("Which movie did Plex add last?", {"plex_recently_added"}),
+    ("Tell me the newest item in Plex.", {"plex_recently_added"}),
+    ("How much room is left on storage?", {"get_storage_status"}),
+    ("How much disk space is free?", {"get_storage_status"}),
+    ("Do I have enough storage left?", {"get_storage_status"}),
+    ("What is the free space on the server?", {"get_storage_status"}),
+    ("How much space remains in cache?", {"get_storage_status"}),
+    ("Is The Hobbit ready in Plex?", {"media_status"}),
+    ("Did The Hobbit finish?", {"media_status"}),
+    ("Is Dumb and Dumber ready?", {"media_status"}),
+    ("Did Dumb and Dumber get found?", {"media_status"}),
+    ("What is happening with The 10th Kingdom?", {"media_status"}),
+    ("Is The 10th Kingdom ready yet?", {"media_status"}),
+    ("What's the status of The Hobbit?", {"media_status"}),
+    ("Has Dumb and Dumber downloaded?", {"media_status"}),
+    ("Can I watch The Hobbit now?", {"media_status"}),
+    ("Where is Dumb and Dumber in the pipeline?", {"media_status"}),
+    ("Search the web for today's politics.", {"web_search", "web_fetch"}),
+    ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+    ("What's happening in technology today?", {"web_search", "web_fetch"}),
+    ("Look up current news about SpaceX.", {"web_search", "web_fetch"}),
+    ("Can you find recent developments in American politics?", {"web_search", "web_fetch"}),
+    ("Search online for the latest Nvidia developments.", {"web_search", "web_fetch"}),
+    ("What are today's major world events?", {"web_search", "web_fetch"}),
+    ("Find current news about artificial intelligence.", {"web_search", "web_fetch"}),
+    ("What's at the front door right now?", {"frigate_snapshot"}),
+    ("Is anyone at the door currently?", {"frigate_snapshot"}),
+    ("Can you check the front door camera now?", {"frigate_snapshot"}),
+    ("What happened at the front door this morning?", {"frigate_recent_events"}),
+    ("Show me recent front door events.", {"frigate_recent_events"}),
+    ("Were there any people at the front door recently?", {"frigate_recent_events"}),
+    ("What did the front door camera record today?", {"frigate_recent_events"}),
+    ("Send the movie file into this chat.", set()),
+    ("Upload Dumb and Dumber here.", set()),
+    ("Can you attach the video file?", set()),
+    ("Play the movie inside this conversation.", set()),
+]
+for _index, (_text, _tools) in enumerate(READ_ONLY_VARIANTS):
+    READ_ONLY_SCENARIOS[f"variant_{_index:03d}"] = {
+        "text": _text,
+        "allowed_tools": _tools,
+        "require_tool": bool(_tools),
+    }
+
 
 @dataclass
 class AudioResult:

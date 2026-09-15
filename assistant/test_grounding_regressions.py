@@ -105,6 +105,24 @@ def test_media_status_questions_use_live_status_capability():
     assert preflight_plan("I was Dumb and Dumber doing") == [("media_status", {"query": "I was Dumb and Dumber doing"})]
 
 
+def test_generic_media_and_local_status_variants_route_deterministically():
+    assert preflight_plan("What's new in Plex?") == [("plex_recently_added", {"limit": 1})]
+    assert preflight_plan("Show me the latest Plex addition.") == [("plex_recently_added", {"limit": 1})]
+    assert preflight_plan("Which movie did Plex add last?") == [("plex_recently_added", {"limit": 1})]
+    assert preflight_plan("How cold is it outside today?") == [("weather_forecast", {"location": None, "days_from_now": 0})]
+    assert preflight_plan("I have enough stores left.") == [("get_storage_status", {})]
+    assert preflight_plan("What is happening with The 10th Kingdom?") == [
+        ("media_status", {"query": "What is happening with The 10th Kingdom?"})
+    ]
+    assert preflight_plan("Where's Dumb and Dumber in the pipeline?") == [
+        ("media_status", {"query": "Where's Dumb and Dumber in the pipeline?"})
+    ]
+
+
+def test_recent_front_door_events_are_local_history_not_web():
+    assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_events"
+
+
 def test_media_status_does_not_turn_acquisition_language_into_status():
     assert preflight_plan("Get Dumb and Dumber from 1994.") == [("media_plan_goal", {"goal": "Get Dumb and Dumber from 1994."})]
 

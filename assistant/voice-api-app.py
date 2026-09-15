@@ -1090,10 +1090,10 @@ def media_status_question(text: str) -> bool:
     # Keep backend-pipeline investigations on their existing route.  This
     # predicate is for a concrete media item's lifecycle, not questions such
     # as "Is anything in Lidarr going to Plex?".
-    if re.search(r"\b(?:anything|pipeline|lidarr|sonarr|radarr)\b", text, re.I):
+    if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", text, re.I):
         return False
-    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where is|what(?:'s| is)|i\s+was)\b", text, re.I)
-                and re.search(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in plex|import(?:ed)?|there yet|status|progress)\b", text, re.I))
+    return bool(re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is)|i\s+was|can i)\b", text, re.I)
+                and re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch|pipeline)\b", text, re.I))
 
 
 def media_nouns_for_status(text: str) -> bool:
@@ -1104,10 +1104,12 @@ def media_title_status_signal(text: str) -> bool:
     """Recognize a likely title in a status frame when STT drops the title's type word."""
     if re.search(r"\b(?:weather|politics?|news|camera|front\s+door|container|docker|gpu|storage|server|service|process|disk)\b", text, re.I):
         return False
-    if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet)\b", text, re.I):
+    if re.search(r"\b(?:happening|going\s+on)\s+with\s+(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}[a-z0-9]+\b", text, re.I):
         return True
-    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where\s+is|what(?:'s|\s+is)|i\s+was)\s+", "", text, flags=re.I)
-    subject = re.split(r"\b(?:doing|ready|found|find|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet|status|progress)\b", subject, maxsplit=1, flags=re.I)[0]
+    if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|watch|pipeline)\b", text, re.I):
+        return True
+    subject = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|that(?:'s|\s+is)|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+was)\s+", "", text, flags=re.I)
+    subject = re.split(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b", subject, maxsplit=1, flags=re.I)[0]
     tokens = re.findall(r"[a-z0-9]+", subject.casefold())
     return len([token for token in tokens if token not in {"the", "a", "an", "it", "that", "this"}]) >= 2
 
@@ -1115,8 +1117,8 @@ def media_title_status_signal(text: str) -> bool:
 def media_status_display_title(result: dict, user_text: str) -> str:
     """Extract a short human title for a truthful not-found status response."""
     query = str(result.get("query") or user_text).strip(" .?!")
-    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|has|did|where\s+is|what(?:'s|\s+is)|i\s+was)\s+", "", query, flags=re.I)
-    query = re.sub(r"\s+(?:doing|going|ready|found|find|download(?:ing|ed)?|stuck|taking|in\s+plex|import(?:ed)?|there\s+yet|status|progress)\b.*$", "", query, flags=re.I)
+    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+was)\s+", "", query, flags=re.I)
+    query = re.sub(r"\s+(?:doing|going|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b.*$", "", query, flags=re.I)
     return query.strip(" .?!") or "that media"
 
 
@@ -1133,7 +1135,7 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     # "see".  "What containers can you see?" is a Docker question, not a camera query.
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu)\b", lowered):
         return "server"
-    if re.search(r"\b(weather|forecast|temperature|rain|snow)\b", lowered):
+    if re.search(r"\b(weather|forecast|temperature|rain|snow|cold|hot|warm)\b", lowered):
         return "weather"
     if media_goal_request(text) or (media_identity_signal(text) and (direct_file_request(text) or playback_request(text))):
         return "media"
@@ -1213,6 +1215,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return deterministic
     if direct_file_request(text) or playback_request(text):
         return []
+    # Library recency questions contain the verb "add" but are read-only
+    # Plex queries, not acquisition goals. Resolve them before the broad
+    # acquisition-language matcher.
+    if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
+        return [("plex_recently_added", {"limit": 1})]
     # A named media identity plus acquisition language is a semantic media goal,
     # even when the title is not in a fixed vocabulary (for example, "give me
     # Dumb and Dumber from 1994").  Direct file delivery and playback are kept
@@ -1254,6 +1261,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # snapshot/activity read is only safe when latest_event_id is present.
     if context.get("group") == "cameras" and not context.get("latest_event_id") and visual_question(text):
         return []
+    # Explicit front-door/camera scope outranks the generic freshness matcher.
+    # "Recent front door events" is local Frigate history, not public web news.
+    if re.search(r"\b(front\s+door|camera|frigate)\b", t) and re.search(r"\b(recent|recently|today|earlier|event|events|happened|recorded)\b", t, re.I):
+        since, until = historical_camera_window(text)
+        return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
     # Explicit current external-information intent outranks inherited camera/media
     # context and visual words such as "what happened".
     if explicit_web_search_request(text) or current_external_question(text):
@@ -1287,6 +1299,10 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("list_containers", {"status": status})]
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", t):
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
+    # Plex recency is a concrete library read and must outrank the generic
+    # media-status matcher (for example, "What's new in Plex?").
+    if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
+        return [("plex_recently_added", {"limit": 1})]
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
@@ -1314,7 +1330,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         if re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t):
             service = re.search(r"\b(sonarr|radarr|plex|frigate|ollama|piper|whisper|kokoro)\b", t).group(1)
             return [("restart_container", {"name": service})]
-    if re.search(r"\b(weather|temperature|forecast|high|low|rain|precipitation|snow|humidity|conditions?)\b", t):
+    if re.search(r"\b(weather|temperature|forecast|high|low|rain|precipitation|snow|humidity|conditions?|cold|hot|warm)\b", t):
         # A noisy follow-up may mention only a province/region.  Preserve the
         # immediately active weather location rather than letting geocoding
         # choose an unrelated homonym (for example Ontario, California).
@@ -1333,7 +1349,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events|politics?|government|congress)\b", t):
         return [("web_search", {"query": text.strip()})]
-    if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:added|in plex|to plex)\b|\bwhat(?:'s| is) the last thing added\b", t):
+    if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
         return [("plex_recently_added", {"limit": 1})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(plex|plexium|added|adding|going|coming|download|music)\b", t):
         if re.search(r"\b(looking|wanted|missing|searching|needs|need)\b", t):
@@ -1363,7 +1379,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if re.search(r"\b(travis|utopia|album|artist|music|import|quarantine|processed|my eyes)\b", t):
         return [("investigate_media_pipeline", {"entity_type": "auto", "query": investigation_query_from_speech(text)})]
     plan = []
-    if re.search(r"\b(storage|space|room|free|disk|cache|terabytes|gigabytes)\b", t): plan.append(("get_storage_status", {}))
+    if re.search(r"\b(storage|stores?|space|room|free|disk|cache|terabytes|gigabytes)\b", t): plan.append(("get_storage_status", {}))
     if re.search(r"\b(gpu|vram|3070|1660|graphics|video card)\b", t): plan.append(("get_gpu_status", {}))
     if re.search(r"\b(container|containers|docker|service|services|server health)\b", t): plan.append(("list_containers", {}))
     if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t): plan.append(("plex_library_counts" if re.search(r"\bhow many|counts?|libraries\b", t) else "plex_search", {"query": plex_query_from_speech(text)} if not re.search(r"\bhow many|counts?|libraries\b", t) else {}))
