@@ -126,6 +126,23 @@ provenance: dict[str, dict] = {}
 #     lost even though the Tools-side workflow and its event history survive
 #     (see RESTART/PERSISTENCE below).
 #
+# pending_disambiguation (candidates, original_goal, created_at)
+#   OWNER: stage_disambiguation()
+#   WRITERS: stage_disambiguation() (both the pre-loop media_plan_response
+#     and post-loop direct_structured_answer call sites, whenever a
+#     media_plan_goal result reports ambiguous=True with candidates); the
+#     disambiguation-resolution branch in respond() clears it on a resolved
+#     reply, and on expiry
+#   READERS: the disambiguation-resolution branch in respond() only
+#   EXPIRY: _DISAMBIGUATION_TTL_SECONDS (90s), checked before every use
+#   OVERRIDE RULE: a genuinely different explicit domain (not "media" --
+#     see the branch's own comment for why "media" itself never counts as
+#     competing here) outranks a stale disambiguation prompt; an
+#     unrecognized/non-distinguishing reply re-asks rather than guessing
+#     and does NOT clear the entry
+#   PERSISTENCE: in-process only, deliberately ephemeral, same as
+#     pending_offers
+#
 # pending_offers[client_id] (offer, arguments, description)
 #   OWNER: stage_media_offer()
 #   WRITERS: stage_media_offer() only (always replaces, never appends --
