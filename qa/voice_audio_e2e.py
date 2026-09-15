@@ -62,6 +62,22 @@ READ_ONLY_SCENARIOS = {
     },
 }
 
+READ_ONLY_CONVERSATIONS = {
+    "server_followup": [
+        ("How many containers are running?", {"list_containers"}),
+        ("What about stopped?", {"list_containers"}),
+    ],
+    "web_correction": [
+        ("What happened today in American politics?", {"web_search", "web_fetch"}),
+        ("Can you search the web for that?", {"web_search", "web_fetch"}),
+    ],
+    "camera_history": [
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
+        ("What were they wearing?", {"frigate_event_snapshot", "frigate_event_activity"}),
+        ("What's at the front door right now?", {"frigate_snapshot"}),
+    ],
+}
+
 
 @dataclass
 class AudioResult:
@@ -127,11 +143,60 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
     return result
 
 
+async def run_conversation(name: str, client_id: str) -> list[dict]:
+    """Run multiple real audio turns on one WebSocket/session context."""
+    turns = READ_ONLY_CONVERSATIONS[name]
+    results = []
+    async with websockets.connect("ws://127.0.0.1:8088/ws", max_size=20 * 1024 * 1024) as ws:
+        for index, (text, allowed_tools) in enumerate(turns):
+            started = time.perf_counter()
+            async with httpx.AsyncClient(timeout=60) as http:
+                response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
+                response.raise_for_status()
+                wav = response.content
+            await ws.send(json.dumps({"type": "start", "client_id": client_id}))
+            await ws.recv()
+            await ws.send(wav)
+            await ws.send(json.dumps({"type": "audio_end"}))
+            transcript = ""
+            answer = ""
+            traces = []
+            chunks = 0
+            error = None
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                message = await asyncio.wait_for(ws.recv(), timeout=15)
+                if isinstance(message, bytes):
+                    chunks += 1
+                    continue
+                payload = json.loads(message)
+                kind = payload.get("type")
+                if kind == "transcript": transcript = payload.get("text", "")
+                elif kind == "text": answer = payload.get("text", "")
+                elif kind == "trace": traces = payload.get("tools") or []
+                elif kind == "audio_chunk": chunks += 1
+                elif kind == "error": error = payload.get("error") or payload.get("message")
+                elif kind == "done": break
+            selected = {item.get("tool") for item in traces if item.get("status") == "ok"}
+            unexpected = selected - allowed_tools
+            if unexpected: error = f"unexpected tool selection: {sorted(unexpected)}"
+            results.append({"turn": index + 1, "source_text": text, "transcript": transcript,
+                            "answer": answer, "tools": traces, "audio_chunks": chunks,
+                            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                            "error": error})
+    return results
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", choices=[*sorted(READ_ONLY_SCENARIOS), "all"], default="containers")
+    parser.add_argument("--conversation", choices=sorted(READ_ONLY_CONVERSATIONS))
     parser.add_argument("--client-id", default="qa-audio-e2e")
     args = parser.parse_args()
+    if args.conversation:
+        results = await run_conversation(args.conversation, args.client_id)
+        print(json.dumps({"conversation": args.conversation, "turns": results}, ensure_ascii=False, sort_keys=True))
+        return 1 if any(turn.get("error") for turn in results) else 0
     names = sorted(READ_ONLY_SCENARIOS) if args.scenario == "all" else [args.scenario]
     results = []
     for index, name in enumerate(names):
