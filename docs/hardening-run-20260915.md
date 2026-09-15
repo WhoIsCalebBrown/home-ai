@@ -142,3 +142,8 @@ This journal records evidence and falsification attempts. Production media write
 - Tools was deployed as `sha-0c2e2df`. An initial manual recreation omitted the existing explicit `server-tools` network alias because the template's `ExtraParams` was not copied into the ad-hoc `docker run`; Assistant DNS failed while Tools itself remained healthy. The container was immediately recreated with `--network-alias server-tools`. The persistent Unraid template already contains `<ExtraParams>--network-alias=server-tools</ExtraParams>` and was backed up before deployment.
 - Final recovery evidence: Assistant-to-Tools DNS resolves, Tools health reports 68 capabilities, contract validation passes, drift is empty, and the read-only production smoke lane passes. No third-party service or media state was changed.
 - Contract/drift audit then found the machine-readable image pins were stale and the drift detector trusted the template alias text without inspecting the live network. The contract now pins Assistant `sha-45581dd` and Tools `sha-0c2e2df`; `qa/unraid_drift_report.py` now verifies both template and runtime `server-tools` DNS names. Live validation and CI run `34964961697` passed.
+
+## 2026-09-15 live inventory enrichment
+
+- `qa/live_inventory.py` now records image IDs, RepoDigests, creation metadata, architecture/OS, labels, restart policy, health, mounts, network aliases/DNS names, and environment-key names without exposing values or secrets.
+- The live inventory covers 48 containers. The first-party provenance report found 40 digest-backed images and 8 owner-review gaps: Faster-Whisper, LifeOS app/demo images, Music Enricher, and NMPZ app workers. This is an audit queue only; no image was changed or removed.
