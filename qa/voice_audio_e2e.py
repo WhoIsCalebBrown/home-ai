@@ -60,6 +60,18 @@ READ_ONLY_SCENARIOS = {
         "text": "What's happening at the front door right now?",
         "allowed_tools": {"frigate_snapshot"},
     },
+    "direct_file": {
+        "text": "Send me the Dumb and Dumber movie file here.",
+        "allowed_tools": set(),
+    },
+    "containers_filler": {
+        "text": "Uh, can you tell me how many containers are running?",
+        "allowed_tools": {"list_containers"},
+    },
+    "containers_restart": {
+        "text": "Can you— how many containers are running?",
+        "allowed_tools": {"list_containers"},
+    },
 }
 
 READ_ONLY_CONVERSATIONS = {
