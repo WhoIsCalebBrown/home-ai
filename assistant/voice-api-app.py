@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_preflight_allowed, semantic_query
+from subject_model import PendingOffer, ResolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -50,6 +51,16 @@ DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/disco
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
+# PENDING_OFFER is a distinct, deliberately weaker concept from `pending`
+# above (PENDING_CONFIRMATION). `pending` entries are session/workflow/
+# plan-hash/args-hash/TTL-bound write authorizations validated server-side
+# by Home-AI-Tools; `pending_offers` entries are lightweight, read-only
+# conversational continuations built from subject_model.PendingOffer, which
+# structurally cannot hold side_effect="write" (see subject_model.py). A
+# PendingOffer is never passed to invoke_tool's `confirmed=True` path, and no
+# code in this file constructs a `pending[...]` write-confirmation entry from
+# a `pending_offers[...]` entry. See respond()'s offer-handling block.
+pending_offers: dict[str, dict] = {}
 provenance: dict[str, dict] = {}
 conversation_context: dict[str, dict] = {}
 tts_lock = asyncio.Lock()
@@ -1711,6 +1722,44 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     conversation_context[client_id] = prior
 
 
+def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
+    """Compute the next-best read-only action for an identified-but-not-yet-
+    actionable (or already-available) media plan, stage it as a PendingOffer,
+    and return the natural-language question to append to the response.
+
+    This never stages an offer for a plan that already carries a write
+    confirmation (media_plan_response's own guard already keeps this
+    function from being called in that case -- see its call site) and never
+    creates more than one offer at a time for a client: staging a new offer
+    always replaces any previous one for this client_id, so "yes" can never
+    become ambiguous between two live offers (spec section 33).
+    """
+    identity = plan_result.get("canonical_identity") or {}
+    if not identity:
+        return None
+    subject = ResolvedSubject.new(
+        "media",
+        identity.get("title") or "that",
+        canonical_identity=build_canonical_identity(**identity),
+        confidence="high",
+        discovery_source="media_plan_goal",
+    )
+    state = str(plan_result.get("current_state") or "UNKNOWN")
+    actions = available_actions(subject, state)
+    action = next_best_action(actions)
+    if action is None or action.side_effect != "read":
+        return None
+    offer = PendingOffer.create(session_id=client_id, subject_ref=subject.subject_id, operation=action.tool_name)
+    pending_offers[client_id] = {
+        "offer": offer,
+        "arguments": {"title": identity.get("title"), "canonical_identity": identity, "media_type": identity.get("media_type")},
+        "description": action.description,
+    }
+    discovery_audit({"event": "offer_presented", "client_id": client_id, "offer_id": offer.offer_id,
+                      "operation": offer.operation, "subject": identity.get("title")})
+    return f"Want me to {action.description}?"
+
+
 def visible_model_text(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.I | re.S)
     text = re.sub(r"</?think>", "", text, flags=re.I)
@@ -2037,6 +2086,45 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if action and action.get("conversation_id") != client_id:
         pending.pop(client_id, None)
         action = None
+    offer_entry = pending_offers.get(client_id)
+    if offer_entry:
+        offer: PendingOffer = offer_entry["offer"]
+        if offer.is_expired():
+            pending_offers.pop(client_id, None)
+            offer_entry = None
+    if offer_entry and not action:
+        reply_kind = classify_offer_reply(user_text)
+        # The newest explicit request always outranks a stale offer (spec
+        # sections 17, 18, 29) -- an utterance that itself names a new
+        # explicit domain or a direct media goal is never treated as offer
+        # acceptance, even if it superficially contains an accept word.
+        has_competing_intent = explicit_domain(user_text) is not None or media_goal_request(user_text)
+        if reply_kind == "accept" and not has_competing_intent:
+            pending_offers.pop(client_id, None)
+            discovery_audit({"event": "offer_accepted", "client_id": client_id, "offer_id": offer.offer_id, "operation": offer.operation})
+            result = await invoke_tool(offer.operation, offer_entry.get("arguments", {}), client_id, request_id)
+            messages = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "tool", "name": offer.operation, "content": json.dumps(result.get("result", {}), separators=(",", ":"))},
+                {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE},
+            ]
+            full = await generate_final(messages)
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="offer_accepted")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if reply_kind == "decline":
+            pending_offers.pop(client_id, None)
+            full = "No problem."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="offer_declined")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # Ambiguous or a competing explicit intent: leave the offer exactly
+        # as staged (do not pop it) and fall through to normal routing for
+        # this turn. The subject the offer refers to is preserved separately
+        # in conversation_context, so a later plain "yes" can still resolve
+        # it even though this turn was not itself acceptance.
     if not action and is_confirmation(user_text):
         previous_media = conversation_context.get(client_id, {}).get("latest_media_workflow") or {}
         if previous_media.get("execution_status") in {"error", "failed_ingestion", "rejected", "disabled"}:
@@ -2238,6 +2326,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # identifiable/actionable.  Never let an unresolved or failed
             # media plan fall through to Qwen, which could invent a started
             # request from conversational context.
+            plan_item = next((item for item in live_results if item.get("tool") == "media_plan_goal"), None)
+            plan_result = plan_item.get("result") if plan_item and isinstance(plan_item.get("result"), dict) else {}
+            if plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
+                offer_question = stage_media_offer(client_id, plan_result)
+                if offer_question:
+                    media_direct = f"{media_direct} {offer_question}"
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
