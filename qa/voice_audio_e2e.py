@@ -289,6 +289,23 @@ _GENERATED_CONVERSATION_FAMILIES = [
             ("Give me the current Welland forecast.", {"weather_forecast"}),
         ],
     ),
+    (
+        "mixed_domain",
+        [
+            ("How many containers are running?", {"list_containers"}),
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("What's happening at the front door right now?", {"frigate_snapshot"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+        ],
+        [
+            ("What's the last thing added to Plex?", {"plex_recently_added"}),
+            ("How many containers are stopped?", {"list_containers"}),
+            ("How much storage do I have left?", {"get_storage_status"}),
+            ("What happened at the front door about an hour ago?", {"frigate_recent_events"}),
+            ("What are today's major world events?", {"web_search", "web_fetch"}),
+        ],
+    ),
 ]
 for _family, _first_turns, _second_turns in _GENERATED_CONVERSATION_FAMILIES:
     for _index, (_first, _first_tools) in enumerate(_first_turns):
