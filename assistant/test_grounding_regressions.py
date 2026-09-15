@@ -125,6 +125,13 @@ def test_container_followup_repairs_whisper_stops_variant():
     assert preflight_plan(route, conversation_context["container-stops"]) == [("list_containers", {"status": "exited"})]
 
 
+def test_web_attempt_cannot_be_described_as_no_web_access():
+    no_results = [{"tool": "web_search", "status": "ok", "result": {"results": []}}]
+    assert evidence_supported_answer("I don't have access to live news.", "What happened today?", no_results) == "I searched the web, but I couldn't find reliable current results."
+    with_results = [{"tool": "web_search", "status": "ok", "result": {"results": [{"title": "A current source"}]}}]
+    assert evidence_supported_answer("I don't have access to live news.", "What happened today?", with_results) == "I found current web results, but I couldn't synthesize a reliable summary from them yet."
+
+
 def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Send me the Dumb and Dumber movie file here.")
     assert direct_file_request("Upload Dumb and Dumber into this chat.")

@@ -691,6 +691,14 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
 def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None) -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
+    web_items = [item for item in results if item.get("tool") == "web_search"]
+    if web_items and re.search(r"\b(?:don't|do not|cannot|can't)\s+(?:have|access)|\bno access to (?:live )?(?:news|the web)|\bcan't tell you what's happening", answer, re.I):
+        successful = [item for item in web_items if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
+        if not successful:
+            return "I couldn't reach web search right now."
+        if any((item.get("result") or {}).get("results") for item in successful):
+            return "I found current web results, but I couldn't synthesize a reliable summary from them yet."
+        return "I searched the web, but I couldn't find reliable current results."
     if re.search(r"current server information|current server status", answer, re.I) and resolved_domain != "server":
         if any(item.get("status") == "ok" for item in results):
             if resolved_domain == "web_research":
