@@ -127,6 +127,13 @@ def test_plex_recency_repairs_are_bounded_to_explicit_library_context():
     assert preflight_plan("Show me the latest Plex edition.") == [("plex_recently_added", {"limit": 1})]
     assert preflight_plan("Which movie did Plex add last?") == [("plex_recently_added", {"limit": 1})]
     assert "edition" in routing_aliases("The special edition is missing")
+    assert preflight_plan("Show me the latest flex edition.") == [("plex_recently_added", {"limit": 1})]
+    assert "flex" in routing_aliases("The flex setting is comfortable")
+
+
+def test_voice_current_info_repair_is_bounded_to_online_development_language():
+    assert current_external_question("online for the latest in video development")
+    assert not current_external_question("The online video is playing")
 
 
 def test_media_status_does_not_turn_acquisition_language_into_status():

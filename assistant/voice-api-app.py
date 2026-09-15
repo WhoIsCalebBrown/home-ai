@@ -616,6 +616,13 @@ def current_external_question(text: str) -> bool:
     subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?|world|event|events?|company|companies|business|stock|stocks?|nvidia|openai|microsoft|apple|google|tesla)\b"
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
     return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
+            # Voice may drop the explicit topic while retaining an unmistakable
+            # request for fresh online information. Keep this bounded to
+            # "online + latest/current + development/update" language so it
+            # cannot turn ordinary local questions into web research.
+            or bool(re.search(r"\bonline\b", text, re.I)
+                    and re.search(r"\b(?:latest|current|today|recent)\b", text, re.I)
+                    and re.search(r"\b(?:development|developments|update|updates|news|headline|headlines)\b", text, re.I))
             or bool(re.search(r"\b(news|headlines?)\b", text, re.I) and re.search(r"\b(today|now|latest|current)\b", text, re.I))
             or bool(re.search(r"\bblack\s*hawk\b", text, re.I))
             or bool(re.search(external_story, text, re.I) and re.search(r"\b(toronto|canada|city|over|above|world|government|technology|ai)\b", text, re.I)))
@@ -933,6 +940,12 @@ def routing_aliases(text: str) -> str:
     # alias these words: only repair them when the same utterance already has
     # explicit Plex plus recency/addition language.
     if re.search(r"\bplex\b", text, re.I) and re.search(r"\b(?:latest|newest|recent|last|added|addition)\b", text, re.I):
+        text = re.sub(r"\bedition\b", "addition", text, flags=re.I)
+    # Bounded voice repair: Whisper can render "Plex edition" as "flex
+    # edition" in a recency question. Require the full recency shape before
+    # repairing; ordinary uses of "flex" remain untouched.
+    if re.search(r"\bflex\b", text, re.I) and re.search(r"\bedition\b", text, re.I) and re.search(r"\b(?:latest|newest|recent|last)\b", text, re.I):
+        text = re.sub(r"\bflex\b", "Plex", text, flags=re.I)
         text = re.sub(r"\bedition\b", "addition", text, flags=re.I)
     if re.search(r"\b(?:movie|film)\b", text, re.I) and re.search(r"\b(?:last|latest|newest|added)\b", text, re.I):
         text = re.sub(r"\bduplex\b", "Plex", text, flags=re.I)
