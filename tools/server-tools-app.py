@@ -2426,22 +2426,23 @@ GROUP_SERVICES = {
 }
 
 CAPABILITY_METADATA = {
-    "frigate_stats": {"aliases": ["camera health", "fps", "detector"], "examples": ["is my camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
-    "frigate_recent_events": {"aliases": ["motion", "person detected", "recent camera event"], "examples": ["was someone at the door recently"], "freshness": "current", "visual_evidence": False},
+    "frigate_stats": {"aliases": ["camera health", "camera status", "fps", "detector"], "examples": ["is my camera working", "is the front door camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
+    "frigate_recent_events": {"aliases": ["motion", "person detected", "recent camera event", "historical camera activity", "camera alerts"], "examples": ["was someone at the door recently", "what happened at the front door earlier", "any alerts from the front camera"], "freshness": "current", "visual_evidence": False},
     "frigate_snapshot": {"aliases": ["see camera", "what does it look like", "current image"], "examples": ["describe the front door right now"], "freshness": "current", "visual_evidence": True},
     "frigate_event_snapshot": {"aliases": ["event image", "detection image", "snapshot from that event"], "examples": ["describe the image from that detection"], "freshness": "event-scoped", "visual_evidence": True},
-    "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline"], "examples": ["what is downloading", "is anything stuck"], "group": "downloads", "freshness": "current"},
+    "frigate_event_activity": {"aliases": ["event activity", "activity in that event", "event clip"], "examples": ["what was the person doing in that event", "what happened during that detection"], "freshness": "event-scoped", "visual_evidence": True},
+    "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline", "current downloads"], "examples": ["what is downloading", "is anything stuck", "what is currently downloading"], "group": "downloads", "freshness": "current"},
     "investigate_media_pipeline": {"aliases": ["music pipeline", "missing media", "artist status"], "examples": ["what is going on with UTOPIA", "how is Travis Scott coming along"], "group": "media_pipeline", "freshness": "current"},
     "get_storage_status": {"aliases": ["disk space", "free space", "storage"], "examples": ["how much storage do I have left"], "freshness": "current"},
     "list_containers": {"aliases": ["docker", "containers", "services"], "examples": ["how many containers are running"], "freshness": "current"},
     "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
     "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
     "plex_recently_added": {"aliases": ["recently added", "last added", "newest in plex"], "examples": ["what was the last thing added to Plex"], "freshness": "current"},
-    "plex_library_lookup": {"aliases": ["do i have", "is it in plex", "plex availability"], "examples": ["do I already have Rodeo"], "group": "plex", "freshness": "current"},
+    "plex_library_lookup": {"aliases": ["do i have", "is it in plex", "plex availability", "find in Plex", "look for it in Plex"], "examples": ["do I already have this movie", "find a movie in Plex"], "group": "plex", "freshness": "current"},
     "media_plan_goal": {"aliases": ["get media", "add movie", "request album", "put it in plex", "media goal"], "examples": ["get Rodeo by Travis Scott", "get the original animated Hobbit movie"], "group": "media", "freshness": "current"},
-    "media_get_workflow": {"aliases": ["how is it doing", "is it downloading", "did it import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current"},
-    "media_status": {"aliases": ["media status", "how is it doing", "is it ready", "did it find it", "what is taking so long"], "examples": ["is Dumb and Dumber ready"], "group": "media", "freshness": "current"},
-    "media_diagnose": {"aliases": ["why is it stuck", "why isn't it ready", "what is blocking it", "diagnose media"], "examples": ["why isn't the movie in Plex yet"], "group": "media", "freshness": "current"},
+    "media_get_workflow": {"aliases": ["how is this request doing", "is this request downloading", "did this request import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current", "requires_referent": True},
+    "media_status": {"aliases": ["media status", "how is it doing", "is it ready", "did it find it", "what is taking so long"], "examples": ["is Dumb and Dumber ready"], "group": "media", "freshness": "current", "requires_referent": True},
+    "media_diagnose": {"aliases": ["why is it stuck", "why isn't it ready", "what is blocking it", "diagnose media", "media problem"], "examples": ["why isn't the movie in Plex yet", "why is Dumb and Dumber stuck", "what is blocking this movie"], "group": "media", "freshness": "current", "requires_referent": True},
     "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
@@ -2450,7 +2451,7 @@ CAPABILITY_METADATA = {
     "add_list_items": {"aliases": ["add to list", "grocery list", "packing list"], "examples": ["put milk on my grocery list"], "group": "lists", "freshness": "current"},
     "remove_list_item": {"aliases": ["remove from list", "take off list"], "examples": ["remove milk from my grocery list"], "group": "lists", "freshness": "current"},
     "clear_completed_list_items": {"aliases": ["clear completed", "clean up list"], "examples": ["clear completed items"], "group": "lists", "freshness": "current"},
-    "web_search": {"aliases": ["internet", "search online", "news", "documentation"], "examples": ["search the web for current release notes"], "freshness": "current", "untrusted": True},
+    "web_search": {"aliases": ["internet", "online research", "current information", "news", "documentation", "public web lookup", "look up online", "search for information", "research online", "public affairs"], "examples": ["search the web for current release notes", "find information about this topic online", "research today's public news", "what happened today in American politics", "look it up on the internet"], "freshness": "current", "untrusted": True},
     "web_fetch": {"aliases": ["open webpage", "read page"], "examples": ["fetch the official documentation"], "freshness": "current", "untrusted": True},
 }
 
@@ -2459,49 +2460,41 @@ def capability_record(item):
     name, desc, permission, service, _, _ = item
     meta = CAPABILITY_METADATA.get(name, {})
     words = [name.replace("_", " "), desc, service, meta.get("group", service), *meta.get("aliases", []), *meta.get("examples", [])]
-    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission in {"confirm", "destructive"}, "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "search_text": " ".join(words)}}
+    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission in {"confirm", "destructive"}, "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "requires_referent": bool(meta.get("requires_referent", False)), "alias_text": " ".join(meta.get("aliases", [])), "example_text": " ".join(meta.get("examples", [])), "search_text": " ".join(words)}}
 
 def _search_tokens(value: str) -> set[str]:
-    stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can"}
+    stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can", "me", "this", "that", "from"}
     return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 1 and token not in stop}
+
+
+def _semantic_ngrams(value: str) -> set[str]:
+    compact = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    padded = f"  {compact}  "
+    return {padded[pos:pos + 3] for pos in range(max(0, len(padded) - 2))}
 
 def discover_capabilities(query: str, max_results: int = 8, context: dict[str, Any] | None = None) -> list[dict]:
     q = _search_tokens(query)
-    lowered = query.casefold()
     context = context or {}
-    prior_group = str(context.get("group", "")).casefold()
-    prior_tools = {str(item).casefold() for item in context.get("tools", [])}
     referents = _search_tokens(" ".join(str(item) for item in context.get("referents", [])))
-    media_context = prior_group in {"media", "media_planner"} or any(item.startswith("media_") for item in prior_tools)
-    media_library_signal = bool(re.search(r"\b(plex|movie|film|show|album|season|episode|media|request|download)\b", lowered))
-    diagnosis_signal = bool(re.search(r"\b(stuck|blocking|why|not ready|taking so long|holding up)\b", lowered))
-    camera_signal = bool(re.search(r"\b(camera|cameras|frigate|front door|garage|snapshot|detection|detected|person|shirt|wearing|event|events)\b", lowered))
+    q_grams = _semantic_ngrams(query)
     ranked = []
     for item in REGISTRY:
         record = capability_record(item)
         meta = record["metadata"]
         terms = _search_tokens(meta["search_text"])
         overlap = len(q & terms)
-        exact = sum(2 for alias in meta["aliases"] if alias.casefold() in query.casefold())
-        example = sum(2 for example in meta["examples"] if any(token in q for token in _search_tokens(example)))
-        score = overlap + exact + example
-        if name := meta["canonical_name"]:
-            if name in {"web_search", "web_fetch"} and re.search(r"\b(new|newest|latest|current|today|ongoing|news|policy|policies|version|release)\b", lowered): score += 7
-            if name == "web_search" and not re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
-            if name == "web_fetch" and re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
-            if name == "media_diagnose" and diagnosis_signal and (media_context or media_library_signal): score += 10
-            if name == "investigate_downloads" and diagnosis_signal and (media_context or media_library_signal): score -= 3
-            if media_context and meta.get("group") == "media" and name.startswith("media_"): score += 4
-            if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
-            if camera_signal and name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
-            if camera_signal and name == "frigate_recent_events" and re.search(r"\b(alert|alerts|event|events|historical|earlier|ago)\b", lowered): score += 9
-            if camera_signal and name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
-            if camera_signal and name == "frigate_event_snapshot" and re.search(r"\b(event|detection|that|historical|earlier|ago)\b", lowered) and not re.search(r"\b(right now|currently|live|current)\b", lowered): score += 12
-            if camera_signal and name == "frigate_event_activity" and re.search(r"\b(doing|activity|what happened|what were)\b", lowered): score += 12
-            if prior_group == "cameras" and meta.get("group") == "frigate": score += 5
-            if name.casefold() in prior_tools: score += 4
-            if referents & terms: score += 2
-        if score: ranked.append((score, record))
+        # Character n-grams tolerate ASR punctuation, inflection, and small
+        # transcription errors without encoding a growing phrase list.
+        term_grams = _semantic_ngrams(meta["search_text"])
+        gram_score = len(q_grams & term_grams) / max(1, len(q_grams))
+        referent_overlap = len(referents & terms)
+        alias_overlap = len(q & _search_tokens(meta.get("alias_text", "")))
+        example_overlap = len(q & _search_tokens(meta.get("example_text", "")))
+        score = (overlap * 1.5) + (alias_overlap * 2.5) + (example_overlap * 1.0) + (gram_score * 4.0) + (referent_overlap * 1.5)
+        if meta.get("requires_referent") and not referents:
+            score *= 0.35
+        if score > 0:
+            ranked.append((score, record))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]["metadata"]["canonical_name"]))
     return [{**record, "metadata": {**record["metadata"], "rank": index + 1, "score": score}} for index, (score, record) in enumerate(ranked[:max(1, min(max_results, 8))])]
 

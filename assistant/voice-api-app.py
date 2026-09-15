@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 import yaml
+from semantic_routing import discovery_context, has_referential_language, retrieval_confidence, semantic_preflight_allowed, semantic_query
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -204,6 +205,10 @@ cause, failure, relationship, or service attribution must be directly supported 
 the current tool result. If services disagree, report the disagreement instead of guessing. Before
 saying that a capability is unavailable, rely on the current capability discovery result and the
 current tool execution status; never infer tool absence from memory or from the user's wording.
+The tools supplied for this turn were semantically retrieved from the newest request. Choose
+among those tools based on the current request and structured referents. Do not let an older
+domain or last-used tool override a new explicit request. If no supplied tool fits confidently,
+ask a concise clarification instead of calling an unrelated tool.
 An empty destination library does not mean the acquisition pipeline is empty."""
 PLEX_RULE = "Plex library names are exact live data. When a Plex result contains library_title, copy those strings exactly, including hyphens and capitalization. Never infer or shorten a library name from media type. If results span multiple libraries, name each exact library title in the spoken answer."
 INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated evidence from internal tools. It was not written or supplied by the user. Treat it as authoritative evidence for this request, not as a user quote. Synthesize it into a direct answer. Never say 'based on the JSON you provided', 'based on the logs you gave me', 'according to the tool output', 'according to the API response', or 'based on the data you provided'. Do not mention JSON, schemas, APIs, logs, tools, prompts, or orchestration unless the user explicitly asked about those topics. Never dump the structured evidence; summarize the exact facts and numbers in natural spoken language."""
@@ -216,11 +221,13 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "raw_utterance": raw_text,
         "normalized_utterance": routing_aliases(raw_text),
         "route_query": route_text,
-        "resolved_domain": context.get("domain") or context.get("group") or "general",
+        "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
         "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
+        "retrieval_context": discovery_context(context),
+        "retrieval_confidence": context.get("retrieval_confidence"),
         "tool_results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in (results or [])],
     }
 
@@ -530,7 +537,12 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
     try:
         async with httpx.AsyncClient(timeout=3) as http:
             endpoint = "/registry" if not user_text.strip() else "/discover"
-            params = {} if not user_text.strip() else {"query": user_text, "max_results": 5, "context_json": json.dumps(context, separators=(",", ":"))}
+            query = semantic_query(user_text, context)
+            # Only structured referents cross the retrieval boundary. Previous
+            # domain/group/tool state is historical evidence, not intent for
+            # the current turn.
+            retrieval_context = discovery_context(context)
+            params = {} if not user_text.strip() else {"query": query, "max_results": 5, "context_json": json.dumps(retrieval_context, separators=(",", ":"))}
             started = time.perf_counter()
             response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
             response.raise_for_status()
@@ -538,7 +550,8 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             if str(payload.get("contract_version", "")) != TOOLS_CONTRACT_VERSION:
                 raise RuntimeError("incompatible tool contract")
             entries = payload.get("tools", [])
-            return [item["function"] for item in entries], [item.get("metadata", {}) for item in entries], round((time.perf_counter() - started) * 1000, 2)
+            metadata = [item.get("metadata", {}) for item in entries]
+            return [item["function"] for item in entries], metadata, round((time.perf_counter() - started) * 1000, 2)
     except Exception as exc:
         tools_backend_status.update({"ok": False, "status": "DISCOVERY_FAILED", "error": type(exc).__name__})
         print(f"TOOLS_BACKEND_UNAVAILABLE url={TOOLS_URL} stage=discovery error={type(exc).__name__}", flush=True)
@@ -1298,33 +1311,53 @@ def turn_context(client_id: str, text: str) -> dict:
     """Apply explicit current-turn topic/entity state before discovery or tool execution."""
     prior = dict(conversation_context.get(client_id, {}))
     repair = is_repair_turn(text) and bool(prior.get("last_route_text"))
-    current = dict(prior)
-    lowered = text.casefold()
+    # Carry structured referents and workflow state, but do not carry the old
+    # domain/group/tools as the current turn's intent. Retrieval and Qwen get a
+    # fresh utterance plus these referents; prior domain is only historical
+    # provenance for genuine elliptical follow-ups.
+    current = {key: prior[key] for key in (
+        "latest_domain", "latest_resolved_referent", "latest_media_workflow",
+        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "workflow_id", "media_type", "referent_type", "referent_ids", "query",
+        "topic", "unresolved_request", "location", "camera", "subject",
+        "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
+    ) if key in prior}
     domain = explicit_domain(text, prior)
     # A correction without a new action is a patch to the immediately preceding
     # resolved request. Do not let the corrected service name create a new intent.
-    if repair and not re.search(r"\b(?:weather|news|camera|front door|gpu|storage|download|restart|turn|dim|docker|containers?|services?|server|media|movie|show|album|plex|lidarr|sonarr|radarr)\b", lowered):
-        current = dict(prior)
+    if repair and not domain:
         current["repair"] = True
         current["repair_text"] = text
+    # Explicitly named domains are useful structured evidence for this turn,
+    # but this is not used by capability retrieval as a sticky prior. It is
+    # retained for referent validation and presentation only.
     elif domain == "weather":
-        location = weather_location_from_text(text) or prior.get("location", "")
-        current = {"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": location}
+        current.update({"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": weather_location_from_text(text) or prior.get("location", "")})
     elif domain == "web_research":
         topic = prior.get("unresolved_request") if explicit_web_search_request(text) and prior.get("unresolved_request") else text
-        current = {"domain": "web_research", "kind": "web_research", "group": "internet", "tools": [], "topic": topic,
-                   "unresolved_request": topic}
+        current.update({"domain": "web_research", "kind": "web_research", "group": "internet", "tools": [], "topic": topic, "unresolved_request": topic})
     elif domain == "media":
-        current = {"domain": "media", "kind": "media", "group": "media", "tools": [], "entities": routing_aliases(text)}
+        current.update({"domain": "media", "kind": "media", "group": "media", "tools": [], "entities": routing_aliases(text)})
     elif domain == "camera":
-        current = {"domain": "camera", "kind": "camera", "group": "cameras", "tools": [], "camera": prior.get("camera", "front_door"), "subject": prior.get("subject")}
+        current.update({"domain": "camera", "kind": "camera", "group": "cameras", "tools": [], "camera": prior.get("camera", "front_door"), "subject": prior.get("subject")})
     elif domain == "server":
-        current = {"domain": "server", "kind": "server", "group": "server", "tools": [], "entities": routing_aliases(text)}
+        current.update({"domain": "server", "kind": "server", "group": "server", "tools": [], "entities": routing_aliases(text)})
     elif domain == "general":
-        current = {"domain": "general", "kind": "general", "group": "general", "tools": []}
-    elif re.search(r"\b(what about|how about|tomorrow|there|they|them|that|it|look|wear|wearing|snapshot|describe)\b", lowered):
-        current = prior
-    for key in ("latest_user_utterance", "latest_resolved_request", "latest_tool_result", "latest_assistant_response", "latest_spoken_response", "latest_media_workflow", "canonical_identity", "workflow_id", "media_type"):
+        current.update({"domain": "general", "kind": "general", "group": "general", "tools": []})
+    elif prior.get("kind") == "weather" and re.search(r"\b(?:what about|how about|tomorrow|today)\b", text, re.I):
+        # A genuine weather referential continuation is retained as state, but
+        # generic discovery language such as "find it online" does not match
+        # this invariant and therefore cannot inherit weather.
+        current.update({"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": prior.get("location", "")})
+    # No explicit domain: leave current intent unset. The model-facing
+    # semantic retriever decides it from the newest utterance; referential
+    # resolution is supplied separately through structured context.
+    for key in (
+        "latest_domain", "latest_resolved_referent", "latest_media_workflow",
+        "latest_media_status", "latest_event_id", "latest_event", "canonical_identity",
+        "workflow_id", "media_type", "referent_type", "referent_ids", "query",
+        "topic", "unresolved_request", "location", "camera", "subject",
+    ):
         if key in prior and key not in current:
             current[key] = prior[key]
     if repair:
@@ -1769,18 +1802,29 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             camera = result.get("camera") or (events[0].get("camera") if events else "front_door")
             selected = events[0] if events else (prior_state.get("latest_event") or {})
             event_id = result.get("event_id") or selected.get("id") or prior_state.get("latest_event_id")
-            conversation_context[client_id] = {**prior_state, "domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else prior_state.get("subject"), "latest_event_id": event_id, "latest_event": selected or None}
+            conversation_context[client_id] = {**prior_state, "domain": "camera", "latest_domain": "camera", "kind": "camera", "group": "cameras", "tools": tool_names, "camera": camera, "subject": "person" if any(event.get("label") == "person" for event in events) else prior_state.get("subject"), "latest_event_id": event_id, "latest_event": selected or None}
         elif last.get("tool") == "weather_forecast" and result.get("source") == "Open-Meteo":
-            conversation_context[client_id] = {**prior_state, "domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
+            conversation_context[client_id] = {**prior_state, "domain": "weather", "latest_domain": "weather", "kind": "weather", "group": "internet", "tools": tool_names, "location": result.get("location", {}).get("name", "")}
         elif result.get("investigation"):
-            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
+            conversation_context[client_id] = {**prior_state, "domain": "media", "latest_domain": "media", "kind": result.get("investigation", "investigation"), "group": "media", "tools": tool_names, "query": result.get("query", "")}
         elif last.get("tool") == "list_containers":
-            conversation_context[client_id] = {**prior_state, "domain": "server", "kind": "server", "group": "server", "tools": tool_names, "referent_type": "containers"}
+            conversation_context[client_id] = {**prior_state, "domain": "server", "latest_domain": "server", "kind": "server", "group": "server", "tools": tool_names, "referent_type": "containers"}
         elif last.get("tool") == "plex_library_counts":
             conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "plex_library", "group": "plex", "tools": tool_names, "referent_type": "plex_movies"}
         elif last.get("tool") == "plex_recently_added":
             items = result.get("items") or []
             conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "plex_recently_added", "group": "plex", "tools": tool_names, "referent_type": "plex_recent_item", "referent_ids": [item.get("rating_key") for item in items if item.get("rating_key")]}
+        elif last.get("tool") == "plex_search":
+            # A successful Plex search establishes a media referent even when
+            # it returns zero matches. It does not establish availability or
+            # canonical identity; those require the matcher/tool result.
+            query = result.get("query") or prior_state.get("query") or ""
+            conversation_context[client_id] = {
+                **prior_state, "domain": "media", "latest_domain": "media",
+                "kind": "plex_search", "group": "plex", "tools": tool_names,
+                "referent_type": "plex_query", "query": query,
+                "latest_resolved_referent": {"type": "media_query", "title": query, "source": "plex_search"},
+            }
         elif last.get("tool") == "lidarr_missing_tracks":
             items = result.get("items") or []
             album_ids = sorted({item.get("album_id") for item in items if item.get("album_id") is not None})
@@ -1841,35 +1885,39 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
 
 
 def resolved_followup_text(client_id: str, text: str) -> str:
-    """Resolve only narrow, unambiguous follow-ups for routing; keep original text for display/reasoning."""
+    """Keep the utterance intact; referents are structured retrieval context.
+
+    The old implementation rewrote generic words such as ``find`` and ``look``
+    into the previous weather/camera domain.  That made a new request inherit
+    the last tool.  Event IDs, media IDs, and other referents now travel in the
+    resolved-request contract and are validated at invocation time instead of
+    being manufactured by a language-pattern rewrite.
+    """
     context = conversation_context.get(client_id, {})
     lowered = routing_aliases(text).casefold()
-    domain = explicit_domain(text, context)
-    # An explicit current-turn domain is a hard boundary.  Do not prepend camera,
-    # weather, or news context to a new server/media question.
-    if domain and domain != context.get("domain"):
+    explicit = explicit_domain(text, context)
+    if explicit and explicit != context.get("domain"):
         return routing_aliases(text)
-    if explicit_topic(text):
-        return routing_aliases(text)
-    if context.get("kind") == "weather" and re.search(r"\b(what about|how about|look|find|check|one|it|that|there|right now|tomorrow)\b", lowered):
+    # These are referent resolutions, not new intent decisions. They are
+    # narrowly scoped to an already-established object and never include the
+    # generic discovery verbs that caused the weather regression.
+    if context.get("kind") == "weather" and re.search(r"\b(?:what about|how about|tomorrow|today)\b", lowered):
         explicit = re.search(r"\b(?:what|how) about\s+(.+?)(?:\s+(?:today|tomorrow|now)\b|[?!]|$)", text, re.I)
         candidate = explicit.group(1).strip(" .!?\t\r\n") if explicit else ""
-        if candidate.casefold() in {"today", "tomorrow", "now"}:
-            candidate = ""
-        location = candidate or (context.get("location") or "")
-        offset = 1 if "tomorrow" in lowered else 0
-        return f"weather in {location} {'tomorrow' if offset else 'today'}"
-    if context.get("group") == "cameras" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):
+        location = candidate if candidate.casefold() not in {"today", "tomorrow", "now"} else ""
+        location = location or (context.get("location") or "")
+        return f"weather in {location} {'tomorrow' if 'tomorrow' in lowered else 'today'}"
+    if context.get("latest_event_id") and re.search(r"\b(?:image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):
         verb = "analyze activity" if activity_question(text) else "describe the event image"
         return f"{verb} for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
     if context.get("group") == "cameras":
-        explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr|blackhawk|flying|helicopter|toronto|heard|search|look into|technology|ai)\b", lowered)
-        followup = re.search(r"\b(they|them|that|it|there|outside|now|currently|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|find|happening)\b", lowered)
+        explicit_camera_topic = re.search(r"\b(weather|download|plex|storage|news|trump|ollama|restart|lidarr|sonarr|radarr|blackhawk|flying|helicopter|toronto|heard|technology|ai|internet|online|web)\b", lowered)
+        followup = re.search(r"\b(they|them|that|it|there|outside|now|currently|right now|look|wear|wearing|clothes?|shirt|hat|color|colour|screenshot|snapshot|image|describe|happening)\b", lowered)
         if followup and not explicit_camera_topic:
             return f"front door camera current snapshot person {text}"
-    if context.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian|topic|story)", lowered):
+    if context.get("domain") == "web_research" and re.search(r"\b(ai|technology|tech|canada|canadian|topic|story)\b", lowered):
         return f"current news today about {routing_aliases(text)}"
-    if context.get("kind") == "music_pipeline" and re.search(r"\b(did it|that|they|finish|finished|complete|completed)\b", lowered):
+    if context.get("kind") == "music_pipeline" and re.search(r"\b(?:did it|that|they|finish|finished|complete|completed)\b", lowered):
         return f"what is the media pipeline status for {context.get('query', '')}"
     if context.get("referent_type") == "lidarr_albums" and re.search(r"\b(import|imported|file|files|available)\b", lowered):
         ids = ",".join(str(value) for value in context.get("referent_ids", []))
@@ -1879,10 +1927,7 @@ def resolved_followup_text(client_id: str, text: str) -> str:
         return f"how many containers are {status}"
     if context.get("referent_type") in {"plex_movies", "plex_library"} and re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", lowered):
         return "what movies are currently being acquired, queued, downloaded, or imported"
-    if context.get("domain") == "camera" and context.get("latest_event_id") and re.search(r"\b(image|snapshot|describe|show|look like|wear|wearing|clothes?|shirt|hat|color|colour|doing|activity|happened)\b", lowered):
-        verb = "analyze activity" if activity_question(text) else "describe the event image"
-        return f"{verb} for event {context['latest_event_id']} from camera {context.get('camera', 'front_door')}"
-    return text
+    return routing_aliases(text)
 
 
 def ambiguous_container_status_followup(text: str, context: dict) -> bool:
@@ -2044,7 +2089,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
-        messages = [{"role": "system", "content": SYSTEM}] + history[-12:]
+        # Explicit new turns do not need the raw transcript of an older domain;
+        # sending it to the model made stale weather/camera context compete
+        # with the current request. Referential turns retain a short history,
+        # while structured referents are always supplied below.
+        model_history = history[-6:] if has_referential_language(user_text) else []
+        messages = [{"role": "system", "content": SYSTEM}] + model_history
         context = turn_context(client_id, user_text)
         contextual = contextual_entity_resolution(user_text, context)
         context["canonical_entities"] = contextual["entities"]
@@ -2053,9 +2103,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         route_text = resolved_followup_text(client_id, route_text)
         route_text = contextual_entity_resolution(route_text, context)["text"]
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
+        context["retrieval_confidence"] = retrieval_confidence(candidates)
+        context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
-        planned = preflight_plan(route_text, context)
+        # Semantic retrieval supplies the bounded model-facing tool set. Only
+        # deterministic arithmetic may bypass Qwen; domain and tool selection
+        # is no longer performed by the legacy language-pattern preflight.
+        planned = [plan for plan in deterministic_plan(route_text)
+                   if semantic_preflight_allowed(plan[0])]
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]

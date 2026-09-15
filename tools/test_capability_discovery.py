@@ -18,6 +18,34 @@ def test_discovery_distinguishes_camera_capabilities():
     assert names("describe the image from that detection")[:1] == ["frigate_event_snapshot"]
 
 
+def test_online_research_paraphrases_do_not_depend_on_phrase_router_or_prior_weather():
+    requests = [
+        "find it on the internet", "find it online", "look it up", "look online",
+        "search for it", "see what the internet says about it", "can you research it",
+        "can you find anything about it", "dig around online", "see if you can find it on the web",
+    ]
+    for request in requests:
+        ranked = module.discover_capabilities(request, 5, {
+            "group": "weather", "tools": ["weather_forecast"],
+            "referents": ["Segua, the Chinese Siamese Cat"],
+        })
+        assert ranked[0]["metadata"]["canonical_name"] == "web_search", request
+
+
+def test_current_public_topic_beats_local_camera_and_weather_candidates():
+    ranked = module.discover_capabilities(
+        "what happened today in American politics", 5,
+        {"group": "cameras", "tools": ["frigate_recent_events"], "referents": []},
+    )
+    assert ranked[0]["metadata"]["canonical_name"] == "web_search"
+
+
+def test_negative_controls_remain_domain_specific():
+    assert names("find Dumb and Dumber in Plex")[0] in {"media_status", "plex_library_lookup", "media_plan_goal"}
+    assert names("find the person from the front-door event")[0] == "frigate_recent_events"
+    assert names("find containers that are stopped")[0] == "list_containers"
+
+
 def test_discovery_alerts_are_events_not_camera_stats():
     assert names("any alerts from the front camera")[:1] == ["frigate_recent_events"]
 
