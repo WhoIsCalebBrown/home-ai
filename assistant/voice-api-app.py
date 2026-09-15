@@ -670,6 +670,18 @@ def unavailable_live_answer(text: str) -> str:
     return "I couldn't verify that current server information because the required live tool result was unavailable."
 
 
+def all_live_results_failed(results: list[dict]) -> bool:
+    """Keep a total live-tool outage from becoming a model-invented answer."""
+    if not results:
+        return False
+    return all(
+        item.get("status") != "ok"
+        or not isinstance(item.get("result"), dict)
+        or item.get("result", {}).get("evidence_available") is False
+        for item in results
+    )
+
+
 def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
     if not re.search(r"\butopia\b", user_text, re.I):
         return None
@@ -2062,6 +2074,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if not live_results and context.get("group") == "cameras" and not context.get("latest_event_id") and visual_question(user_text):
             full = "I couldn't find a matching historical camera event to inspect."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="historical_camera_without_event")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        if all_live_results_failed(live_results):
+            # Do not ask Qwen to improvise around a total live-tool outage.
+            full = unavailable_live_answer(user_text)
+            store_provenance(client_id, live_results)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="all_live_tools_failed")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return

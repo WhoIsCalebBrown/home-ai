@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -50,6 +50,7 @@ historical_camera_window = namespace["historical_camera_window"]
 direct_file_request = namespace["direct_file_request"]
 playback_request = namespace["playback_request"]
 ambiguous_container_status_followup = namespace["ambiguous_container_status_followup"]
+all_live_results_failed = namespace["all_live_results_failed"]
 media_goal_request = namespace["media_goal_request"]
 media_status_question = namespace["media_status_question"]
 media_nouns_for_status = namespace["media_nouns_for_status"]
@@ -138,6 +139,12 @@ def test_direct_file_and_playback_requests_do_not_become_acquisition():
     assert direct_file_request("Upload Dumb and Dumber into this chat.")
     assert not media_goal_request("Send me the Dumb and Dumber movie file here.")
     assert not media_goal_request("Upload Dumb and Dumber into this chat.")
+
+
+def test_total_live_tool_failure_cannot_become_model_grounded_answer():
+    failed = [{"tool": "web_search", "status": "timeout", "result": {"error_code": "TIMEOUT", "evidence_available": False}}]
+    assert all_live_results_failed(failed)
+    assert not all_live_results_failed([{"tool": "web_search", "status": "ok", "result": {"results": []}}])
     assert playback_request("Play Dumb and Dumber.")
     assert not media_goal_request("Play Dumb and Dumber.")
 

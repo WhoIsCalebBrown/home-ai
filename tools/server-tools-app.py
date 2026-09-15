@@ -2572,12 +2572,14 @@ async def invoke(req: Invoke):
         call_arguments.setdefault("session_id", req.session_id)
         result = await asyncio.wait_for(fn(call_arguments), timeout=12)
     except asyncio.TimeoutError:
-        status, result = "timeout", {"error": f"{service} tool timed out"}
+        status, result = "timeout", {"error": f"{service} tool timed out", "error_code": "TIMEOUT", "retryable": True, "evidence_available": False}
     except httpx.HTTPStatusError as exc:
-        status, result = "unavailable", {"error": f"{service} API returned HTTP {exc.response.status_code}"}
+        status, result = "unavailable", {"error": f"{service} API returned HTTP {exc.response.status_code}", "error_code": "BACKEND_UNAVAILABLE", "http_status": exc.response.status_code, "retryable": True, "evidence_available": False}
     except Exception as exc:
-        status, result = "error", {"error": f"{service} tool failed", "detail": type(exc).__name__}
+        status, result = "error", {"error": f"{service} tool failed", "error_code": "EXECUTION_FAILED", "detail": type(exc).__name__, "retryable": False, "evidence_available": False}
     finally:
         AUDIT_CONTEXT.reset(context_token)
+    if status == "ok" and not isinstance(result, dict):
+        status, result = "error", {"error": f"{service} tool returned an invalid result", "error_code": "INVALID_TOOL_RESULT", "retryable": False, "evidence_available": False}
     audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": status, "action_id": req.action_id, "duration_ms": round((time.monotonic() - started) * 1000), "result_summary": audit_result(result)})
     return {"tool": req.name, "service": service, "permission": permission, "status": status, "result": result}
