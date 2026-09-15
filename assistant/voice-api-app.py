@@ -789,6 +789,23 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         if state == "NO_CANDIDATE":
             return f"I couldn't find a suitable copy of {title}."
         return f"I don't have a confirmed current status for {title} yet."
+    if tool == "media_diagnose":
+        state = str(result.get("canonical_state") or "UNKNOWN")
+        title = result.get("title") or (result.get("canonical_identity") or {}).get("title") or "That media"
+        diagnosis = result.get("diagnosis")
+        if diagnosis == "NO_ACCEPTABLE_CANDIDATE":
+            return f"I couldn't find a suitable copy of {title}."
+        if diagnosis == "COLLECTED_NOT_VISIBLE":
+            return f"{title} was collected, but Plex hasn't picked it up yet."
+        if diagnosis == "SEARCH_IN_PROGRESS":
+            return f"{title} is still being searched for."
+        if diagnosis == "ACQUISITION_IN_PROGRESS":
+            return f"{title} is being acquired now."
+        if diagnosis == "COMPLETE" or state == "AVAILABLE":
+            return f"{title} is ready in Plex."
+        if diagnosis == "LIVE_STATUS_INCOMPLETE":
+            return f"I can't get a complete live status for {title} right now."
+        return f"I don't have a confirmed diagnosis for {title} yet."
     if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
         offset = int(result.get("days_from_now") or 0)
         unit = result.get("temperature_unit", "C")

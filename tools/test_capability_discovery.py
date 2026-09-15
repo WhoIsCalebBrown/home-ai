@@ -409,6 +409,18 @@ def test_media_status_preserves_exact_plex_availability_when_provider_read_fails
     assert result["status_reason"] == "CLI_DEBRID_READ_FAILED"
 
 
+def test_media_diagnose_stops_at_first_proven_provider_boundary(monkeypatch):
+    import asyncio
+    async def status(_):
+        return {"found": True, "workflow_id": "wf", "canonical_identity": {"title": "Dumb and Dumber"},
+                "canonical_state": "NO_CANDIDATE", "storage_class": "unknown"}
+    monkeypatch.setattr(module, "media_status", status)
+    result = asyncio.run(module.media_diagnose({"workflow_id": "wf"}))
+    assert result["diagnosis"] == "NO_ACCEPTABLE_CANDIDATE"
+    assert result["blocking_boundary"] == "cli_debrid"
+    assert result["next_read_only_action"] == "user_decision_required"
+
+
 def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypatch, tmp_path):
     import asyncio
     module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"

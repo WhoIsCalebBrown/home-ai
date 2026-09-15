@@ -169,6 +169,12 @@ def test_simple_structured_reads_bypass_synthesis_pass():
     assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
 
 
+def test_media_diagnosis_is_human_and_stops_at_proven_boundary():
+    result = {"title": "Dumb and Dumber", "canonical_state": "NO_CANDIDATE",
+              "diagnosis": "NO_ACCEPTABLE_CANDIDATE", "canonical_identity": {"title": "Dumb and Dumber"}}
+    assert direct_structured_answer("why is it stuck", [{"tool": "media_diagnose", "status": "ok", "result": result}]) == "I couldn't find a suitable copy of Dumb and Dumber."
+
+
 def test_unresolved_media_plan_cannot_claim_request_started():
     result = [{"tool": "media_plan_goal", "status": "ok", "result": {
         "goal": {"media_type": "movie", "title_query": "10th Kingdom"},

@@ -1921,6 +1921,37 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def media_diagnose(args: dict[str, Any]) -> dict[str, Any]:
+    """Explain the first proven blocking boundary using bounded live status.
+
+    This deliberately reuses the canonical status adapter rather than probing
+    every media service.  A diagnostic read must not create retries, searches,
+    or provider side effects.
+    """
+    status = await media_status(args)
+    state = str(status.get("canonical_state") or "UNKNOWN")
+    identity = status.get("canonical_identity") or {}
+    title = identity.get("title") or "that media"
+    if state == "AVAILABLE":
+        diagnosis, boundary, next_action = "COMPLETE", None, "none"
+    elif state in {"REQUESTED", "SEARCHING"}:
+        diagnosis, boundary, next_action = "SEARCH_IN_PROGRESS", "cli_debrid", "wait_for_provider_state"
+    elif state in {"ACQUIRING", "VERIFYING"}:
+        diagnosis, boundary, next_action = "ACQUISITION_IN_PROGRESS", "cli_debrid", "wait_for_collection_or_verification"
+    elif state == "ACQUIRED_NOT_VISIBLE":
+        diagnosis, boundary, next_action = "COLLECTED_NOT_VISIBLE", "plex_visibility", "inspect_scan_or_library_path"
+    elif state == "NO_CANDIDATE":
+        diagnosis, boundary, next_action = "NO_ACCEPTABLE_CANDIDATE", "cli_debrid", "user_decision_required"
+    elif state in {"PARTIAL_STATUS", "BACKEND_UNAVAILABLE"}:
+        diagnosis, boundary, next_action = "LIVE_STATUS_INCOMPLETE", "status_backend", "retry_read_only_status_later"
+    else:
+        diagnosis, boundary, next_action = "UNRESOLVED", "workflow", "inspect_canonical_workflow"
+    return {"found": status.get("found", False), "workflow_id": status.get("workflow_id"),
+            "canonical_identity": identity, "title": title, "canonical_state": state,
+            "diagnosis": diagnosis, "blocking_boundary": boundary, "next_read_only_action": next_action,
+            "status": status}
+
+
 def _build_cli_debrid_request(args: dict[str, Any]) -> dict[str, Any]:
     """Translate one bounded Home-AI goal into cli_debrid's request shape."""
     media_type = str(args.get("media_type", "")).casefold()
@@ -2336,6 +2367,7 @@ REGISTRY = [
     ("media_storage_status", "Show standard DB-library and permanent-library storage contracts without writing.", "read", "media_planner", {"media_type": {"type": "string"}}, media_storage_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
     ("media_status", "Read live canonical media workflow status from cli_debrid and exact Plex identity matches; never writes or retries.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_status),
+    ("media_diagnose", "Explain the first proven blocking boundary for one canonical media workflow; read-only and never retries or writes.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_diagnose),
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
@@ -2370,6 +2402,7 @@ CAPABILITY_METADATA = {
     "media_plan_goal": {"aliases": ["get media", "add movie", "request album", "put it in plex", "media goal"], "examples": ["get Rodeo by Travis Scott", "get the original animated Hobbit movie"], "group": "media", "freshness": "current"},
     "media_get_workflow": {"aliases": ["how is it doing", "is it downloading", "did it import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current"},
     "media_status": {"aliases": ["media status", "how is it doing", "is it ready", "did it find it", "what is taking so long"], "examples": ["is Dumb and Dumber ready"], "group": "media", "freshness": "current"},
+    "media_diagnose": {"aliases": ["why is it stuck", "why isn't it ready", "what is blocking it", "diagnose media"], "examples": ["why isn't the movie in Plex yet"], "group": "media", "freshness": "current"},
     "calculator": {"aliases": ["calculate", "math", "percent", "percentage"], "examples": ["what is 17.5 percent of 438"], "freshness": "deterministic"},
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
