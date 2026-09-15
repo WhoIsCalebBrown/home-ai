@@ -135,10 +135,14 @@ READ_ONLY_CONVERSATIONS = {
     ],
     "camera_history": [
         ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
-        # The live read-only state may legitimately contain no matching event.
-        # In that branch the safe response is deterministic and must not call
-        # a visual tool or fall back to the live camera.
-        ("What were they wearing?", set()),
+        # Once an event is selected, visual follow-ups must stay event-scoped;
+        # they must not use the current camera snapshot.
+        ("What were they wearing?", {"frigate_event_snapshot"}),
+        ("What's at the front door right now?", {"frigate_snapshot"}),
+    ],
+    "camera_activity": [
+        ("About an hour ago, what happened at the front door?", {"frigate_recent_events"}),
+        ("What were they doing?", {"frigate_event_activity"}),
         ("What's at the front door right now?", {"frigate_snapshot"}),
     ],
     "media_status_chain": [
