@@ -755,3 +755,89 @@ async def test_ambiguous_cross_media_title_requires_clarification_not_arbitrary_
     assert session.client_id not in session.app.pending
     assert session.client_id not in session.app.pending_offers, "an unresolved ambiguous identity must never become an offer"
     assert not session.backend.submitted_writes
+
+
+# --- Subject switch during offer (spec item #8) -----------------------
+
+@pytest.mark.asyncio
+async def test_explicit_subject_switch_replaces_offer_without_executing_it(session):
+    """"Want me to check Cowboy Bebop in Plex?" / "Actually check Dune
+    instead." -- the new explicit subject wins, the Cowboy Bebop offer is
+    never executed, and Dune becomes the active subject."""
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="1", year="2021")
+    cowboy_offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-cowboy", operation="plex_match_canonical_media")
+    session.app.pending_offers[session.client_id] = {
+        "offer": cowboy_offer, "arguments": {"title": "Cowboy Bebop"}, "description": "check whether Cowboy Bebop is in Plex",
+    }
+    await session.turn(
+        "Actually check Dune instead.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
+        ]}}],
+    )
+    cowboy_calls = [args for name, args in session.backend.call_log if "cowboy" in json.dumps(args).casefold()]
+    assert not cowboy_calls, "the old offer's subject must never be queried just because routing ran"
+    dune_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal" and "dune" in str(args.get("goal", "")).casefold()]
+    assert dune_calls, "the new explicit subject must actually be resolved"
+
+
+# --- Concurrent sessions (spec item #17) -------------------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_do_not_leak_subjects_or_offers(app, backend):
+    """Two simultaneous conversations (movie subject+offer, album
+    subject+offer) must not share pending/pending_offers/conversation_context
+    state -- each client_id is its own session by construction (all state is
+    keyed by client_id), this proves it holds under real interleaved use."""
+    backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="1", year="2021")
+    backend.seed_library("Rodeo", media_type="album", state="ABSENT", foreign_album_id="fa-rodeo-3", artist="Travis Scott")
+    ws_a, ws_b = FakeWebSocket(), FakeWebSocket()
+    client_a, client_b = f"session-a-{uuid.uuid4()}", f"session-b-{uuid.uuid4()}"
+
+    async def invoke_tool_fake(name, arguments, cid, rid, confirmed=False, action_id=None):
+        return await backend.invoke(name, arguments, cid, rid, confirmed=confirmed, action_id=action_id)
+
+    async def discover_tools_fake(user_text, context):
+        catalog = [{"type": "function", "function": {"name": "media_plan_goal", "description": "plan media", "parameters": {"type": "object", "properties": {"goal": {"type": "string"}}, "required": ["goal"]}}}]
+        return [item["function"] for item in catalog], [{"metadata": {"canonical_name": "media_plan_goal", "score": 1.0}}], 1.0
+
+    app.invoke_tool = invoke_tool_fake
+    app.discover_tools = discover_tools_fake
+
+    for client_id, ws, title in ((client_a, ws_a, "Dune"), (client_b, ws_b, "Rodeo")):
+        app.httpx = _FakeHttpxModule([{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": f"get {title}"}}},
+        ]}}])
+        await app.respond(ws, client_id, str(uuid.uuid4()), f"Get {title}.")
+
+    action_a = app.pending.get(client_a)
+    action_b = app.pending.get(client_b)
+    assert action_a is not None and action_b is not None
+    assert action_a["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert action_b["arguments"]["confirmation_context"]["title"] == "Rodeo"
+    assert action_a["arguments"] != action_b["arguments"]
+    assert app.conversation_context.get(client_a, {}).get("latest_media_workflow", {}).get("title") != "Rodeo"
+
+    # Confirm session A; session B's pending confirmation must be untouched.
+    app.httpx = _FakeHttpxModule([{"message": {"content": "", "tool_calls": []}}], "Done, got Dune.")
+    await app.respond(ws_a, client_a, str(uuid.uuid4()), "Go for it.")
+    assert len(backend.submitted_writes) == 1
+    assert backend.submitted_writes[0]["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert client_b in app.pending, "confirming session A must never consume or clear session B's pending confirmation"
+
+
+# --- Failure injection: Plex unavailable during an accepted offer (#15) --
+
+@pytest.mark.asyncio
+async def test_plex_unavailable_during_offer_acceptance_is_truthful_no_write(session):
+    async def unavailable_invoke(name, arguments, cid, rid, confirmed=False, action_id=None):
+        if name == "plex_match_canonical_media":
+            return {"tool": name, "status": "unavailable", "result": {"error": "plex API returned HTTP 502", "error_code": "BACKEND_UNAVAILABLE", "retryable": True}}
+        return await session.backend.invoke(name, arguments, cid, rid, confirmed=confirmed, action_id=action_id)
+
+    session.app.invoke_tool = unavailable_invoke
+    offer = session.app.PendingOffer.create(session_id=session.client_id, subject_ref="subj-1", operation="plex_match_canonical_media")
+    session.app.pending_offers[session.client_id] = {"offer": offer, "arguments": {"title": "Cowboy Bebop"}, "description": "check whether it's in Plex"}
+    await session.turn("Yeah.")
+    assert session.client_id not in session.app.pending, "a failed read must never become a write confirmation"
+    assert not session.backend.submitted_writes
