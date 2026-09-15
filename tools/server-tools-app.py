@@ -2327,6 +2327,7 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
     prior_group = str(context.get("group", "")).casefold()
     prior_tools = {str(item).casefold() for item in context.get("tools", [])}
     referents = _search_tokens(" ".join(str(item) for item in context.get("referents", [])))
+    camera_signal = bool(re.search(r"\b(camera|cameras|frigate|front door|garage|snapshot|detection|detected|person|shirt|wearing|event|events)\b", lowered))
     ranked = []
     for item in REGISTRY:
         record = capability_record(item)
@@ -2341,11 +2342,11 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
             if name == "web_search" and not re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
             if name == "web_fetch" and re.search(r"\b(fetch|open|read|page|url|website|article)\b", lowered): score += 3
             if name == "frigate_stats" and re.search(r"\b(working|okay|online|offline|health|fps|detector)\b", lowered): score += 8
-            if name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
-            if name == "frigate_recent_events" and re.search(r"\b(alert|alerts|event|events|historical|earlier|ago)\b", lowered): score += 9
-            if name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
-            if name == "frigate_event_snapshot" and re.search(r"\b(event|detection|that|historical|earlier|ago)\b", lowered) and not re.search(r"\b(right now|currently|live|current)\b", lowered): score += 12
-            if name == "frigate_event_activity" and re.search(r"\b(doing|activity|what happened|what were)\b", lowered): score += 12
+            if camera_signal and name == "frigate_recent_events" and re.search(r"\b(recent|recently|motion|detected|was someone|who was)\b", lowered): score += 8
+            if camera_signal and name == "frigate_recent_events" and re.search(r"\b(alert|alerts|event|events|historical|earlier|ago)\b", lowered): score += 9
+            if camera_signal and name == "frigate_snapshot" and re.search(r"\b(describe|see|look|wearing|color|colour|right now|current image)\b", lowered): score += 8
+            if camera_signal and name == "frigate_event_snapshot" and re.search(r"\b(event|detection|that|historical|earlier|ago)\b", lowered) and not re.search(r"\b(right now|currently|live|current)\b", lowered): score += 12
+            if camera_signal and name == "frigate_event_activity" and re.search(r"\b(doing|activity|what happened|what were)\b", lowered): score += 12
             if prior_group == "cameras" and meta.get("group") == "frigate": score += 5
             if name.casefold() in prior_tools: score += 4
             if referents & terms: score += 2

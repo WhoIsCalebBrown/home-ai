@@ -22,6 +22,11 @@ def test_discovery_alerts_are_events_not_camera_stats():
     assert names("any alerts from the front camera")[:1] == ["frigate_recent_events"]
 
 
+def test_unrelated_activity_language_does_not_select_frigate():
+    assert names("how is Dumb and Dumber doing")[:1] in (["media_status"], ["media_get_workflow"])
+    assert names("what happened today in American politics")[:1] == ["web_search"]
+
+
 def test_discovery_handles_local_aliases_and_utilities():
     assert "lidarr_health" in names("what is the status of LIDAR")[:4]
     assert names("what is 17.5 percent of 438")[0] == "calculator"
