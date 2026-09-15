@@ -1853,9 +1853,37 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
     a user-facing lifecycle without changing any external system.
     """
     workflow_id = str(args.get("workflow_id", "")).strip()
-    row = next((item for item in _media_workflows() if item.get("workflow_id") == workflow_id), None)
+    workflow_rows = _media_workflows()
+    row = next((item for item in workflow_rows if item.get("workflow_id") == workflow_id), None)
+    if not row and (args.get("query") or args.get("title")):
+        # Read-only exact workflow lookup by presentation identity. Never do
+        # fuzzy provider lookup here; ambiguous title matches fail closed.
+        query = str(args.get("query") or args.get("title") or "")
+        parts = _media_goal_parts(query, args.get("media_type"))
+        title_query = parts.get("title_query") or query
+        title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did)\s+", "", title_query, flags=re.I)
+        title_query = re.sub(r"\s+(?:doing|going|ready|found|find|downloading|downloaded|in plex|there yet)\b.*$", "", title_query, flags=re.I).strip(" .?!")
+        requested_year = parts.get("requested_year")
+        norm = re.sub(r"[^a-z0-9]+", " ", title_query.casefold()).strip()
+        candidates = []
+        for candidate in workflow_rows:
+            identity = candidate.get("canonical_identity") or {}
+            candidate_title = re.sub(r"[^a-z0-9]+", " ", str(identity.get("title") or "").casefold()).strip()
+            if candidate_title != norm:
+                continue
+            if requested_year is not None and str(identity.get("year")) != str(requested_year):
+                continue
+            if args.get("media_type") and str(candidate.get("media_type") or identity.get("media_type")) != str(args["media_type"]):
+                continue
+            candidates.append(candidate)
+        if len(candidates) == 1:
+            row = candidates[0]
+            workflow_id = str(row.get("workflow_id"))
+        elif len(candidates) > 1:
+            return {"found": False, "status": "AMBIGUOUS", "query": query,
+                    "candidates": [{"workflow_id": x.get("workflow_id"), "canonical_identity": x.get("canonical_identity")} for x in candidates]}
     if not row:
-        return {"found": False, "status": "NOT_FOUND", "workflow_id": workflow_id}
+        return {"found": False, "status": "NOT_FOUND", "workflow_id": workflow_id, "query": args.get("query") or args.get("title")}
     identity = row.get("canonical_identity") or {}
     media_type = str(row.get("media_type") or identity.get("media_type") or "movie").casefold()
     if media_type == "anime":
@@ -2366,7 +2394,7 @@ REGISTRY = [
     ("media_policy_status", "Validate centralized media policies against live manager roots and quality/metadata profiles. Read-only; never changes provider state.", "read", "media_planner", {"media_type": {"type": "string"}}, media_policy_status),
     ("media_storage_status", "Show standard DB-library and permanent-library storage contracts without writing.", "read", "media_planner", {"media_type": {"type": "string"}}, media_storage_status),
     ("media_get_workflow", "Read one persisted media workflow by workflow ID; returns normalized lifecycle state and canonical identity.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_get_workflow),
-    ("media_status", "Read live canonical media workflow status from cli_debrid and exact Plex identity matches; never writes or retries.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_status),
+    ("media_status", "Read live canonical media workflow status by workflow ID or one exact existing title query; never writes or retries. Ambiguous title matches fail closed.", "read", "media_planner", {"workflow_id": {"type": "string"}, "query": {"type": "string"}, "title": {"type": "string"}, "media_type": {"type": "string"}}, media_status),
     ("media_diagnose", "Explain the first proven blocking boundary for one canonical media workflow; read-only and never retries or writes.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_diagnose),
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]

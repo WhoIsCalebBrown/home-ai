@@ -1234,7 +1234,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("lidarr_import_status", {"album_ids": context.get("referent_ids", [])})]
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
-    media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|how(?:'s| is)\s+.+\b(?:doing|going)|did it import|is it downloading|where is)\b", t)
+    media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
     if media_goal and media_nouns:
         return [("media_plan_goal", {"goal": text})]
