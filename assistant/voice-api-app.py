@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
-from subject_model import PendingOffer, ResolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action
+from subject_model import PendingOffer, ResolvedSubject, UnresolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action, unresolved_subject_from_dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from wyoming.asr import Transcribe, Transcript
@@ -1593,7 +1593,7 @@ def turn_context(client_id: str, text: str) -> dict:
     # provenance for genuine elliptical follow-ups.
     current = {key: prior[key] for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity", "latest_unresolved_subject",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
@@ -1640,7 +1640,7 @@ def turn_context(client_id: str, text: str) -> dict:
     # resolution is supplied separately through structured context.
     for key in (
         "latest_domain", "latest_resolved_referent", "latest_media_workflow",
-        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity",
+        "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity", "latest_unresolved_subject",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
     ):
@@ -2004,6 +2004,151 @@ _REFERENT_ARGUMENT_KEYS = {
 }
 
 
+_MEDIA_TYPE_WORDS = {"movie": "movie", "film": "movie", "show": "tv", "series": "tv",
+                      "album": "album", "record": "album", "anime": "anime"}
+
+
+def extract_media_type_hint(text: str) -> str | None:
+    lowered = text.casefold()
+    for word, media_type in _MEDIA_TYPE_WORDS.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return media_type
+    return None
+
+
+def extract_year_hint(text: str) -> int | None:
+    match = re.search(r"\b(19|20)\d{2}\b", text)
+    return int(match.group(0)) if match else None
+
+
+def enrichment_reply_hint(text: str, subject: "UnresolvedSubject | None") -> dict | None:
+    """Recognize a short reply that ENRICHES an already-pending unresolved
+    subject (a year, a media-type correction) rather than starting a fresh
+    request. Only meaningful when there is an unresolved subject to enrich
+    against -- a bare "2003." with no pending subject is not a hint about
+    anything. Covers: "It's a movie from 2003.", "The 2003 one.",
+    "I mean the one from 2003.", "2003.", "The Tommy Wiseau movie." (title-only
+    corrections are not extracted here; only year/media-type are structured
+    enough to merge safely without guessing at a new title)."""
+    if subject is None:
+        return None
+    year = extract_year_hint(text)
+    media_type = extract_media_type_hint(text)
+    if year is None and media_type is None:
+        return None
+    hints: dict = {}
+    if year is not None:
+        hints["year"] = year
+    if media_type is not None:
+        hints["media_type"] = media_type
+    return hints
+
+
+def guess_media_title(text: str) -> str:
+    """Best-effort title extraction from a fresh media discovery/request
+    utterance, for staging an UnresolvedSubject when canonical resolution
+    fails. Deliberately generic (strips known request/question framing and
+    media-type words), never a per-title special case."""
+    working = text.strip().rstrip("?.!")
+    working = re.sub(r"^(?:do you know|have you heard of|i want to request|i want|can you get|get me|please get|request|can you find|find)\s+", "", working, flags=re.I)
+    working = re.sub(r"^(?:a|an|the)\s+(?:movie|show|series|album|film|anime)\s+(?:called|named)\s+", "", working, flags=re.I)
+    working = re.sub(r"^(?:a|an|the)\s+(?:movie|show|series|album|film|anime)\s+", "", working, flags=re.I)
+    working = re.sub(r"^(?:movie|show|series|album|film|anime)\s+(?:called|named)\s+", "", working, flags=re.I)
+    working = re.sub(r"\s+from\s+(?:19|20)\d{2}$", "", working, flags=re.I)
+    return working.strip()
+
+
+def stage_unresolved_media_subject(client_id: str, title: str, **hints) -> None:
+    """Persist a media subject the user clearly named even though canonical
+    resolution failed -- failure to resolve must not erase what the user
+    asked about. Enriches an existing unresolved subject with the same title
+    instead of replacing it outright, so accumulated hints (media_type, then
+    later a year) are never lost across turns.
+    """
+    if not title:
+        return
+    context = dict(conversation_context.get(client_id, {}))
+    existing = unresolved_subject_from_dict(context.get("latest_unresolved_subject"))
+    if existing is not None and existing.title_or_name.casefold() == title.casefold():
+        subject = existing.enrich(**hints).with_failed_attempt()
+    else:
+        subject = UnresolvedSubject.new("media", title, **hints)
+    context["latest_unresolved_subject"] = subject.to_dict()
+    # Reuse the SAME referent-priority mechanism discovery_context()/
+    # semantic_query() already give latest_resolved_referent over a stale
+    # web topic -- an unresolved subject is still the strongest referent
+    # this session has, and must win the same way a resolved one does.
+    context["latest_resolved_referent"] = title
+    conversation_context[client_id] = context
+
+
+def promote_unresolved_subject(client_id: str) -> None:
+    """Clear the unresolved-subject slot once canonical identity is
+    established -- it may remain in audit/history but is no longer the
+    active identity (record_tool_referent/stage_media_confirmation already
+    set canonical_identity/latest_resolved_referent from the successful
+    result at the call site; this only clears the now-superseded slot)."""
+    if client_id not in conversation_context:
+        return
+    context = dict(conversation_context[client_id])
+    context.pop("latest_unresolved_subject", None)
+    conversation_context[client_id] = context
+
+
+# Tool-result relevance gate (spec items #6, #7). A tool name's prefix
+# indicates which semantic domain it belongs to; this is a generic mapping,
+# not a per-title or per-query special case. Only used to decide whether a
+# result may ground the FINAL answer -- it never blocks a tool from being
+# called, logged, or traced for debugging.
+_DOMAIN_TOOL_PREFIXES = {
+    "media": ("media_", "plex_", "lidarr_", "radarr_", "sonarr_", "slskd_", "qbittorrent_",
+              "torbox_", "music_", "beets_", "investigate_media", "web_search", "web_fetch"),
+    "weather": ("weather",),
+    "camera": ("frigate",),
+    "cameras": ("frigate",),
+    "web_research": ("web_",),
+    "server": ("get_storage_status", "get_server_overview", "list_containers", "container_",
+               "get_container_status", "restart_container", "get_docker", "qbittorrent_"),
+}
+
+
+def _effective_relevance_domain(context: dict) -> str | None:
+    """A tool-relevance domain, inferred more liberally than
+    context["domain"] alone: a discovery/unresolved/resolved media subject
+    still means "this turn is about media" even when explicit_domain() never
+    classified an explicit domain for a bare discovery question like "Do you
+    know the movie X?" (it has no lidarr/plex/sonarr/... noun for
+    explicit_domain to key on)."""
+    domain = context.get("domain")
+    if domain:
+        return domain
+    if context.get("discovery_subject") or context.get("latest_unresolved_subject") or context.get("canonical_identity"):
+        return "media"
+    return None
+
+
+def filter_relevant_tool_results(live_results: list[dict], context: dict) -> list[dict]:
+    """Keep only tool results relevant to the current turn's semantic
+    domain, so an unrelated read-only tool result (e.g. get_storage_status
+    surfacing alongside a movie-identification question) cannot silently
+    become supporting evidence for the final answer. Irrelevant results are
+    still in `live_results` for tracing/audit -- this function only
+    controls what reaches evidence_message()/stream_final().
+
+    A None effective domain (no signal either way) does not filter at all --
+    dropping evidence when direction is genuinely unknown would risk hiding
+    real answers, which is a worse failure mode than an occasional
+    unfiltered irrelevant result in an ambiguous turn.
+    """
+    domain = _effective_relevance_domain(context)
+    if not domain:
+        return live_results
+    prefixes = _DOMAIN_TOOL_PREFIXES.get(domain)
+    if not prefixes:
+        return live_results
+    return [item for item in live_results if str(item.get("tool", "")).startswith(prefixes)]
+
+
 def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result: dict) -> None:
     """After any identification-capable tool call, keep the subject it was
     asked about (or, if the result resolved a cleaner canonical title,
@@ -2302,12 +2447,26 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             # A successful Plex search establishes a media referent even when
             # it returns zero matches. It does not establish availability or
             # canonical identity; those require the matcher/tool result.
+            #
+            # latest_resolved_referent must be a plain string everywhere
+            # else in this file (discovery_context()/semantic_query() do
+            # str(value)/.casefold() on it, record_tool_referent() only ever
+            # writes a string) -- this branch previously wrote a
+            # {"type","title","source"} dict instead, which silently
+            # clobbered a good string referent with a structured value nothing
+            # downstream could actually use (discovery_context() would feed
+            # retrieval the literal Python repr of the dict as a "referent").
+            # Found by the real-transcript replay test
+            # (test_real_production_transcript_replay), not by inspection.
+            # Fixed to the same plain-string convention as every other
+            # writer; never overwrite an existing non-empty referent with an
+            # empty query.
             query = result.get("query") or prior_state.get("query") or ""
             conversation_context[client_id] = {
                 **prior_state, "domain": "media", "latest_domain": "media",
                 "kind": "plex_search", "group": "plex", "tools": tool_names,
                 "referent_type": "plex_query", "query": query,
-                "latest_resolved_referent": {"type": "media_query", "title": query, "source": "plex_search"},
+                "latest_resolved_referent": query or prior_state.get("latest_resolved_referent"),
             }
         elif last.get("tool") == "lidarr_missing_tracks":
             items = result.get("items") or []
@@ -2482,6 +2641,57 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
+    unresolved_subject = unresolved_subject_from_dict(conversation_context.get(client_id, {}).get("latest_unresolved_subject"))
+    if unresolved_subject is not None:
+        enrichment_hint = enrichment_reply_hint(user_text, unresolved_subject)
+        # A genuinely different explicit domain outranks the pending
+        # unresolved subject, same precedent as offers/disambiguation --
+        # "media" itself is not competing (a media-type-word enrichment
+        # reply is media-flavored language by construction).
+        enrichment_domain = explicit_domain(user_text)
+        has_competing_domain = enrichment_domain is not None and enrichment_domain != "media"
+        if enrichment_hint and not has_competing_domain:
+            enriched = unresolved_subject.enrich(**enrichment_hint)
+            enriched_goal = enriched.resolution_goal_text()
+            result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": request_id}, client_id, request_id)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            live_results_enriched = [result]
+            if plan_result.get("canonical_identity"):
+                promote_unresolved_subject(client_id)
+                record_tool_referent(client_id, "media_plan_goal", {"goal": enriched_goal}, result)
+                resolved_text = direct_structured_answer(user_text, live_results_enriched) or media_plan_response(user_text, live_results_enriched)
+                if not resolved_text:
+                    resolved_text = f"I found {plan_result['canonical_identity'].get('title', enriched.title_or_name)}."
+                if plan_result.get("confirmation_required"):
+                    stage_media_confirmation(client_id, request_id, plan_result)
+                elif not plan_result.get("ambiguous"):
+                    offer_question = stage_media_offer(client_id, plan_result)
+                    if offer_question:
+                        resolved_text = f"{resolved_text} {offer_question}"
+            elif plan_result.get("ambiguous") and plan_result.get("candidates"):
+                stage_disambiguation(client_id, plan_result["candidates"], enriched_goal)
+                resolved_text = media_plan_response(user_text, live_results_enriched) or "I found more than one possible match. Which one do you mean?"
+            else:
+                # Still unresolved even after enrichment: keep the subject
+                # (with the new hint merged in and a failed attempt
+                # recorded) rather than dropping it -- the user may enrich
+                # further or the assistant may need to say it still can't
+                # confirm a match.
+                context_after = dict(conversation_context.get(client_id, {}))
+                context_after["latest_unresolved_subject"] = enriched.with_failed_attempt().to_dict()
+                context_after["latest_resolved_referent"] = enriched.title_or_name
+                conversation_context[client_id] = context_after
+                resolved_text = f"I still couldn't confirm a match for {enriched.title_or_name}, even with that detail."
+            store_provenance(client_id, live_results_enriched)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="unresolved_subject_enrichment")
+            history.append({"role": "assistant", "content": resolved_text})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # No enrichment hint recognized, or a competing domain took over:
+        # leave the unresolved subject exactly as staged and fall through
+        # to normal routing for this turn (mirrors the offer/disambiguation
+        # precedent -- never silently consumed on an unrecognized reply).
     disambiguation = conversation_context.get(client_id, {}).get("pending_disambiguation")
     if disambiguation and _disambiguation_expired(disambiguation):
         context_after_expiry = dict(conversation_context.get(client_id, {}))
@@ -2880,6 +3090,17 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     media_direct = f"{media_direct} {offer_question}"
             if plan_result and plan_result.get("ambiguous") and plan_result.get("candidates"):
                 stage_disambiguation(client_id, plan_result["candidates"], user_text)
+            if plan_result:
+                if plan_result.get("canonical_identity"):
+                    promote_unresolved_subject(client_id)
+                elif not plan_result.get("ambiguous"):
+                    # Genuinely unresolvable: retain what the user named
+                    # rather than letting the failure erase the subject
+                    # (spec item #1) -- never for an enrichment retry's own
+                    # failure, which already has its own subject to keep.
+                    guessed_title = guess_media_title(user_text)
+                    if guessed_title:
+                        stage_unresolved_media_subject(client_id, guessed_title, media_type=extract_media_type_hint(user_text))
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
@@ -3039,6 +3260,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                             offer_question = stage_media_offer(client_id, plan_result)
                             if offer_question:
                                 post_direct = f"{post_direct} {offer_question}"
+                        if plan_result.get("canonical_identity"):
+                            promote_unresolved_subject(client_id)
+                        elif not plan_result.get("ambiguous"):
+                            guessed_title = guess_media_title(user_text)
+                            if guessed_title:
+                                stage_unresolved_media_subject(client_id, guessed_title, media_type=extract_media_type_hint(user_text))
                         if plan_result.get("ambiguous") and plan_result.get("candidates"):
                             # Same dead-path class as stage_media_offer
                             # above: this is the actual response path for a
@@ -3066,16 +3293,41 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
             store_provenance(client_id, live_results)
-            instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in live_results) else ""
-            evidence_messages = evidence_message(live_results)
-            evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
-            messages.extend(evidence_messages)
+            # live_results is kept intact for tracing/audit above; only the
+            # evidence actually shown to the model for final synthesis is
+            # filtered to what's relevant to this turn's domain/subject
+            # (spec items #6, #7) -- an irrelevant read-only tool result
+            # (e.g. get_storage_status alongside a movie-identification
+            # question) must never ground the answer, even though it was
+            # legitimately invoked and logged.
+            grounding_results = filter_relevant_tool_results(live_results, context)
+            instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in grounding_results) else ""
+            evidence_messages = evidence_message(grounding_results) if grounding_results else []
+            if evidence_messages:
+                evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
+                messages.extend(evidence_messages)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+        else:
+            grounding_results = live_results
+        # The Qwen tool-dispatch loop above appends a raw {"role": "tool",
+        # "name": ...} message for EVERY call it made, regardless of
+        # relevance -- grounding_results only filtered the separate
+        # evidence_message() block appended afterward. Drop irrelevant raw
+        # tool messages here too, or an irrelevant result (get_storage_status
+        # alongside a movie question) still reaches final synthesis through
+        # this earlier append, defeating the relevance gate above.
+        relevant_tool_names = {item.get("tool") for item in grounding_results}
+        all_called_tool_names = {item.get("tool") for item in live_results}
+        if relevant_tool_names != all_called_tool_names:
+            messages = [
+                message for message in messages
+                if not (message.get("role") == "tool" and message.get("name") not in relevant_tool_names)
+            ]
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=live_results, guard_domain=context.get("domain"))
+        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})

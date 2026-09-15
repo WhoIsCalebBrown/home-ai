@@ -381,3 +381,82 @@ def next_best_action(actions: list[Action]) -> Action | None:
         if name in by_name:
             return by_name[name]
     return actions[0]
+
+
+# --- UnresolvedSubject ------------------------------------------------------
+#
+# ResolvedSubject (above) assumes identity is already known. That is
+# insufficient for "we know WHAT the user means, but haven't canonicalized it
+# yet" -- a media_plan_goal call that returns no canonical_identity and no
+# candidates still carries real information (title, media_type, any year the
+# user gave) that must not be thrown away. Losing it is what let a later
+# "search for it online" fall back to a stale, unrelated web topic instead of
+# the movie the user had just been talking about.
+
+@dataclass
+class UnresolvedSubject:
+    subject_type: str
+    title_or_name: str
+    hints: dict = field(default_factory=dict)
+    constraints: dict = field(default_factory=dict)
+    candidate_ids: list = field(default_factory=list)
+    confidence: Confidence = "low"
+    source_turn: str = ""
+    failed_resolution_attempts: int = 0
+
+    @staticmethod
+    def new(subject_type: str, title_or_name: str, **hints) -> "UnresolvedSubject":
+        return UnresolvedSubject(subject_type=subject_type, title_or_name=title_or_name, hints=hints)
+
+    def enrich(self, **hints) -> "UnresolvedSubject":
+        """Merge new hints (e.g. a year given in a follow-up) without losing
+        anything already known. Never overwrites an existing hint value with
+        an empty one; a later, more specific hint replaces an earlier one."""
+        merged_hints = dict(self.hints)
+        for key, value in hints.items():
+            if value not in (None, "", []):
+                merged_hints[key] = value
+        return UnresolvedSubject(
+            subject_type=self.subject_type, title_or_name=self.title_or_name,
+            hints=merged_hints, constraints=dict(self.constraints),
+            candidate_ids=list(self.candidate_ids), confidence=self.confidence,
+            source_turn=self.source_turn, failed_resolution_attempts=self.failed_resolution_attempts,
+        )
+
+    def with_failed_attempt(self) -> "UnresolvedSubject":
+        return UnresolvedSubject(
+            subject_type=self.subject_type, title_or_name=self.title_or_name,
+            hints=dict(self.hints), constraints=dict(self.constraints),
+            candidate_ids=list(self.candidate_ids), confidence=self.confidence,
+            source_turn=self.source_turn, failed_resolution_attempts=self.failed_resolution_attempts + 1,
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def resolution_goal_text(self) -> str:
+        """Build a retry goal string from title + accumulated hints, for
+        re-attempting canonical resolution after an enriching reply (e.g.
+        title='The Room' + hints={'year': 2003} -> 'The Room 2003 movie')."""
+        parts = [self.title_or_name]
+        year = self.hints.get("year")
+        if year:
+            parts.append(str(year))
+        if self.subject_type == "media" and self.hints.get("media_type"):
+            parts.append(str(self.hints["media_type"]))
+        return " ".join(parts)
+
+
+def unresolved_subject_from_dict(data: dict | None) -> "UnresolvedSubject | None":
+    if not data:
+        return None
+    return UnresolvedSubject(
+        subject_type=data.get("subject_type", "media"),
+        title_or_name=data.get("title_or_name", ""),
+        hints=dict(data.get("hints") or {}),
+        constraints=dict(data.get("constraints") or {}),
+        candidate_ids=list(data.get("candidate_ids") or []),
+        confidence=data.get("confidence", "low"),
+        source_turn=data.get("source_turn", ""),
+        failed_resolution_attempts=int(data.get("failed_resolution_attempts") or 0),
+    )
