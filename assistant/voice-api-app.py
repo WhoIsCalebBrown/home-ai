@@ -1310,6 +1310,60 @@ def underspecified_read_request(text: str, context: dict | None = None) -> str |
     return None
 
 
+_DISCOVERY_QUESTION_PATTERNS = (
+    re.compile(r"\bdo you know(?: (?:the|this|that))?\s+(?:\w+\s+){0,4}?(?:called|named)\s+(.+)$", re.I),
+    re.compile(r"\bdo you know\s+(?:the|this|that)?\s*(.+)$", re.I),
+    re.compile(r"\bhave you heard of\s+(.+)$", re.I),
+    re.compile(r"\bwhat(?:'s| is)\s+(.+)$", re.I),
+    re.compile(r"\bcan you tell me what\s+(.+?)\s+is\b", re.I),
+    re.compile(r"\bwhat can you find (?:about|on)\s+(.+)$", re.I),
+    re.compile(r"\bthere'?s\s+a\s+\w+\s+called\s+(.+?),\s*do you know it\b", re.I),
+)
+_DISCOVERY_QUESTION_STOPWORDS = frozenset({
+    "it", "that", "this", "there", "them", "he", "she", "going on", "wrong",
+})
+
+
+def discovery_question(text: str) -> str | None:
+    """Recognize the closed grammar of identification questions and extract
+    the subject phrase, without deciding what kind of thing the subject is.
+
+    Covers: "do you know X" / "do you know the show called X", "have you
+    heard of X", "what is X" / "what's X", "can you tell me what X is",
+    "what can you find about X", "there's a show called X, do you know it".
+    This is a fixed, small set of question SHAPES, not a per-title regex --
+    adding a new title never requires touching this function. Whether the
+    extracted subject is media, general knowledge, or a web topic is left
+    entirely to bounded capability discovery/Qwen (spec section 4); this
+    function only prevents a discovery-shaped utterance from being silently
+    dropped or misread as something else, and lets the subject survive as a
+    referent for follow-up turns.
+    """
+    stripped = text.strip().rstrip("?.!")
+    if not stripped:
+        return None
+    for pattern in _DISCOVERY_QUESTION_PATTERNS:
+        match = pattern.search(stripped)
+        if not match:
+            continue
+        subject = match.group(1).strip().strip("?.!").strip()
+        if not subject or len(subject) > 80:
+            continue
+        if subject.casefold() in _DISCOVERY_QUESTION_STOPWORDS:
+            continue
+        # A referential subject ("do you know it") is not a fresh discovery
+        # -- it depends on an existing referent and must not manufacture a
+        # new one from the pronoun itself.
+        if has_referential_language(subject) and len(_tokens_for_discovery(subject)) <= 2:
+            continue
+        return subject
+    return None
+
+
+def _tokens_for_discovery(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.casefold())
+
+
 def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     """Resolve an explicit current-turn domain before applying conversational context."""
     lowered = routing_aliases(text).casefold()
@@ -1392,6 +1446,16 @@ def turn_context(client_id: str, text: str) -> dict:
         # generic discovery language such as "find it online" does not match
         # this invariant and therefore cannot inherit weather.
         current.update({"domain": "weather", "kind": "weather", "group": "weather", "tools": [], "location": prior.get("location", "")})
+    elif discovery_question(text):
+        # A discovery-shaped question ("do you know X", "what is X", "have
+        # you heard of X", ...) has no explicit domain of its own -- this
+        # does NOT decide media/general/web, it only makes sure the subject
+        # phrase survives as a referent for retrieval and for a later
+        # follow-up turn, instead of being silently dropped. Bounded
+        # capability discovery (discover_tools) and Qwen still decide which
+        # capability actually answers it.
+        current["latest_resolved_referent"] = discovery_question(text)
+        current["discovery_subject"] = discovery_question(text)
     # No explicit domain: leave current intent unset. The model-facing
     # semantic retriever decides it from the newest utterance; referential
     # resolution is supplied separately through structured context.
