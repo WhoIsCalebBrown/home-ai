@@ -1883,16 +1883,17 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
     rows = evidence.get("rows") or []
     raw_states = [str(item.get("state") or "") for item in rows]
     state_text = " ".join(raw_states).casefold()
-    if evidence.get("error"):
-        # A persisted workflow is history, not proof of current provider state.
-        # Never turn a read failure into stale progress or availability.
-        canonical_state, storage_class = "PARTIAL_STATUS", "unknown"
-    elif permanent.get("matched") and standard.get("matched"):
+    if permanent.get("matched") and standard.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "both"
     elif permanent.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "permanent_local"
     elif standard.get("matched"):
         canonical_state, storage_class = "AVAILABLE", "debrid"
+    elif evidence.get("error"):
+        # A persisted workflow is history, not proof of current provider state.
+        # A provider read failure blocks invented progress, but it must not
+        # override the absence of a positive Plex identity match above.
+        canonical_state, storage_class = "PARTIAL_STATUS", "unknown"
     elif any(token in state_text for token in ("blacklist", "no candidate", "no_candidate")):
         canonical_state, storage_class = "NO_CANDIDATE", "unknown"
     elif any(token in state_text for token in ("fail", "error")):

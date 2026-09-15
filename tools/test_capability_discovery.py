@@ -332,7 +332,26 @@ def test_media_status_never_falls_back_to_stale_workflow_on_provider_read_failur
     result = asyncio.run(module.media_status({"workflow_id": "wf-stale"}))
     assert result["canonical_state"] == "PARTIAL_STATUS"
     assert result["status_reason"] == "CLI_DEBRID_READ_FAILED"
-    assert result["storage_class"] == "unknown"
+
+
+def test_media_status_preserves_exact_plex_availability_when_provider_read_fails(monkeypatch, tmp_path):
+    import asyncio
+    module.MEDIA_WORKFLOWS_PATH = tmp_path / "media-workflows.json"
+    module._save_media_workflows([{
+        "workflow_id": "wf-visible", "media_type": "movie", "mode": "standard",
+        "canonical_identity": {"media_type": "movie", "tmdb_id": 1362, "title": "The Hobbit", "year": 1977},
+        "current_state": "SEARCHING", "storage_class": "debrid",
+    }])
+
+    async def plex(args):
+        return {"matched": args.get("library") == "Movies-DB", "match_method": "tmdb", "plex_rating_key": "79598"}
+
+    monkeypatch.setattr(module, "plex_match_canonical_media", plex)
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {"error": "database unavailable", "rows": []})
+    result = asyncio.run(module.media_status({"workflow_id": "wf-visible"}))
+    assert result["canonical_state"] == "AVAILABLE"
+    assert result["storage_class"] == "debrid"
+    assert result["status_reason"] == "CLI_DEBRID_READ_FAILED"
 
 
 def test_movie_plan_surfaces_cross_domain_tv_candidate_without_writing(monkeypatch, tmp_path):
