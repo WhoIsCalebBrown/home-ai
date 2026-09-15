@@ -43,6 +43,11 @@ def test_discovery_is_bounded():
     assert len(module.discover_capabilities("server media camera internet", 8)) <= 8
 
 
+def test_frigate_version_parser_accepts_live_plain_text_response():
+    assert module.parse_text_or_json_payload("0.17.2-3d4dd3a\n") == "0.17.2-3d4dd3a"
+    assert module.parse_text_or_json_payload('{"version":"0.17.2"}') == {"version": "0.17.2"}
+
+
 def test_lidarr_missing_tracks_preserves_album_identifier(monkeypatch):
     import asyncio
 

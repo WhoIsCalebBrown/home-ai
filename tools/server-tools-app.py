@@ -162,6 +162,30 @@ async def get_json(service: str, path: str, params: dict[str, Any] | None = None
         return r.json()
 
 
+def parse_text_or_json_payload(text: str) -> Any:
+    """Parse JSON when present, otherwise return a bounded plain-text body."""
+    body = text.strip()
+    if not body:
+        return ""
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return body[:256]
+
+
+async def get_text_or_json(service: str, path: str, timeout: float = 5) -> Any:
+    """Read a bounded endpoint that may legitimately return plain text."""
+    base, _ = SERVICES[service]
+    headers = {}
+    key = api_key(service)
+    if key:
+        headers["X-Api-Key"] = key
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(base + path, headers=headers)
+        r.raise_for_status()
+        return parse_text_or_json_payload(r.text)
+
+
 async def post_json(service: str, path: str, body: dict[str, Any] | None = None, timeout: float = 8) -> Any:
     base, _ = SERVICES[service]
     headers = {}
@@ -870,8 +894,9 @@ async def lidarr_import_status(args):
 
 
 async def frigate_status(_: dict[str, Any]) -> dict[str, Any]:
-    data = await get_json("frigate", "/api/version")
-    return {"reachable": True, "version": data.get("version") if isinstance(data, dict) else data}
+    data = await get_text_or_json("frigate", "/api/version")
+    version = data.get("version") if isinstance(data, dict) else data
+    return {"reachable": True, "version": version, "source": "frigate:/api/version"}
 
 
 async def frigate_stats(_: dict[str, Any]) -> dict[str, Any]:
