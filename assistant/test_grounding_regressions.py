@@ -129,6 +129,9 @@ def test_generic_media_and_local_status_variants_route_deterministically():
 
 def test_recent_front_door_events_are_local_history_not_web():
     assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_events"
+    assert preflight_plan("Can you check the camera right now?") == [("frigate_snapshot", {"camera": "front_door"})]
+    assert preflight_plan("What is happening at the front door?") == [("frigate_snapshot", {"camera": "front_door"})]
+    assert preflight_plan("What happened today in Canada?") == [("web_search", {"query": "What happened today in Canada?"})]
 
 
 def test_plex_recency_repairs_are_bounded_to_explicit_library_context():

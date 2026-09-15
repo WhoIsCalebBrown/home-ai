@@ -166,6 +166,137 @@ READ_ONLY_CONVERSATIONS = {
     ],
 }
 
+# Generated read-only conversation families. These deliberately exercise the
+# same semantic transitions with different natural language, without adding
+# any write-capable turn to the live audio lane.
+_GENERATED_CONVERSATION_FAMILIES = [
+    (
+        "server_weather",
+        [
+            ("How many containers are running?", {"list_containers"}),
+            ("Which containers are up right now?", {"list_containers"}),
+            ("Tell me the Docker running count.", {"list_containers"}),
+            ("Are all the containers running?", {"list_containers"}),
+            ("What is the current container total?", {"list_containers"}),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How cold is it outside?", {"weather_forecast"}),
+            ("What are conditions in Welland?", {"weather_forecast"}),
+            ("Will it rain tomorrow?", {"weather_forecast"}),
+            ("Give me the forecast for tomorrow.", {"weather_forecast"}),
+        ],
+    ),
+    (
+        "weather_server",
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How is the weather in Welland?", {"weather_forecast"}),
+            ("What is the forecast right now?", {"weather_forecast"}),
+            ("Will it rain today?", {"weather_forecast"}),
+            ("How warm is it outside?", {"weather_forecast"}),
+        ],
+        [
+            ("How many containers are running?", {"list_containers"}),
+            ("What Docker services are up?", {"list_containers"}),
+            ("Tell me how many containers are stopped.", {"list_containers"}),
+            ("Which containers are currently running?", {"list_containers"}),
+            ("How many containers are there?", {"list_containers"}),
+        ],
+    ),
+    (
+        "plex_storage",
+        [
+            ("What's the last thing added to Plex?", {"plex_recently_added"}),
+            ("What was recently added to my library?", {"plex_recently_added"}),
+            ("Show me the newest Plex addition.", {"plex_recently_added"}),
+            ("Which movie did Plex add last?", {"plex_recently_added"}),
+            ("What's new in Plex?", {"plex_recently_added"}),
+        ],
+        [
+            ("How much storage do I have left?", {"get_storage_status"}),
+            ("How much free space is on the server?", {"get_storage_status"}),
+            ("Is there enough disk space left?", {"get_storage_status"}),
+            ("How much room remains in cache?", {"get_storage_status"}),
+            ("What is the storage status?", {"get_storage_status"}),
+        ],
+    ),
+    (
+        "media_web",
+        [
+            ("How is The Hobbit doing?", {"media_status"}),
+            ("Is Dumb and Dumber ready?", {"media_status"}),
+            ("What's happening with The 10th Kingdom?", {"media_status"}),
+            ("Did Dumb and Dumber get found?", {"media_status"}),
+            ("Where is The Hobbit in the pipeline?", {"media_status"}),
+        ],
+        [
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("What happened today in American politics?", {"web_search", "web_fetch"}),
+            ("Search the web for current SpaceX news.", {"web_search", "web_fetch"}),
+            ("What are today's major world events?", {"web_search", "web_fetch"}),
+            ("Look up current technology developments.", {"web_search", "web_fetch"}),
+        ],
+    ),
+    (
+        "camera_web",
+        [
+            ("What's happening at the front door right now?", {"frigate_snapshot"}),
+            ("Is anyone at the front door now?", {"frigate_snapshot"}),
+            ("What does the front door camera show?", {"frigate_snapshot"}),
+            ("Can you check the camera right now?", {"frigate_snapshot"}),
+            ("Is there anyone at the door currently?", {"frigate_snapshot"}),
+        ],
+        [
+            ("What's happening in American politics today?", {"web_search", "web_fetch"}),
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("Can you search current news about AI?", {"web_search", "web_fetch"}),
+            ("What happened today in Canada?", {"web_search", "web_fetch"}),
+            ("Look up today's technology headlines.", {"web_search", "web_fetch"}),
+        ],
+    ),
+    (
+        "web_camera",
+        [
+            ("What's the latest news about Nvidia?", {"web_search", "web_fetch"}),
+            ("What happened today in American politics?", {"web_search", "web_fetch"}),
+            ("Search online for current AI news.", {"web_search", "web_fetch"}),
+            ("What are today's world events?", {"web_search", "web_fetch"}),
+            ("Look up the latest technology developments.", {"web_search", "web_fetch"}),
+        ],
+        [
+            ("What's at the front door right now?", {"frigate_snapshot"}),
+            ("Is anyone at the door currently?", {"frigate_snapshot"}),
+            ("Can you check the front door camera now?", {"frigate_snapshot"}),
+            ("What is happening at the front door?", {"frigate_snapshot"}),
+            ("Show me the live front door view.", {"frigate_snapshot"}),
+        ],
+    ),
+    (
+        "history_weather",
+        [
+            ("What happened at the front door about an hour ago?", {"frigate_recent_events"}),
+            ("Show me recent front door events.", {"frigate_recent_events"}),
+            ("What did the camera record this morning?", {"frigate_recent_events"}),
+            ("Were there any people at the front door recently?", {"frigate_recent_events"}),
+            ("What happened at the door earlier today?", {"frigate_recent_events"}),
+        ],
+        [
+            ("What's the weather today?", {"weather_forecast"}),
+            ("How cold is it outside?", {"weather_forecast"}),
+            ("What will the weather be tomorrow?", {"weather_forecast"}),
+            ("Will it rain today?", {"weather_forecast"}),
+            ("Give me the current Welland forecast.", {"weather_forecast"}),
+        ],
+    ),
+]
+for _family, _first_turns, _second_turns in _GENERATED_CONVERSATION_FAMILIES:
+    for _index, (_first, _first_tools) in enumerate(_first_turns):
+        _second, _second_tools = _second_turns[_index]
+        READ_ONLY_CONVERSATIONS[f"generated_{_family}_{_index:02d}"] = [
+            (_first, _first_tools), (_second, _second_tools)
+        ]
+
 # Independent read-only voice variants. These are intentionally phrased as
 # different user requests rather than repeated invocations of one sentence.
 # The matrix is executed through the real audio lane; it never includes a
@@ -348,9 +479,16 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", choices=[*sorted(READ_ONLY_SCENARIOS), "all"], default="containers")
-    parser.add_argument("--conversation", choices=sorted(READ_ONLY_CONVERSATIONS))
+    parser.add_argument("--conversation", choices=[*sorted(READ_ONLY_CONVERSATIONS), "all"])
     parser.add_argument("--client-id", default="qa-audio-e2e")
     args = parser.parse_args()
+    if args.conversation == "all":
+        results = []
+        for index, name in enumerate(sorted(READ_ONLY_CONVERSATIONS)):
+            turns = await run_conversation(name, f"{args.client_id}-{index}")
+            results.append({"conversation": name, "turns": turns})
+            print(json.dumps(results[-1], ensure_ascii=False, sort_keys=True))
+        return 1 if any(turn.get("error") for item in results for turn in item["turns"]) else 0
     if args.conversation:
         results = await run_conversation(args.conversation, args.client_id)
         print(json.dumps({"conversation": args.conversation, "turns": results}, ensure_ascii=False, sort_keys=True))

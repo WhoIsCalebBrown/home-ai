@@ -1278,6 +1278,14 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # read; a fresh title is still resolved by the planner.
     if latest_media.get("workflow_id") and re.search(r"\b(?:how(?:'s| is)|status|progress|doing|find|found|ready|download|downloading|stuck|taking|plex|import|there yet)\b", t, re.I):
         return [("media_status", {"workflow_id": latest_media["workflow_id"]})]
+    # A live camera request is distinct from an event-history query. Require
+    # an explicit camera/front-door signal plus live/visual language, and keep
+    # this before the historical branch.
+    if (re.search(r"\b(front\s+door|camera|frigate)\b", t, re.I)
+            and re.search(r"\b(?:now|right now|currently|at the moment|check|show|view|happening)\b", t, re.I)
+            and not re.search(r"\b(?:recent|recently|earlier|event|events|recorded)\b", t, re.I)
+            and not historical_camera_question(text)):
+        return [("frigate_snapshot", {"camera": "front_door"})]
     # Explicit historical camera scope outranks generic freshness words such
     # as "today" and "this morning". A public topic without camera nouns can
     # still route to web search below.
@@ -1300,8 +1308,10 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if re.search(r"\b(front\s+door|camera|frigate)\b", t) and re.search(r"\b(recent|recently|today|earlier|event|events|happened|recorded)\b", t, re.I):
         since, until = historical_camera_window(text)
         return [("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 20, "since": since, "until": until})]
-    # Explicit current external-information intent outranks inherited camera/media
-    # context and visual words such as "what happened".
+    # Explicit current-information intent is a hard domain boundary. It is
+    # evaluated after explicit camera/history shapes so "recent front door
+    # events" cannot be mistaken for public news, but before any inherited
+    # domain can influence the model.
     if explicit_web_search_request(text) or current_external_question(text):
         query = context.get("unresolved_request") if explicit_web_search_request(text) else text.strip()
         return [("web_search", {"query": query or text.strip()})]
