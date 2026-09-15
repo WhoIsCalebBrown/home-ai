@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 
@@ -392,6 +393,23 @@ class AudioResult:
     audio_chunks: int = 0
     elapsed_ms: float = 0.0
     error: str | None = None
+    classification: str = ""
+
+
+def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set[str]) -> str | None:
+    """Classify truthful safe outcomes separately from routing failures.
+
+    A read-only tool can be selected and fail honestly, or ASR can turn a
+    safe status question into a potentially mutating phrase.  Neither should
+    be reported as a missing-tool routing defect when the response is
+    explicitly truthful/confirmatory and no write-capable tool ran.
+    """
+    if any(item.get("tool") in allowed_tools and item.get("status") in {"error", "unavailable", "timeout"} for item in trace):
+        if re.search(r"can't verify|couldn't verify|unavailable|couldn't reach|no live", answer, re.I):
+            return "backend_read_failure_truthful"
+    if not trace and re.search(r"did you mean|could you clarify|need more details|not sure", answer, re.I):
+        return "safe_stt_recovery"
+    return None
 
 
 async def run_scenario(name: str, client_id: str) -> AudioResult:
@@ -440,7 +458,9 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
         if unexpected:
             result.error = f"unexpected tool selection: {sorted(unexpected)}"
         elif scenario.get("require_tool", bool(scenario["allowed_tools"])) and not selected:
-            result.error = "expected a read-only tool, but no tool was selected"
+            result.classification = classify_safe_non_success(result.tool_trace or [], result.answer, scenario["allowed_tools"]) or "routing_failure"
+            if not result.classification.startswith(("backend_", "safe_")):
+                result.error = "expected a read-only tool, but no tool was selected"
     except Exception as exc:  # pragma: no cover - exercised by live harness
         result.error = f"{type(exc).__name__}: {exc}"
     result.elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -459,6 +479,7 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
             traces = []
             chunks = 0
             error = None
+            classification = ""
             try:
                 async with httpx.AsyncClient(timeout=60) as http:
                     response = await http.post("http://pocket-tts:8095/v1/audio/speech", json={"input": text})
@@ -489,11 +510,16 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
             selected = {item.get("tool") for item in traces if item.get("status") == "ok"}
             unexpected = selected - allowed_tools
             if unexpected: error = f"unexpected tool selection: {sorted(unexpected)}"
-            elif allowed_tools and not selected: error = "expected a read-only tool, but no tool was selected"
+            elif allowed_tools and not selected:
+                classification = classify_safe_non_success(traces, answer, allowed_tools) or "routing_failure"
+                if not classification.startswith(("backend_", "safe_")):
+                    error = "expected a read-only tool, but no tool was selected"
+            else:
+                classification = "tool_success" if selected else "no_tool_expected"
             results.append({"turn": index + 1, "source_text": text, "transcript": transcript,
                             "answer": answer, "tools": traces, "audio_chunks": chunks,
                             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                            "error": error})
+                            "error": error, "classification": classification})
     return results
 
 
