@@ -929,6 +929,13 @@ def routing_aliases(text: str) -> str:
     # unmistakably surrounded by the local media/Plex domain.
     if re.search(r"\blitter\b", text, re.I) and re.search(r"\b(plex|music|album|download|media|artist|going\s+to|end\s+up|eventually|headed|added)\b", text, re.I):
         text = re.sub(r"\blitter\b", "Lidarr", text, flags=re.I)
+    # Bounded Plex-recency repairs observed in voice tests.  Do not globally
+    # alias these words: only repair them when the same utterance already has
+    # explicit Plex plus recency/addition language.
+    if re.search(r"\bplex\b", text, re.I) and re.search(r"\b(?:latest|newest|recent|last|added|addition)\b", text, re.I):
+        text = re.sub(r"\bedition\b", "addition", text, flags=re.I)
+    if re.search(r"\b(?:movie|film)\b", text, re.I) and re.search(r"\b(?:last|latest|newest|added)\b", text, re.I):
+        text = re.sub(r"\bduplex\b", "Plex", text, flags=re.I)
     # Faster-Whisper occasionally hears "storage" as "stores".  Keep this
     # correction tightly scoped to an unmistakable capacity question; do not
     # turn ordinary references to stores into infrastructure intent.
@@ -1208,7 +1215,8 @@ def deterministic_plan(text: str) -> list[tuple[str, dict]]:
 
 
 def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, dict]]:
-    t = text.lower()
+    routed_text = routing_aliases(text)
+    t = routed_text.lower()
     context = context or {}
     deterministic = deterministic_plan(text)
     if deterministic:

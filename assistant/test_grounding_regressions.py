@@ -123,6 +123,12 @@ def test_recent_front_door_events_are_local_history_not_web():
     assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_events"
 
 
+def test_plex_recency_repairs_are_bounded_to_explicit_library_context():
+    assert preflight_plan("Show me the latest Plex edition.") == [("plex_recently_added", {"limit": 1})]
+    assert preflight_plan("Which movie did Plex add last?") == [("plex_recently_added", {"limit": 1})]
+    assert "edition" in routing_aliases("The special edition is missing")
+
+
 def test_media_status_does_not_turn_acquisition_language_into_status():
     assert preflight_plan("Get Dumb and Dumber from 1994.") == [("media_plan_goal", {"goal": "Get Dumb and Dumber from 1994."})]
 
