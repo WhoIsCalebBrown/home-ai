@@ -2264,6 +2264,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             async with httpx.AsyncClient(timeout=None) as http:
                 payload = {"model": MODEL, "messages": messages, "tools": tools, "stream": False, "think": False,
                            "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
+                # Qwen3.5 can legitimately choose a plain answer under
+                # tool_choice=auto even when a live capability is required.
+                # The first pass is a dispatch decision, so require one of the
+                # semantically retrieved tools; after execution, synthesis is
+                # intentionally left unconstrained.
+                if _ == 0 and tools:
+                    payload["tool_choice"] = "required"
                 response = await http.post(f"{OLLAMA}/api/chat", json=payload)
                 response.raise_for_status()
                 message = response.json().get("message", {})
