@@ -37,7 +37,7 @@ jobs:
         # that actually has those deps.
         run: |
           python -m py_compile assistant/voice-api-app.py
-          python -m pytest -q assistant/test_tts_audio.py
+          python -m pytest -q assistant/test_tts_audio.py assistant/test_openai_gateway.py
           python -m pytest -q assistant/test_grounding_regressions.py qa --ignore=qa/test_assistant_conversation_integration.py
       - name: Run assistant conversation integration tests (production-shaped deps)
         if: matrix.name == 'home-ai-assistant'
