@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -66,6 +66,8 @@ media_status_display_title = namespace["media_status_display_title"]
 plex_query_from_speech = namespace["plex_query_from_speech"]
 guess_media_title = namespace["guess_media_title"]
 fresh_title_restatement = namespace["fresh_title_restatement"]
+media_intent = namespace["media_intent"]
+media_library_query = namespace["media_library_query"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -893,6 +895,42 @@ def test_fresh_title_restatement_rejects_bare_refinements():
     assert fresh_title_restatement("It's a movie from 2003.") is None
     assert fresh_title_restatement("I mean the one from 2003.") is None
     assert fresh_title_restatement("Can you request the movie?") is None
+
+
+def test_media_intent_classifies_the_five_operation_shapes():
+    """Not every sentence with a title means "request this" -- verify the
+    aggregated intent classifier correctly separates the five operation
+    shapes using the existing, already-tested predicates.
+
+    Note: a BARE title with no movie/show/album word and no year ("Add The
+    Room.") is a known, deliberately-not-widened gap in this deterministic
+    classifier -- media_identity_signal requires an explicit type word or
+    year, and broadening it to accept any bare acquisition-verb + proper
+    noun was tried and reverted: it collided with offer-acceptance replies
+    ("Get it.", "Yeah, get it.") that also survive the same "real content"
+    filter. That class of request still resolves correctly in production
+    via the Qwen tool-calling path (media_plan_goal stays in the discovered
+    candidate set and Qwen can call it directly), and once inside
+    media_plan_goal the unknown-media-type cross-domain search (tools/
+    server-tools-app.py) resolves it without requiring the type word --
+    this is deterministic PRE-routing only, not the resolver itself."""
+    assert media_intent("Can you request the movie The Room?") == "MEDIA_REQUEST"
+    assert media_intent("What's the status of The Room? Did I request it already?") == "MEDIA_STATUS"
+    assert media_intent("Do I have The Room on Plex?") == "MEDIA_LIBRARY_QUERY"
+    assert media_intent("Do you know the movie The Room?") == "MEDIA_DISCOVERY"
+    assert media_intent("Play The Room.") == "MEDIA_PLAY"
+
+
+def test_media_intent_titleless_request_is_still_media_request():
+    """"Can you add a movie?" has intent=MEDIA_REQUEST with no title yet --
+    that is exactly the NO_TITLE_GIVEN case media_plan_goal already handles
+    by asking a clarifying question, not a classification failure."""
+    assert media_intent("Can you add a movie?") == "MEDIA_REQUEST"
+
+
+def test_media_intent_none_for_unrelated_text():
+    assert media_intent("What's the weather like today?") is None
+    assert media_intent("How many containers are running?") is None
 
 
 if __name__ == "__main__":

@@ -1741,3 +1741,149 @@ async def test_unrelated_explicit_request_still_outranks_a_pending_title_clarifi
         final_text="It is 12 degrees in Welland.",
     )
     assert "movie" not in reply.casefold() and "title" not in reply.casefold()
+
+
+# --- Target behavior: "Add The Thing." -> year ambiguity -> "the older ----
+# --- one" -- reuses the EXISTING pending_disambiguation machinery ---------
+# --- (test_disambiguation_followup_language_matrix already proves this   --
+# --- for "Dune"; this is the literal user-specified example, kept        --
+# --- separate for direct traceability to the requirement). ---------------
+
+@pytest.mark.asyncio
+async def test_add_the_thing_year_ambiguity_the_older_one(session):
+    session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
+    session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
+
+    await session.turn(
+        "Add The Thing.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
+        ]}}],
+    )
+    disambiguation = session.app.conversation_context.get(session.client_id, {}).get("pending_disambiguation")
+    assert disambiguation is not None
+    assert {c.get("year") for c in disambiguation["candidates"]} == {"1982", "2011"}
+
+    calls_before = len(session.backend.call_log)
+    await session.turn("The older one.")
+    plan_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
+    assert plan_calls and "1982" in str(plan_calls[-1].get("goal", "")), "\"older\" (comparative) must resolve like \"old\""
+    # Confirmed identified -> a real confirmation prompt, never a silent write.
+    assert not session.backend.submitted_writes
+
+
+# --- Tool fan-out check: a media clarification reply must not trigger ----
+# --- global capability discovery for unrelated domains. ------------------
+
+@pytest.mark.asyncio
+async def test_disambiguation_reply_does_not_fan_out_to_unrelated_tools(session):
+    """"the older one" must be consumed by the pending_disambiguation
+    check BEFORE reaching discover_tools/Qwen at all -- a media
+    clarification reply must never cause camera/weather/other tool
+    discovery to run."""
+    session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
+    session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
+    await session.turn(
+        "Add The Thing.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
+        ]}}],
+    )
+    calls_before = [name for name, _ in session.backend.call_log]
+    await session.turn("The older one.")
+    new_calls = [name for name, _ in session.backend.call_log[len(calls_before):]]
+    assert new_calls == ["media_plan_goal"], f"a clarification reply must only touch media_plan_goal, got: {new_calls}"
+
+
+@pytest.mark.asyncio
+async def test_pending_title_clarification_does_not_fan_out_to_unrelated_tools(session):
+    await session.turn("Can you request the movie?")
+    calls_before = len(session.backend.call_log)
+    await session.turn("Interstellar")
+    new_calls = [name for name, _ in session.backend.call_log[calls_before:]]
+    assert new_calls == ["media_plan_goal"], f"a bare clarification reply must only touch media_plan_goal, got: {new_calls}"
+
+
+# --- Cancellation and expiry -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pending_title_clarification_can_be_cancelled_by_a_competing_domain(session):
+    """A genuinely new, unrelated explicit request cancels the stale
+    clarification rather than being force-fed into title resolution (the
+    clarification itself is left in place for its own TTL, matching the
+    offer/disambiguation precedent -- it is the NEW request that must not
+    be swallowed)."""
+    await session.turn("Can you request the movie?")
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is not None
+    reply = await session.turn(
+        "What's the weather like today?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {"location": "Welland"}}},
+        ]}}],
+        final_text="It is 12 degrees in Welland.",
+    )
+    assert "movie" not in reply.casefold() and "title" not in reply.casefold()
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is not None, (
+        "a stale clarification is left in place for its own TTL, same as the offer/disambiguation precedent -- "
+        "it is the competing request that is not swallowed by it, not the clarification itself that is cleared"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_title_clarification_expires(session):
+    await session.turn("Can you request the movie?")
+    clarification = session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification")
+    assert clarification is not None
+    clarification["created_at"] = 0.0  # force expiry
+    session.app.conversation_context[session.client_id]["pending_title_clarification"] = clarification
+
+    calls_before = len(session.backend.call_log)
+    await session.turn("Interstellar")
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is None
+    # Expired -- the reply falls through to normal routing (which may
+    # legitimately call some other tool, e.g. plex_search) instead of being
+    # force-tried against media_plan_goal as an answer to the stale question.
+    new_calls = [name for name, _ in session.backend.call_log[calls_before:]]
+    assert "media_plan_goal" not in new_calls
+
+
+@pytest.mark.asyncio
+async def test_pending_disambiguation_expires(session):
+    session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
+    session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
+    await session.turn(
+        "Add The Thing.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
+        ]}}],
+    )
+    disambiguation = session.app.conversation_context.get(session.client_id, {}).get("pending_disambiguation")
+    disambiguation["created_at"] = 0.0
+    session.app.conversation_context[session.client_id]["pending_disambiguation"] = disambiguation
+    reply = await session.turn("The older one.")
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_disambiguation") is None
+
+
+# --- Clarification vs. confirmation: never the same concept ---------------
+
+@pytest.mark.asyncio
+async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(session):
+    """A media clarification answer ("The older one.") and a write
+    confirmation answer ("Yeah.") are different concepts entirely --
+    resolving a candidate must never itself execute or authorize a write,
+    and must never be interpretable as answering an unrelated pending
+    confirmation."""
+    session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
+    session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
+    await session.turn(
+        "Add The Thing.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
+        ]}}],
+    )
+    await session.turn("The older one.")
+    # Resolving the candidate must stage a real confirmation prompt (a
+    # write requires an explicit "yes" of its own) -- never execute directly.
+    assert not session.backend.submitted_writes
+    action = session.app.pending.get(session.client_id)
+    assert action is not None, "identification must stage a real PendingConfirmation, not skip straight to a write"

@@ -1424,6 +1424,47 @@ def media_goal_request(text: str) -> bool:
     )
 
 
+def media_library_query(text: str) -> bool:
+    """"Do I have X on Plex?" / "Do I have any movies on my server?" -- a
+    question about what is already IN the library, distinct from a request
+    to acquire something (media_goal_request) or a check on an in-progress
+    acquisition's status (media_status_question). Reuses the exact same
+    "do i have / is there ... plex" framing _media_goal_parts already strips
+    and preflight_plan's existing plex-domain trigger already recognizes --
+    this is a named summary of that existing behavior, not a new route."""
+    return bool(re.search(r"\b(?:do i have|do we have|is there)\b.*\bplex\b", text, re.I)
+                or re.search(r"\bplex\b.*\b(?:do i have|do we have|is there)\b", text, re.I))
+
+
+def media_intent(text: str) -> str | None:
+    """Classify which media OPERATION an utterance is asking for, before
+    any title/media-identity resolution happens. Not every sentence that
+    contains a potential title means "request this" -- a status check, a
+    library-presence check, a discovery question, and a playback request
+    all look superficially similar to a request but must never be treated
+    as one. This aggregates the specific predicates that already decide
+    real routing (media_goal_request, media_status_question,
+    media_library_query, discovery_question, playback_request) into one
+    named, testable classification rather than duplicating their logic --
+    each of those predicates remains the actual routing authority; this
+    function documents and verifies their combined, mutually-exclusive
+    intent surface for the media domain.
+    """
+    if direct_file_request(text):
+        return None
+    if playback_request(text):
+        return "MEDIA_PLAY"
+    if media_status_question(text):
+        return "MEDIA_STATUS"
+    if media_library_query(text):
+        return "MEDIA_LIBRARY_QUERY"
+    if media_goal_request(text):
+        return "MEDIA_REQUEST"
+    if discovery_question(text) and media_identity_signal(text):
+        return "MEDIA_DISCOVERY"
+    return None
+
+
 def media_status_question(text: str) -> bool:
     # Keep backend-pipeline investigations on their existing route.  This
     # predicate is for a concrete media item's lifecycle, not questions such
@@ -1660,6 +1701,15 @@ def turn_context(client_id: str, text: str) -> dict:
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
+        # Pending media-resolution state (a disambiguation question or a
+        # missing-title clarification already asked) must survive a turn
+        # that does not consume it, the same way pending_offers/pending[]
+        # survive outside this dict entirely -- these two live INSIDE
+        # conversation_context, so without being carried forward here they
+        # were silently erased by this exact rebuild on the very next turn,
+        # even when respond()'s own competing-domain check said to leave
+        # them in place. Real gap found while building PendingMediaResolution.
+        "pending_disambiguation", "pending_title_clarification",
     ) if key in prior}
     domain = explicit_domain(text, prior)
     # A correction without a new action is a patch to the immediately preceding
@@ -2379,11 +2429,11 @@ def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | No
         matches = [c for c in candidates if str(c.get("year")) == year_match.group(0)]
         if len(matches) == 1:
             return matches[0]
-    if re.search(r"\b(new|newest|latest|recent)\b", lowered) and numeric_years:
+    if re.search(r"\b(new|newer|newest|latest|recent)\b", lowered) and numeric_years:
         matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[-1])]
         if len(matches) == 1:
             return matches[0]
-    if re.search(r"\b(old|oldest|original|first)\b", lowered) and numeric_years:
+    if re.search(r"\b(old|older|oldest|original|first)\b", lowered) and numeric_years:
         matches = [c for c in candidates if str(c.get("year")) == str(numeric_years[0])]
         if len(matches) == 1:
             return matches[0]

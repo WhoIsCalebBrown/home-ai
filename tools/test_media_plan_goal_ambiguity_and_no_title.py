@@ -259,3 +259,86 @@ def test_media_title_candidate_words_classifier_shapes():
     assert cand("what's in my library") == []
     assert cand("season 2 of stranger things") == ["2", "stranger", "things"]
     assert cand("request the movie The Room by Tommy Wiseau") == ["room", "by", "tommy", "wiseau"]
+
+
+# --- Unknown media type must not require the user to say "movie"/"show" ---
+
+@pytest.mark.asyncio
+async def test_unknown_media_type_resolves_via_cross_domain_search(app, monkeypatch):
+    """Target behavior: "Do I have Avengers on Plex?" has no movie/show
+    word and no year, so _media_goal_parts classifies media_type="unknown"
+    -- media_plan_goal must not just give up (the real production bug: the
+    unknown-kind branch skipped straight to ambiguous=True with zero
+    candidates and never searched anything). It must search movie+TV
+    together and resolve using the real identity/plex/arr logic, not a
+    parallel path."""
+    async def fake_radarr_search(args):
+        # An exact-title match ("Avengers", not "Avengers: Endgame") so this
+        # test isolates cross-domain resolution from the separate
+        # query-drift guardrail (tools/test_query_drift_guardrail.py),
+        # which would legitimately flag "avengers" -> "Avengers: Endgame"
+        # as too dissimilar on its own.
+        return {"matches": [{"title": "Avengers", "year": "1998", "tmdbId": 9320}]}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({"goal": "do i have avengers on plex", "media_type": None})
+
+    assert plan["canonical_identity"]["title"] == "Avengers"
+    assert plan["canonical_identity"]["media_type"] == "movie"
+
+
+@pytest.mark.asyncio
+async def test_unknown_media_type_cross_domain_tv_match_resolves_as_tv(app, monkeypatch):
+    """Same cross-domain search, but the real answer is a TV series --
+    proves the resolved kind is actually used (media_type="tv" in the
+    final canonical identity), not hardcoded to movie."""
+    async def fake_radarr_search(args):
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": [{"title": "The Office", "year": "2005", "tvdbId": 73244, "tmdbId": 2316}]}
+
+    async def fake_plex_match_canonical_media(args):
+        return {"matched": False, "candidates": []}
+
+    async def fake_arr_get(service, path, args=None):
+        return []
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "plex_match_canonical_media", fake_plex_match_canonical_media)
+    monkeypatch.setattr(app, "arr_get", fake_arr_get)
+
+    plan = await app.media_plan_goal({"goal": "do i have the office on plex"})
+
+    assert plan["canonical_identity"]["title"] == "The Office"
+    assert plan["canonical_identity"]["media_type"] == "tv"
+
+
+@pytest.mark.asyncio
+async def test_unknown_media_type_cross_domain_ambiguity_retains_candidates(app, monkeypatch):
+    """A tie across BOTH domains (or within one) must still surface real
+    candidates, not collapse to a bare dead end -- same discipline as the
+    single-domain NO_CONFIDENT_MATCH case."""
+    async def fake_radarr_search(args):
+        return {"matches": [{"title": "Titans", "year": "2011", "tmdbId": 1}]}
+
+    async def fake_sonarr_search(args):
+        return {"matches": [{"title": "Titans", "year": "2018", "tvdbId": 2}]}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+
+    plan = await app.media_plan_goal({"goal": "do i have titans"})
+
+    assert plan["canonical_identity"] is None
+    assert plan["ambiguous"] is True
+    assert plan["ambiguity_reason"] == "NO_CONFIDENT_MATCH"
+    media_types = {c["media_type"] for c in plan["candidates"]}
+    assert media_types == {"movie", "tv"}

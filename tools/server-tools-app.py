@@ -2094,6 +2094,36 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                              "episode_count": (owned.get("statistics") or {}).get("episodeCount") if owned else None}
             plan["steps"].append({"capability": "media.library.check", "owner": "plex", "reason": "avoid duplicate acquisition"})
             plan["steps"].append({"capability": "media.wanted.read", "owner": "sonarr", "reason": "determine whether the series is already managed"})
+    elif kind == "unknown":
+        # The user named something real (the NO_TITLE_GIVEN check above
+        # already passed) but said no movie/show/album word and no
+        # year-qualified phrase, so _media_goal_parts could not classify a
+        # domain -- e.g. "Do I have Avengers on Plex?". Requiring an
+        # explicit type word before resolution is the exact bug this branch
+        # fixes: search the movie and TV domains together (the two
+        # genuinely ambiguous-without-a-type-word domains; a bare mention
+        # with no "album"/"music"/"by ARTIST" language is not a sensible
+        # album search) and let scoring pick the real domain, the same way
+        # a person would not need to say "movie" to be understood. Bounded
+        # to media-domain sources only -- no camera/weather/other fan-out.
+        movie_lookup, tv_lookup = await asyncio.gather(radarr_search({"query": title}), sonarr_search({"query": title}))
+        combined_matches = [{**row, "_domain": "movie"} for row in movie_lookup.get("matches", [])]
+        combined_matches += [{**row, "_domain": "tv"} for row in tv_lookup.get("matches", [])]
+        identity, ambiguous, near_candidates = _pick_match(combined_matches, title, artist)
+        if identity:
+            # A confident cross-domain match: re-run the full plan with the
+            # now-known media type so plex/arr availability checks, query
+            # drift, and canonical identity all get the SAME real logic the
+            # movie/tv branches already use -- no duplicated availability
+            # code, no second parallel resolution path.
+            return await media_plan_goal({**args, "media_type": identity["_domain"]})
+        if ambiguous and near_candidates:
+            summaries = []
+            for row in near_candidates[:3]:
+                summaries.extend(_candidate_summaries([row], row.get("_domain", "movie")))
+            plan["candidates"] = summaries
+            plan["ambiguity_reason"] = "NO_CONFIDENT_MATCH"
+        plan["ambiguous"] = True
     else:
         plan["ambiguous"] = True
     identity = plan.get("canonical_identity") or {}
