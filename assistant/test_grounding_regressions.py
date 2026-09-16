@@ -534,7 +534,7 @@ def test_weather_asr_frame_does_not_become_a_location():
 def test_simple_structured_reads_bypass_synthesis_pass():
     weather = {"source": "Open-Meteo", "days_from_now": 0, "temperature_unit": "C",
                "location": {"name": "Welland"}, "current": {"temperature_2m": 20, "weather_code": 0}}
-    assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) == "It's about 20 degrees Celsius in Welland with clear skies."
+    assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) == "It's about 20 degrees Celsius in Welland. It's clear skies."
     assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
 
 
