@@ -6,6 +6,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY tools/server-tools-app.py ./server-tools-app.py
+COPY tools/canonical_identity.py ./canonical_identity.py
+COPY tools/workflow_events.py ./workflow_events.py
 RUN pip install --no-cache-dir fastapi==0.115.6 uvicorn[standard]==0.34.0 httpx==0.28.1 pydantic==2.10.6
 
 EXPOSE 8090
