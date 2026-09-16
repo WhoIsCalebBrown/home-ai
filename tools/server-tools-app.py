@@ -1972,6 +1972,31 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
               and (not artist_cf or artist_cf in json.dumps(m).casefold())]
     if len(exact) == 1:
         return exact[0], False, []
+    if len(exact) > 1:
+        # Real live-verified gap: an EXACT title tie (e.g. two genuinely
+        # different Radarr entries both literally titled "Cast Away", one
+        # the real 2000 Tom Hanks film, one an obscure 2017 film) has zero
+        # remaining title-relevance uncertainty -- the only open question
+        # is WHICH same-named entry, so a decisive real-world popularity
+        # gap is trusted here specifically. This is deliberately a much
+        # stronger rule than the capped fuzzy-match tiebreaker below (which
+        # must stay weak: a small vote_count edge between two DIFFERENT
+        # titles must never manufacture false confidence -- that is a
+        # different question with real remaining uncertainty). Threshold:
+        # an order-of-magnitude-plus gap (>=10x) AND a real minimum floor
+        # (>=50 votes) on the leader, so two near-zero counts (noise, not
+        # signal) can never manufacture confidence -- chosen against the
+        # live-observed shape (695,975 vs 1: ratio ~696,000x) with headroom
+        # for a real remake-ambiguity case (comparable counts) to still
+        # correctly fail closed below.
+        ranked_exact = sorted(exact, key=lambda m: m.get("vote_count") or 0, reverse=True)
+        top_votes = ranked_exact[0].get("vote_count") or 0
+        runner_up_votes = ranked_exact[1].get("vote_count") or 0
+        if top_votes >= 50 and runner_up_votes * 10 <= top_votes:
+            return ranked_exact[0], False, []
+        # Otherwise fall through to the generic scored/margin path below --
+        # a genuinely comparable-popularity exact tie must still fail
+        # closed and surface real candidates, exactly as before this fix.
     wanted = set(re.findall(r"[a-z0-9]+", title_cf))
     if "kai" in wanted:
         kai_matches = [row for row in matches if "kai" in set(re.findall(r"[a-z0-9]+", str(row.get("title") or "").casefold()))]
