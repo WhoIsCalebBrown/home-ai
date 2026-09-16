@@ -101,6 +101,9 @@ class FakeToolsBackend:
         self.submitted_writes: list[dict] = []
         self.consumed_confirmations: set[str] = set()
         self.call_log: list[tuple[str, dict]] = []
+        self.simulate_drift_for: str | None = None
+        self.drift_candidate_title: str = ""
+        self.drift_candidate_year: str | None = None
 
     def seed_library(self, title: str, *, media_type: str, state: str, **identity_fields):
         canonical_id = identity_fields.get("tmdb_id") or identity_fields.get("tvdb_id") or identity_fields.get("foreign_album_id") or title
@@ -145,6 +148,20 @@ class FakeToolsBackend:
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
+            if self.simulate_drift_for and self.simulate_drift_for.casefold() in goal.casefold():
+                # Simulates the real tools/server-tools-app.py query-drift
+                # guardrail's output shape for a search that resolved a
+                # single, low-similarity candidate -- this conversation-level
+                # test proves the ASSISTANT correctly turns that into a
+                # disambiguation prompt, not that this fake reimplements the
+                # real difflib-based drift detection itself (that is
+                # unit/integration-tested directly against the real function
+                # in tools/test_query_drift_guardrail.py).
+                return {"tool": name, "status": "ok", "result": {
+                    "canonical_identity": None, "current_state": "AMBIGUOUS_IDENTITY", "ambiguous": True,
+                    "confirmation_required": False, "ambiguity_reason": "QUERY_DRIFT",
+                    "candidates": [{"title": self.drift_candidate_title, "year": self.drift_candidate_year, "media_type": "movie"}],
+                }}
             title = goal
             all_known_titles = (
                 [e["identity"].get("title") for e in self.library.values()]
@@ -1508,3 +1525,42 @@ async def test_storage_topic_switch_and_return_to_media_subject(session):
     plan_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
     assert plan_calls and "room" in str(plan_calls[-1].get("goal", "")).casefold()
     assert "terabyte" not in reply4.casefold() and "cache" not in reply4.casefold()
+
+
+# --- Query-drift guardrail, conversation level (fresh fixture, not "The Room") -
+
+@pytest.mark.asyncio
+async def test_query_drift_asks_for_clarification_instead_of_silent_wrong_match(session):
+    """A deliberately-planted title-mangling bug (goal "The Beacon" somehow
+    resolving to a lone candidate titled "Beach Party") would, on the real
+    tools/server-tools-app.py side, be caught by the query-drift guardrail
+    and returned as ambiguous=True/QUERY_DRIFT rather than a confident
+    canonical_identity. This test proves the ASSISTANT side of that contract:
+    given that shape, it must ask a clarifying question, never silently
+    proceed as if it had confidently identified anything."""
+    session.backend.simulate_drift_for = "The Beacon"
+    session.backend.drift_candidate_title = "Beach Party"
+    session.backend.drift_candidate_year = "1963"
+
+    reply = await session.turn(
+        "Can you request the movie The Beacon?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Beacon", "media_type": "movie"}}},
+        ]}}],
+    )
+    assert "beach party" in reply.casefold() or "which one" in reply.casefold() or "mean" in reply.casefold(), (
+        "a drifted match must produce a clarifying question naming the uncertain candidate, not a silent answer"
+    )
+    assert session.client_id not in session.app.pending, "a drifted match must never become a write confirmation"
+    assert not session.backend.submitted_writes
+    disambiguation = session.app.conversation_context.get(session.client_id, {}).get("pending_disambiguation")
+    assert disambiguation is not None, "the existing disambiguation machinery must be reused, not a second path"
+    assert disambiguation["candidates"][0]["title"] == "Beach Party"
+
+    # A bare "yes" must not silently accept the uncertain candidate either --
+    # same never-guess discipline as any other disambiguation.
+    calls_before = len(session.backend.call_log)
+    reply2 = await session.turn("Yeah.")
+    assert len(session.backend.call_log) == calls_before, "an unresolved reply must not invoke any tool"
+    assert session.client_id not in session.app.pending
+    assert not session.backend.submitted_writes
