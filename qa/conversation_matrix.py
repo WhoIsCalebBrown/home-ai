@@ -22,6 +22,7 @@ def load_router():
         "turn_context", "resolved_followup_text", "is_repair_turn", "repair_route_text",
         "contextual_entity_resolution", "weather_location_from_text", "artist_from_speech",
         "social_acknowledgement", "retained_media_status_repair", "DOMAIN_ENTITIES", "ARTIST_ALIASES",
+        "_descriptive_media_clue",
     }
     body = []
     for node in tree.body:

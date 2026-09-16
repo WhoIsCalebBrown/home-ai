@@ -125,6 +125,10 @@ class FakeToolsBackend:
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
+        self.person_index: dict[str, str] = {}  # casefold(person name) -> title, mirrors the real web-discovery fallback's person-hint -> title resolution (tools/server-tools-app.py's _web_discover_title), tested there directly against real functions -- this fake only proves the ASSISTANT-side handoff after identity resolves, not the discovery mechanism itself.
+
+    def seed_person(self, person: str, title: str) -> None:
+        self.person_index[person.casefold()] = title
 
     def seed_library(self, title: str, *, media_type: str, state: str, **identity_fields):
         canonical_id = identity_fields.get("tmdb_id") or identity_fields.get("tvdb_id") or identity_fields.get("foreign_album_id") or title
@@ -199,14 +203,19 @@ class FakeToolsBackend:
                     "candidates": [{"title": self.drift_candidate_title, "year": self.drift_candidate_year, "media_type": "movie"}],
                 }}
             title = goal
-            all_known_titles = (
-                [e["identity"].get("title") for e in self.library.values()]
-                + [hit["canonical_identity"].get("title") for hits in self.web_index.values() for hit in hits]
-            )
-            for candidate_title in all_known_titles:
-                if candidate_title and candidate_title.casefold() in goal.casefold():
-                    title = candidate_title
+            for person, mapped_title in self.person_index.items():
+                if person in goal.casefold():
+                    title = mapped_title
                     break
+            else:
+                all_known_titles = (
+                    [e["identity"].get("title") for e in self.library.values()]
+                    + [hit["canonical_identity"].get("title") for hits in self.web_index.values() for hit in hits]
+                )
+                for candidate_title in all_known_titles:
+                    if candidate_title and candidate_title.casefold() in goal.casefold():
+                        title = candidate_title
+                        break
             identity = self._find_identity(title)
             if identity is None:
                 return {"tool": name, "status": "ok", "result": {"canonical_identity": None, "current_state": "NOT_FOUND", "ambiguous": False, "confirmation_required": False}}
@@ -243,7 +252,7 @@ class FakeToolsBackend:
             # request-shaped ask), never merely because the item is
             # identified/absent -- "do I have it?" must not itself produce a
             # write confirmation.
-            is_request_shaped = bool(re.search(r"\b(get|request|add|download|acquire)\b", goal, re.I))
+            is_request_shaped = bool(re.search(r"\b(get|give|grab|find|add|request|want|put|download|acquire)\b", goal, re.I))
             confirmation_required = state != "AVAILABLE_IN_PLEX" and state != "NOT_FOUND" and is_request_shaped
             result = {"canonical_identity": identity, "current_state": state, "ambiguous": False,
                       "confirmation_required": confirmation_required, "workflow_id": workflow_id,
@@ -1887,3 +1896,122 @@ async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(
     assert not session.backend.submitted_writes
     action = session.app.pending.get(session.client_id)
     assert action is not None, "identification must stage a real PendingConfirmation, not skip straight to a write"
+
+
+# --- Descriptive media discovery (real live production bug): a plain --
+# --- question about a media item, described by person + plot rather   --
+# --- than a known title, must reach media_plan_goal -- not the plex   --
+# --- library-search dead end, and not the old "no matching live       --
+# --- workflow" status short-circuit. Reproduced through the REAL      --
+# --- respond()/preflight_plan deterministic path, not helper calls.   --
+
+@pytest.mark.asyncio
+async def test_scenario_2_descriptive_question_reaches_media_plan_goal_not_plex_search(session):
+    """Real production bug: "What's that Brad Pitt movie about fly fishing
+    in Montana?" was deterministically routed to plex_search with the
+    entire descriptive sentence as the literal library query (zero
+    matches, "I couldn't find that ... in my library"). It must instead
+    reach media_plan_goal so structured lookup and the web-discovery
+    fallback get a chance."""
+    reply = await session.turn("What's that Brad Pitt movie about fly fishing in Montana?")
+    called = [name for name, _ in session.backend.call_log]
+    assert "media_plan_goal" in called
+    assert "plex_search" not in called
+    assert "in my library" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_scenario_3_descriptive_question_does_not_hit_old_status_dead_end(session):
+    """Real production bug (0.06s canned response, confirmed via live
+    trace): "What's that Tom Hanks movie where he's stuck on an island
+    with a volleyball?" was classified MEDIA_STATUS purely because "stuck"
+    collides with download-status vocabulary, triggering the
+    no-matching-live-workflow short-circuit before Qwen or media_plan_goal
+    were ever reached. It must now reach media_plan_goal instead."""
+    reply = await session.turn("What's that Tom Hanks movie where he's stuck on an island with a volleyball?")
+    called = [name for name, _ in session.backend.call_log]
+    assert "media_plan_goal" in called
+    assert "media_status" not in called
+    assert "matching live workflow" not in reply.casefold()
+
+
+@pytest.mark.parametrize("text", [
+    "What's that Brad Pitt movie about fly fishing in Montana?",
+    "What is that Brad Pitt movie about fly fishing in Montana?",
+    "What's the name of the Brad Pitt movie where he fly fishes?",
+    "Which Brad Pitt movie has fly fishing in Montana?",
+    "Do you know the Brad Pitt movie where he fly fishes?",
+    "Can you identify the Brad Pitt movie with fly fishing?",
+])
+@pytest.mark.asyncio
+async def test_phrasing_variants_all_reach_media_plan_goal(session, text):
+    """Item 10: several phrasings of the same descriptive question must
+    all converge on the real identity resolver, none interpreted as
+    workflow status or a bare library search."""
+    await session.turn(text)
+    called = [name for name, _ in session.backend.call_log]
+    assert "media_plan_goal" in called, text
+    assert "media_status" not in called, text
+
+
+@pytest.mark.parametrize("text", [
+    "I want the Brad Pitt fly fishing movie.",
+    "Add the Brad Pitt movie where he fishes in Montana.",
+    "Get me that Brad Pitt fishing movie.",
+    "Request the movie with Brad Pitt and fly fishing.",
+])
+@pytest.mark.asyncio
+async def test_request_variants_reach_media_plan_goal_and_proceed_to_confirmation(session, text):
+    """Item 11: request-shaped descriptive variants use the SAME identity
+    resolution machinery (media_plan_goal), then proceed to normal
+    confirmation once resolved -- never a second, independent resolver."""
+    session.backend.seed_person("brad pitt", "A River Runs Through It")
+    session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
+    await session.turn(text)
+    called = [name for name, _ in session.backend.call_log]
+    assert "media_plan_goal" in called, text
+    action = session.app.pending.get(session.client_id)
+    assert action is not None, f"a resolved request must stage a real confirmation, not write directly: {text}"
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_knowledge_to_availability_handoff(session):
+    """Item 12: descriptive discovery resolves identity (read-only) and
+    promotes it to a resolved subject; a LATER "Do I have it?" uses that
+    subject for a real Plex availability check, and "if not, get it"
+    proceeds to normal request planning -- never a production write during
+    this exchange."""
+    session.backend.seed_person("tom hanks", "Cast Away")
+    session.backend.seed_library("Cast Away", media_type="movie", state="ABSENT", tmdb_id="8358")
+
+    reply1 = await session.turn("What's that Tom Hanks movie where he's stuck on an island with a volleyball?")
+    assert "cast away" in reply1.casefold()
+    assert session.client_id not in session.app.pending, "a read-only identity question must never itself stage a write confirmation"
+
+    reply2 = await session.turn(
+        "Do I have it?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cast Away"}}},
+        ]}}],
+    )
+    assert "cast away" in reply2.casefold()
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_knowledge_to_request_handoff(session):
+    """Item 13: descriptive discovery resolves identity; "Add it." then
+    proceeds through normal media planning and stops at strict
+    confirmation -- no production write during QA."""
+    session.backend.seed_person("brad pitt", "A River Runs Through It")
+    session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
+
+    reply1 = await session.turn("What's that Brad Pitt movie about fly fishing in Montana?")
+    assert "a river runs through it" in reply1.casefold()
+    assert session.client_id not in session.app.pending
+
+    await session.turn("Add it.")
+    action = session.app.pending.get(session.client_id)
+    assert action is not None, "a request following identity resolution must stop at a real confirmation prompt"
+    assert not session.backend.submitted_writes
