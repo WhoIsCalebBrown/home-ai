@@ -1440,3 +1440,71 @@ async def test_discovery_question_never_selects_irrelevant_tools_for_multiple_me
             final_text=f"{title} is a {media_type}.",
         )
         assert "terabyte" not in reply.casefold() and "free on your" not in reply.casefold(), f"{utterance!r} must not ground on get_storage_status"
+
+
+# --- Second real production transcript replay (stale-production, items #8-12)
+# Reproduces: "Can you request the movie The Room?" (with an actually-correct
+# canonical match this time -- the TOOLS-level "Room" false-positive bug is
+# regression-tested directly in tools/test_media_goal_title_extraction.py,
+# since this conversation harness's FakeToolsBackend does its own simplified
+# title matching and never exercises the real _media_goal_parts regex bug),
+# then a follow-up correction, an explicit storage-topic switch, and a
+# return to the media subject -- all through the real respond() path.
+
+@pytest.mark.asyncio
+async def test_storage_topic_switch_and_return_to_media_subject(session):
+    session.backend.seed_library("The Room", media_type="movie", year="2003", tmdb_id="17181", state="AVAILABLE_IN_PLEX")
+
+    # Turn 1: explicit request -- resolves confidently (fake backend has an
+    # exact, unambiguous match) and reports existing availability rather than
+    # planning a new request.
+    reply1 = await session.turn(
+        "Can you request the movie The Room?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Room", "media_type": "movie"}}},
+        ]}}],
+    )
+    assert "storage" not in reply1.casefold() and "terabyte" not in reply1.casefold()
+    assert "weather" not in reply1.casefold()
+
+    # Turn 2: follow-up correction/reinforcement -- must not call
+    # get_storage_status, must not abandon the media subject.
+    calls_before = len(session.backend.call_log)
+    reply2 = await session.turn("No, I mean a movie called The Room.")
+    new_calls = session.backend.call_log[calls_before:]
+    assert not any(name == "get_storage_status" for name, _ in new_calls)
+    context_after_correction = session.app.conversation_context.get(session.client_id, {})
+    assert "room" in (context_after_correction.get("latest_resolved_referent") or "").casefold()
+
+    # Turn 3: explicit new storage question -- must get a real storage
+    # answer, never "Room is ready in Plex" or any media-grounded response.
+    reply3 = await session.turn(
+        "What's using up most of the space in the cache?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "get_storage_status", "arguments": {}}},
+        ]}}],
+        final_text="Your cache is mostly used by the downloads share.",
+    )
+    assert "room" not in reply3.casefold() and "plex" not in reply3.casefold(), (
+        "an explicit new storage question must never be answered with stale media context"
+    )
+    storage_calls = [args for name, args in session.backend.call_log if name == "get_storage_status"]
+    assert storage_calls, "the explicit storage question must actually invoke get_storage_status"
+
+    # Turn 4: return to media -- explicit intent must recover the subject,
+    # not get hijacked by the just-established storage domain, and an
+    # irrelevant get_storage_status result (if somehow invoked) must not be
+    # eligible to ground this answer either.
+    reply4 = await session.turn(
+        "Can you request The Room by Tommy Wiseau?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "get_storage_status", "arguments": {}}},
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Room", "media_type": "movie"}}},
+        ]}}],
+    )
+    assert session.last_stream_payload is None or "179100000000" not in json.dumps(session.last_stream_payload.get("messages", [])), (
+        "get_storage_status must not ground the returned-to-media answer even if accidentally invoked"
+    )
+    plan_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
+    assert plan_calls and "room" in str(plan_calls[-1].get("goal", "")).casefold()
+    assert "terabyte" not in reply4.casefold() and "cache" not in reply4.casefold()
