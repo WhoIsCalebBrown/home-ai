@@ -915,7 +915,10 @@ def all_live_results_failed(results: list[dict]) -> bool:
     if not results:
         return False
     if results and all(item.get("tool") in {"web_search", "web_fetch"} for item in results):
-        return not any(web_result_useful(item) or (item.get("tool") == "web_fetch" and item.get("status") == "ok") for item in results)
+        # A search that ran and legitimately found nothing is not an outage —
+        # that case gets its own honest "no results" answer elsewhere. Only a
+        # real transport/status failure counts as a live-tool failure here.
+        return not any(item.get("status") == "ok" for item in results)
     return all(
         item.get("status") != "ok"
         or not isinstance(item.get("result"), dict)
@@ -2132,11 +2135,6 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return deterministic
     if direct_file_request(text) or playback_request(text):
         return []
-    # Fresh public-information questions must outrank the broad media-status
-    # grammar below ("what's happening in Canada today" was otherwise
-    # mistaken for a retained media workflow).
-    if current_external_question(text) or explicit_web_search_request(text):
-        return [("web_search", {"query": text.strip()})]
     # Library recency questions contain the verb "add" but are read-only
     # Plex queries, not acquisition goals. Resolve them before the broad
     # acquisition-language matcher.
