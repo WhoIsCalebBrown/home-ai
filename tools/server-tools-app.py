@@ -585,6 +585,7 @@ async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
             "latitude": place["latitude"], "longitude": place["longitude"],
             "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
             "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "hourly": "temperature_2m,weather_code,precipitation_probability,precipitation",
             "temperature_unit": "celsius", "wind_speed_unit": "kmh", "forecast_days": max(2, offset + 1), "timezone": "auto"})
         forecast.raise_for_status(); data = forecast.json()
     daily = {k: (v[offset] if isinstance(v, list) and len(v) > offset else None) for k, v in data.get("daily", {}).items()}
@@ -600,9 +601,25 @@ async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
                 data["current"][key] = convert(data["current"][key])
         for key in ("temperature_2m_max", "temperature_2m_min"):
             daily[key] = [convert(value) for value in daily.get(key, [])] if isinstance(daily.get(key), list) else convert(daily.get(key))
+        hourly = data.get("hourly", {})
+        if isinstance(hourly, dict):
+            hourly["temperature_2m"] = [convert(value) for value in hourly.get("temperature_2m", [])]
+    hourly = data.get("hourly", {}) if isinstance(data.get("hourly"), dict) else {}
+    hourly_points = []
+    daily_times = data.get("daily", {}).get("time", [])
+    target_date = daily_times[offset] if isinstance(daily_times, list) and len(daily_times) > offset else None
+    hourly_times = hourly.get("time", []) if isinstance(hourly.get("time"), list) else []
+    for index, stamp in enumerate(hourly_times):
+        if target_date and not str(stamp).startswith(str(target_date)):
+            continue
+        point = {key: values[index] for key, values in hourly.items()
+                 if key != "time" and isinstance(values, list) and index < len(values)}
+        point["time"] = stamp
+        hourly_points.append(point)
     return {"requested_location": location, "resolved_location": ", ".join(str(x) for x in (resolved.get("name"), resolved.get("admin1"), resolved.get("country")) if x),
             "location": resolved, "temperature_unit": unit,
             "days_from_now": offset, "current": data.get("current", {}), "day": daily,
+            "hourly": hourly_points[:24],
             "timezone": data.get("timezone"), "source": "Open-Meteo", "retrieved_at": now()}
 
 

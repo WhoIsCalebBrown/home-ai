@@ -22,7 +22,7 @@ from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
-from tts_audio import apply_pcm16_headroom, merge_wav_chunks
+from tts_audio import apply_pcm16_headroom, merge_wav_chunks, prepend_silence
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -466,7 +466,7 @@ async def synthesize_kokoro(text: str) -> bytes:
             payload = {"text": text, "voice": KOKORO_VOICE, "speed": KOKORO_SPEED}
         response = await http.post(KOKORO_API_URL, json=payload)
         response.raise_for_status()
-        return response.content
+        return prepend_silence(response.content)
 
 
 async def synthesize_chatterbox(text: str) -> bytes:
@@ -485,7 +485,7 @@ async def synthesize_pocket(text: str) -> bytes:
     async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
         response = await http.post(POCKET_API_URL, json={"input": text})
         response.raise_for_status()
-        return response.content
+        return prepend_silence(response.content)
 
 
 async def stream_pocket(ws: WebSocket, request_id: str, text: str) -> None:
@@ -501,7 +501,7 @@ async def stream_pocket(ws: WebSocket, request_id: str, text: str) -> None:
                 pocket_chunks.append(base64.b64decode(payload["audio"], validate=True))
             # Pocket's stream is WAV-framed per ~80 ms chunk.  Reassemble it
             # before sending so the browser plays one continuous source.
-            wav = apply_pcm16_headroom(merge_wav_chunks(pocket_chunks))
+            wav = prepend_silence(apply_pcm16_headroom(merge_wav_chunks(pocket_chunks)))
             discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav", "transport": "reassembled"})
             await send_wav(ws, request_id, wav, provider="pocket")
 
@@ -1117,28 +1117,7 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             return f"I can't get a complete live status for {title} right now."
         return f"I don't have a confirmed diagnosis for {title} yet."
     if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
-        offset = int(result.get("days_from_now") or 0)
-        unit = result.get("temperature_unit", "C")
-        suffix = "degrees Celsius" if unit == "C" else "degrees Fahrenheit"
-        if offset == 0 and result.get("current", {}).get("temperature_2m") is not None:
-            temperature = round(float(result["current"]["temperature_2m"]))
-            code = result.get("current", {}).get("weather_code")
-            condition = {0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "cloudy", 45: "foggy", 51: "light rain", 61: "rainy", 71: "snowy", 80: "showers"}.get(code)
-            place = result["location"].get("name") or result.get("resolved_location", "there")
-            if condition:
-                return f"It's about {temperature} {suffix} in {place}. It's {condition}."
-            return f"It's about {temperature} {suffix} in {place}."
-        day = result.get("day", {})
-        high = day.get("temperature_2m_max")
-        low = day.get("temperature_2m_min")
-        place = result["location"].get("name") or result.get("resolved_location", "there")
-        when = "tomorrow" if offset == 1 else f"in {offset} days"
-        parts = []
-        if high is not None:
-            parts.append(f"a high around {round(float(high))} {suffix}")
-        if low is not None:
-            parts.append(f"a low around {round(float(low))} {suffix}")
-        return f"{when.capitalize()} in {place}, expect " + " and ".join(parts) + "." if parts else None
+        return natural_weather_summary(result)
     if tool == "plex_recently_added":
         item_data = (result.get("items") or [None])[0]
         if item_data and item_data.get("title"):
@@ -1148,6 +1127,89 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         if count is not None:
             return "Lidarr isn't looking for anything right now." if int(count) == 0 else f"Lidarr is currently looking for {int(count)} albums."
     return None
+
+
+def natural_weather_summary(result: dict) -> str | None:
+    """Compose a concise broadcaster-style summary from available forecast data."""
+    offset = int(result.get("days_from_now") or 0)
+    unit = result.get("temperature_unit", "C")
+    suffix = "degrees Celsius" if unit == "C" else "degrees Fahrenheit"
+    place = result.get("location", {}).get("name") or result.get("resolved_location", "there")
+    day = result.get("day") or {}
+    current = result.get("current") or {}
+    code_names = {
+        0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "cloudy", 45: "foggy",
+        48: "foggy", 51: "drizzly", 53: "drizzly", 55: "drizzly", 61: "rainy",
+        63: "rainy", 65: "heavy rain", 71: "snowy", 73: "snowy", 75: "heavy snow",
+        80: "showers", 81: "showers", 82: "heavy showers", 95: "stormy", 96: "stormy", 99: "stormy",
+    }
+    def condition(code):
+        return code_names.get(code)
+    def category(code):
+        if code is None:
+            return "unknown"
+        if code >= 95:
+            return "storm"
+        if 71 <= code <= 77:
+            return "snow"
+        if 51 <= code <= 69 or 80 <= code <= 82:
+            return "rain"
+        if code in {45, 48}:
+            return "fog"
+        if code in {0, 1}:
+            return "clear"
+        if code in {2, 3}:
+            return "cloud"
+        return "other"
+    def number(value):
+        return round(float(value)) if value is not None else None
+    if offset == 0 and current.get("temperature_2m") is not None:
+        now_temp = number(current.get("temperature_2m"))
+        now_condition = condition(current.get("weather_code"))
+        opening = f"Today in {place}, it's currently {now_temp} {suffix}"
+        if now_condition:
+            opening += f" and {now_condition}"
+        high, low = number(day.get("temperature_2m_max")), number(day.get("temperature_2m_min"))
+        if high is not None and low is not None:
+            opening += f", with a high around {high} and a low around {low}"
+        elif high is not None:
+            opening += f", with a high around {high}"
+        elif low is not None:
+            opening += f", with a low around {low}"
+        opening += "."
+        hours = [point for point in (result.get("hourly") or []) if isinstance(point, dict)]
+        future = hours[1:] if len(hours) > 1 else []
+        future_categories = [category(point.get("weather_code")) for point in future]
+        current_category = category(current.get("weather_code"))
+        later_rain = next((index for index, value in enumerate(future_categories) if value in {"rain", "snow", "storm"}), None)
+        later_clear = next((index for index, value in enumerate(future_categories) if value in {"cloud", "fog"} and current_category == "rain"), None)
+        if later_rain is not None and current_category not in {"rain", "snow", "storm"}:
+            detail = "Rain is expected later" if future_categories[later_rain] == "rain" else f"{future_categories[later_rain].capitalize()} is expected later"
+            return opening + " " + detail + ", with conditions changing through the day."
+        if later_clear is not None:
+            return opening + " Showers should ease later, with skies gradually clearing."
+        future_temps = [float(point["temperature_2m"]) for point in future if point.get("temperature_2m") is not None]
+        if future_temps and max(future_temps) - now_temp >= 5:
+            return opening + f" Temperatures should climb toward the afternoon high of {high} by later today." if high is not None else opening + " Temperatures should rise noticeably later today."
+        if future_temps and now_temp - min(future_temps) >= 5:
+            return opening + f" Temperatures should drop noticeably later today, toward {low}." if low is not None else opening + " Temperatures should drop noticeably later today."
+        if future_categories:
+            common = max(set(future_categories), key=future_categories.count)
+            stable = {"clear": "clear and sunny", "cloud": "cloudy", "rain": "showery", "snow": "snowy", "fog": "foggy"}.get(common)
+            if stable:
+                return opening + f" It should stay {stable} through most of the day."
+        return opening
+    high, low = number(day.get("temperature_2m_max")), number(day.get("temperature_2m_min"))
+    day_condition = condition(day.get("weather_code"))
+    when = "Tomorrow" if offset == 1 else f"In {offset} days"
+    parts = []
+    if day_condition:
+        parts.append(day_condition)
+    if high is not None:
+        parts.append(f"a high around {high} {suffix}")
+    if low is not None:
+        parts.append(f"a low around {low} {suffix}")
+    return f"{when} in {place}, expect " + ", with ".join(parts) + "." if parts else None
 
 
 def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:

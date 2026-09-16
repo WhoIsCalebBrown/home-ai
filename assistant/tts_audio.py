@@ -57,6 +57,17 @@ def apply_pcm16_headroom(wav_bytes: bytes, target_peak: int = 29490) -> bytes:
     return _wav_from_pcm(samples.tobytes(), rate, width, channels)
 
 
+def prepend_silence(wav_bytes: bytes, milliseconds: int = 120) -> bytes:
+    """Add a short clean attack so the first phoneme is not clipped by playback."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+        rate, width, channels = wav.getframerate(), wav.getsampwidth(), wav.getnchannels()
+        frames = wav.readframes(wav.getnframes())
+    if width != 2 or not frames or milliseconds <= 0:
+        return wav_bytes
+    silence = b"\x00" * int(rate * milliseconds / 1000) * width * channels
+    return _wav_from_pcm(silence + frames, rate, width, channels)
+
+
 def _wav_from_pcm(pcm: bytes, rate: int, width: int, channels: int) -> bytes:
     output = io.BytesIO()
     with wave.open(output, "wb") as wav:
