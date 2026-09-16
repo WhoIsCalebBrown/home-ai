@@ -1,0 +1,109 @@
+# Open WebUI client integration
+
+Open WebUI is an additive client for Home-AI. It is not an agent provider and it
+does not receive Home-AI tools or backend credentials. The single model exposed
+to it is `home-ai`, served by the Assistant's OpenAI-compatible facade.
+
+```text
+Open WebUI / existing frontend / future ESP32
+                 |
+                 v
+        Home-AI OpenAI facade
+                 |
+        Home-AI Assistant state
+                 |
+       Qwen + bounded Tools calls
+```
+
+## Deployed boundary
+
+The Assistant exposes these private, bearer-authenticated routes on `voiceai`:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/audio/transcriptions`
+- `POST /v1/audio/speech`
+
+The model is `home-ai`; requests are translated into the existing
+`respond()`/session path. Open WebUI never calls Ollama, Plex, Frigate, media
+backends, or Home-AI Tools directly.
+
+`stream=true` is supported as an OpenAI-compatible SSE response. The current
+Assistant produces a completed response and emits one final content delta; it
+does not claim token-level streaming.
+
+## Session mapping
+
+The facade maps `metadata.chat_id` (or `chat_id`/the Open WebUI header when
+present) to a Home-AI session. User identity is included when supplied. The
+fallback for clients that omit chat identity is deterministic from the first
+user turn; clients should send a stable chat ID for strict conversation
+isolation.
+
+Pending offers, confirmations, subjects, referents, and workflows remain in
+Home-AI. The frontend cannot authorize a write by itself.
+
+## Audio
+
+- STT: OpenAI-compatible transcription requests are translated to the existing
+  Faster-Whisper/Wyoming service.
+- TTS: speech requests are translated to Pocket TTS. `wav` and `mp3` are
+  supported; `mp3` is converted by the owned Assistant adapter for browser
+  playback.
+- Home-AI suppresses its normal turn TTS for OpenAI chat calls so Open WebUI
+  does not receive a duplicate audio response.
+
+Future ESP32 clients should use a versioned owned voice-session protocol:
+
+```text
+POST /voice/v1/sessions
+WS   /voice/v1/sessions/{session_id}
+```
+
+Client events: `session_start`, `audio_start`, `audio_chunk`, `audio_end`,
+`cancel`. Server events: `listening`, `stt_partial`, `stt_final`, `thinking`,
+`tool_started`, `tool_finished`, `response_text`, `tts_start`, `tts_audio`,
+`tts_end`, `done`, and `error`.
+
+The initial audio contract should be PCM16 mono at 16 kHz, chunked into short
+binary frames. Wake-word detection remains on the device; the server performs
+STT, reasoning, tools, and TTS. Each device gets an isolated default session,
+for example `esp32:kitchen`, unless an explicit continuation is requested.
+
+## Unraid deployment
+
+- Official image: `ghcr.io/open-webui/open-webui:v0.11.3`
+- Container: `Open-WebUI`
+- Network: `voiceai`
+- Persistent data: `/mnt/cache/appdata/home-ai/open-webui`
+- LAN host port: `13000` (not a public exposure)
+- Home-AI gateway key: `/mnt/cache/appdata/home-ai/secrets/openai-compat.key`
+- Open WebUI encryption key: `/mnt/cache/appdata/home-ai/open-webui/.webui-secret`
+- Template: `deployment/Open-WebUI.xml`
+
+The server-side Assistant key is read from a private mounted file. No key is
+logged or included in Qwen context. The Open WebUI container receives only the
+same private bearer key needed to call the facade; it does not receive any
+backend service secrets.
+
+## Current qualification status
+
+Validated directly:
+
+- authenticated model discovery
+- non-streaming read-only chat
+- OpenAI-shaped single-boundary SSE
+- Faster-Whisper transcription
+- Pocket-TTS MP3 speech output
+- Open WebUI health and private-network reachability to Home-AI
+- existing Assistant and Tools remain separate and healthy
+
+Not yet claimed as complete:
+
+- browser microphone/playback through a logged-in Open WebUI account
+- physical ESP32 hardware
+- public reverse-proxy exposure
+- token-level streaming
+
+These are intentionally separate from the backend integration and do not
+require changing the Home-AI brain or any third-party image.
