@@ -37,31 +37,52 @@ def has_referential_language(text: str) -> bool:
     return bool(_tokens(text) & REFERENTIAL_WORDS)
 
 
-def discovery_context(context: dict[str, Any] | None) -> dict[str, Any]:
+def discovery_context(context: dict[str, Any] | None, text: str = "") -> dict[str, Any]:
     """Return only structured context useful for resolving a referent.
 
     In particular, domain/group/previous-tools are intentionally omitted: a
     previous tool is evidence about the past, not an instruction for the new
     turn.
+
+    A structured referent (a retained camera event, media workflow, topic,
+    ...) is preserved in `context` indefinitely so a LATER genuinely
+    referential follow-up can still resolve it -- but it must not itself bias
+    capability-discovery scoring (referent_overlap in
+    tools/server-tools-app.py's discover_capabilities) for a turn that has no
+    connection to it. Real production bug: a stale camera referent
+    (context["camera"]) from an earlier turn hijacked discovery for
+    "Question 1?", a genuinely unrelated follow-up with zero camera-related
+    words -- Frigate tools were biased into the candidate set purely because
+    the referent was still sitting in context. `referents` is therefore only
+    populated when the new utterance itself carries some minimal connecting
+    signal: referential language (a pronoun/demonstrative, via
+    has_referential_language) or an explicit/continuation domain that
+    turn_context() has already resolved for this turn (context["domain"]).
+    Deterministic status/diagnosis continuations without either signal (e.g.
+    "Any progress?") are handled by preflight_plan's own referent-gated
+    routing before discovery is ever reached, so they are unaffected by this
+    gate.
     """
     source = context or {}
+    connected = bool(source.get("domain")) or has_referential_language(text)
     referents: list[str] = []
-    for key in (
-        "canonical_identity",
-        "latest_resolved_referent",
-        "latest_media_workflow",
-        "latest_media_status",
-        "latest_event",
-        "query",
-        "topic",
-        "unresolved_request",
-        "location",
-        "camera",
-        "subject",
-    ):
-        value = source.get(key)
-        if value:
-            referents.append(str(value))
+    if connected:
+        for key in (
+            "canonical_identity",
+            "latest_resolved_referent",
+            "latest_media_workflow",
+            "latest_media_status",
+            "latest_event",
+            "query",
+            "topic",
+            "unresolved_request",
+            "location",
+            "camera",
+            "subject",
+        ):
+            value = source.get(key)
+            if value:
+                referents.append(str(value))
     return {
         "referents": referents,
         "unresolved_topic": source.get("unresolved_request") or source.get("topic"),
