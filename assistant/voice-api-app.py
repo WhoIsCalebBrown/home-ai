@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import contextvars
+import hmac
 import io
 import json
 import os
@@ -14,8 +16,8 @@ import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
 from subject_model import PendingOffer, ResolvedSubject, UnresolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action, unresolved_subject_from_dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
@@ -48,6 +50,8 @@ PRONUNCIATION_LEXICON = Path(os.getenv("PRONUNCIATION_LEXICON", "/app/pronunciat
 NEMO_CACHE_DIR = Path(os.getenv("NEMO_CACHE_DIR", "/app/pronunciation/nemo-cache")).resolve()
 TTS_DEBUG_LOG = os.getenv("TTS_DEBUG_LOG", "/app/pronunciation/tts-debug.jsonl")
 DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/discovery-debug.jsonl")
+OPENAI_COMPAT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "")
+OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "home-ai")
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
@@ -195,6 +199,7 @@ speech_normalizer = None
 pronunciation_entries: dict[str, str] = {}
 normalization_init_seconds: float | None = None
 tools_backend_status: dict[str, object] = {"ok": False, "status": "NOT_CHECKED", "url": TOOLS_URL}
+tts_suppressed = contextvars.ContextVar("tts_suppressed", default=False)
 
 
 async def check_tools_backend() -> None:
@@ -1125,6 +1130,8 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str 
         record_assistant_response(client_id, text, request_id=request_id, origin=origin)
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
     await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
+    if tts_suppressed.get():
+        return
     prepared = await prepare_tts_text(request_id, text)
     await asyncio.gather(*(speak(ws, request_id, chunk, prepared=True) for chunk in speakable_chunks(prepared)))
 
@@ -2349,8 +2356,9 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
             print(f"TTS_TIMING request={request_id} event=first_complete_phrase t={time.time():.6f} text={json.dumps(safe, ensure_ascii=False)}", flush=True)
             await ws.send_json({"type": "text", "text": separator + safe, "request_id": request_id})
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
-            prepared = await prepare_tts_text(request_id, safe)
-            tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk, prepared=True)) for chunk in speakable_chunks(prepared))
+            if not tts_suppressed.get():
+                prepared = await prepare_tts_text(request_id, safe)
+                tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk, prepared=True)) for chunk in speakable_chunks(prepared))
 
     try:
         async with httpx.AsyncClient(timeout=None) as http:
@@ -3472,3 +3480,157 @@ async def websocket(ws: WebSocket):
         old = active.pop(client_id, None)
         if old:
             old.cancel()
+
+
+class _OpenAIResponseSocket:
+    """Small capture sink for the OpenAI facade.
+
+    The existing responder is intentionally reused instead of creating a
+    second agent loop.  TTS is suppressed by the request context; the normal
+    browser/WebSocket frontend continues to use the existing audio path.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    async def send_json(self, message: dict) -> None:
+        self.messages.append(message)
+
+
+def _openai_error(message: str, code: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": "home_ai_error", "code": code}},
+    )
+
+
+def _require_openai_auth(request: Request) -> None:
+    if not OPENAI_COMPAT_API_KEY:
+        raise HTTPException(503, detail="OpenAI-compatible API is not configured")
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not hmac.compare_digest(token, OPENAI_COMPAT_API_KEY):
+        raise HTTPException(401, detail="Invalid bearer token")
+
+
+def _openai_session_id(request: Request, body: dict) -> str:
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    user = str(metadata.get("user_id") or body.get("user") or request.headers.get("x-openwebui-user-id") or "default")
+    chat = str(metadata.get("chat_id") or body.get("chat_id") or request.headers.get("x-openwebui-chat-id") or "").strip()
+    if not chat:
+        # OpenAI-compatible callers are stateless by protocol.  Open WebUI
+        # normally sends the complete message list, so use the first user
+        # turn as a deterministic fallback conversation key when it does not
+        # forward its chat UUID.  A forwarded chat_id always wins.
+        messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        first = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"), {})
+        content = first.get("content", "") if isinstance(first, dict) else ""
+        if isinstance(content, list):
+            content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        import hashlib
+        chat = "derived-" + hashlib.sha256(str(content).encode("utf-8")).hexdigest()[:24]
+    safe_user = re.sub(r"[^A-Za-z0-9_.:-]", "_", user)[:80] or "default"
+    safe_chat = re.sub(r"[^A-Za-z0-9_.:-]", "_", chat)[:120]
+    return f"webui:{safe_user}:{safe_chat}"
+
+
+def _latest_user_message(body: dict) -> str:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") in {"text", "input_text"}).strip()
+    return ""
+
+
+async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
+    user_text = _latest_user_message(body)
+    if not user_text:
+        raise HTTPException(400, detail="At least one user message is required")
+    client_id = _openai_session_id(request, body)
+    request_id = f"{client_id}-{time.time_ns()}"
+    sink = _OpenAIResponseSocket()
+    token = tts_suppressed.set(True)
+    try:
+        await respond(sink, client_id, request_id, user_text)
+    finally:
+        tts_suppressed.reset(token)
+    answer = "".join(str(item.get("text", "")) for item in sink.messages if item.get("type") == "text").strip()
+    trace = next((item.get("tools", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
+    if not answer:
+        raise HTTPException(502, detail="Home-AI produced no assistant response")
+    return answer, client_id, trace
+
+
+@app.get("/v1/models")
+async def openai_models(request: Request):
+    _require_openai_auth(request)
+    return {"object": "list", "data": [{"id": OPENAI_COMPAT_MODEL, "object": "model", "owned_by": "home-ai"}]}
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    _require_openai_auth(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, detail="JSON object required")
+        model = str(body.get("model") or OPENAI_COMPAT_MODEL)
+        if model != OPENAI_COMPAT_MODEL:
+            raise HTTPException(404, detail=f"Unknown model: {model}")
+        answer, session_id, _trace = await _openai_chat_turn(body, request)
+    except HTTPException as exc:
+        return _openai_error(str(exc.detail), "invalid_request", exc.status_code)
+    except Exception as exc:
+        print(f"OPENAI_COMPAT_CHAT_FAILED error={type(exc).__name__}", flush=True)
+        return _openai_error("Home-AI could not complete this request", "backend_unavailable", 502)
+    completion_id = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    if body.get("stream"):
+        async def events():
+            chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": answer}, "finish_reason": None}]}
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            final = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
+                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield f"data: {json.dumps(final)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Home-AI-Session": session_id})
+    return {"id": completion_id, "object": "chat.completion", "created": created, "model": OPENAI_COMPAT_MODEL,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_transcriptions(request: Request, file: UploadFile = File(...)):
+    _require_openai_auth(request)
+    try:
+        transcript = await transcribe(await file.read())
+        return {"text": transcript}
+    except Exception as exc:
+        print(f"OPENAI_COMPAT_STT_FAILED error={type(exc).__name__}", flush=True)
+        return _openai_error("Speech transcription is unavailable", "stt_unavailable", 503)
+
+
+@app.post("/v1/audio/speech")
+async def openai_speech(request: Request):
+    _require_openai_auth(request)
+    try:
+        body = await request.json()
+        text = str(body.get("input") or "").strip()
+        if not text:
+            return _openai_error("input is required", "invalid_request", 400)
+        requested_format = str(body.get("response_format") or "wav").casefold()
+        if requested_format not in {"wav", "pcm"}:
+            return _openai_error("Home-AI TTS currently supports wav output", "unsupported_format", 400)
+        wav = await synthesize_pocket(text)
+        return Response(content=wav, media_type="audio/wav", headers={"X-Home-AI-TTS-Provider": "pocket"})
+    except Exception as exc:
+        print(f"OPENAI_COMPAT_TTS_FAILED error={type(exc).__name__}", flush=True)
+        return _openai_error("Speech synthesis is unavailable", "tts_unavailable", 503)
