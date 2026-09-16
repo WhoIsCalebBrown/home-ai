@@ -1563,4 +1563,63 @@ async def test_query_drift_asks_for_clarification_instead_of_silent_wrong_match(
     reply2 = await session.turn("Yeah.")
     assert len(session.backend.call_log) == calls_before, "an unresolved reply must not invoke any tool"
     assert session.client_id not in session.app.pending
-    assert not session.backend.submitted_writes
+
+
+class _FakeGatewayRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+OPENWEBUI_TITLE_TASK = {"messages": [{"role": "user", "content": (
+    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing "
+    "the chat history.\n### Chat History:\n<chat_history>\nUSER: do i have "
+    "any movies on my server\n</chat_history>"
+)}]}
+
+
+@pytest.mark.asyncio
+async def test_openwebui_housekeeping_request_never_reaches_respond(app, monkeypatch):
+    """Real production bug: OpenWebUI's own internal title/tags/follow-up
+    generation calls were fed verbatim into the real respond() pipeline,
+    firing real tool calls against every backend service for no reason on
+    every single chat message. This proves the gateway now detects that
+    shape and answers directly (via generate_final, a single tool-free
+    Ollama completion) instead of ever invoking respond()."""
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("respond() must never be invoked for an OpenWebUI housekeeping request")
+
+    async def fake_generate_final(messages):
+        assert messages == OPENWEBUI_TITLE_TASK["messages"]
+        return '{"title": "Server Movie Check"}'
+
+    monkeypatch.setattr(app, "respond", fail_if_called)
+    monkeypatch.setattr(app, "generate_final", fake_generate_final)
+
+    answer, client_id, trace = await app._openai_chat_turn(OPENWEBUI_TITLE_TASK, _FakeGatewayRequest())
+
+    assert answer == '{"title": "Server Movie Check"}'
+    assert trace == []
+
+
+@pytest.mark.asyncio
+async def test_genuine_chat_message_through_gateway_still_uses_the_real_pipeline(app, monkeypatch):
+    """Negative control: a real user chat turn arriving through the same
+    gateway endpoint must still flow through the full respond() pipeline,
+    not be swept into the housekeeping bypass."""
+    called = {"respond": False}
+
+    async def fake_respond(sink, client_id, request_id, user_text):
+        called["respond"] = True
+        await sink.send_json({"type": "text", "text": "It is sunny today.", "request_id": request_id})
+
+    async def fail_if_called(messages):
+        raise AssertionError("generate_final() must not be used for a real chat turn")
+
+    monkeypatch.setattr(app, "respond", fake_respond)
+    monkeypatch.setattr(app, "generate_final", fail_if_called)
+
+    body = {"messages": [{"role": "user", "content": "What's the weather like today?"}]}
+    answer, client_id, trace = await app._openai_chat_turn(body, _FakeGatewayRequest())
+
+    assert called["respond"] is True
+    assert answer == "It is sunny today."

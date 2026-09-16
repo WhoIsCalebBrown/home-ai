@@ -383,7 +383,7 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)},
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
-        "retrieval_context": discovery_context(context),
+        "retrieval_context": discovery_context(context, raw_text),
         "retrieval_confidence": context.get("retrieval_confidence"),
         "tool_results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in (results or [])],
     }
@@ -698,7 +698,7 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             # Only structured referents cross the retrieval boundary. Previous
             # domain/group/tool state is historical evidence, not intent for
             # the current turn.
-            retrieval_context = discovery_context(context)
+            retrieval_context = discovery_context(context, user_text)
             params = {} if not user_text.strip() else {"query": query, "max_results": 5, "context_json": json.dumps(retrieval_context, separators=(",", ":"))}
             started = time.perf_counter()
             response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
@@ -3596,11 +3596,49 @@ def _latest_user_message(body: dict) -> str:
     return ""
 
 
+# OpenWebUI's own internal housekeeping completions (title/tags/follow-up
+# generation) are sent as ordinary /v1/chat/completions calls with a
+# `role: user` message containing OpenWebUI's literal "### Task: ..."
+# meta-prompt templates -- these are OpenWebUI answering questions about the
+# conversation TEXT itself, not a real user chat turn, and must never reach
+# the real tool-discovery/execution pipeline. Real production bug: one such
+# housekeeping call fired nine real tool calls (music_enricher_quarantine,
+# beets_recent_imports, torbox_status, qbittorrent_list, plex_search,
+# slskd_downloads, lidarr_search_album, lidarr_artist_status,
+# investigate_media_pipeline), using the literal template text as the search
+# query for every one, on every single chat message OpenWebUI sends.
+# Matches only the specific task shapes there is live audit-log evidence for
+# (title, tags, follow-ups) -- add another compiled pattern here if a new
+# OpenWebUI task type is observed rather than loosening these to match
+# anything containing "Task:".
+_OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES = (
+    re.compile(r"###\s*task:.*generate a concise.*title.*summarizing the chat history", re.I | re.S),
+    re.compile(r"###\s*task:.*generate 1-3 broad tags categorizing the main themes", re.I | re.S),
+    re.compile(r"###\s*task:.*suggest 3-5 relevant follow-up questions", re.I | re.S),
+)
+
+
+def _is_openwebui_housekeeping_request(body: dict) -> bool:
+    text = _latest_user_message(body)
+    if "### task" not in text.casefold():
+        return False
+    return any(pattern.search(text) for pattern in _OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES)
+
+
 async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
     user_text = _latest_user_message(body)
     if not user_text:
         raise HTTPException(400, detail="At least one user message is required")
     client_id = _openai_session_id(request, body)
+    if _is_openwebui_housekeeping_request(body):
+        # Answer directly from the given messages with a single tool-free
+        # completion -- OpenWebUI still gets a valid title/tags/follow-ups
+        # response, but no real backend service is ever touched.
+        messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        answer = await generate_final(messages)
+        if not answer:
+            raise HTTPException(502, detail="Home-AI produced no assistant response")
+        return answer, client_id, []
     request_id = f"{client_id}-{time.time_ns()}"
     sink = _OpenAIResponseSocket()
     token = tts_suppressed.set(True)
