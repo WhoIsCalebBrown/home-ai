@@ -1583,7 +1583,24 @@ def media_status_question(text: str) -> bool:
     routed_text = routing_aliases(text)
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
         return False
-    if _descriptive_media_clue(routed_text):
+    # An unambiguous "my/our <title> request <status>" or "<title>
+    # download(ed)? yet" frame names a KNOWN, already-requested item's
+    # current state -- this strong status marker must outrank the
+    # descriptive-clue suppression below even when the item's own title
+    # happens to contain capitalized words that resemble a person-name
+    # shape (e.g. "A River Runs Through It", "Cast Away"). Real production
+    # gap found investigating status tracking: "How is my A River Runs
+    # Through It request going?" was misclassified as a descriptive
+    # discovery question -- not because of a plot word this time, but
+    # because the movie's own multi-word capitalized TITLE matched the
+    # same two-Title-Case-words shape used to detect a person's name.
+    strong_status_marker = re.search(
+        r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b"
+        r"|\bstatus\s+of\b"
+        r"|\bdownload(?:ed|ing)?\s+yet\b",
+        routed_text, re.I,
+    )
+    if _descriptive_media_clue(routed_text) and not strong_status_marker:
         return False
     if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
@@ -1617,6 +1634,14 @@ def media_title_status_signal(text: str) -> bool:
     if re.search(r"\b(?:happening|going\s+on)\s+with\s+(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}[a-z0-9]+\b", text, re.I):
         return True
     if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|watch|pipeline)\b", text, re.I):
+        return True
+    # A possessive "my/our <title> request <status>" frame names a KNOWN,
+    # already-requested item -- real production gap: "Has my Interstellar
+    # request finished?" fell through this function (no leading "the"/"a"
+    # immediately before the status word, since "request" intervenes) even
+    # though media_status_question() itself correctly recognized it,
+    # leaving no OR-branch to route it to the real status capability.
+    if re.search(r"\b(?:my|our)\s+(?:[a-z0-9]+\s+){1,5}request\s+(?:is\s+)?(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going|there\s+yet|status)\b", text, re.I):
         return True
     # A standalone "where's <title>?" is a read-only lifecycle question when
     # the subject is title-shaped. Keep this bounded to multi-token subjects
@@ -2080,7 +2105,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # Semantic media goals are planned above the service layer. This is
     # intentionally read/plan-only: it does not add or search anything.
     media_nouns = re.search(r"\b(album|movie|film|series|show|anime|hobbit|rodeo|astroworld|dragon ball|plex|lidarr|sonarr|radarr)\b", t)
-    if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and (not media_acquisition_language(text) or re.search(r"\bget\s+found\b", t)):
+    # "request" as a NOUN referring to an already-existing request ("my
+    # ... request going/done/finished") must not be treated as
+    # media_acquisition_language's "request" VERB (an imperative to
+    # request something new) -- real production gap: "How is my A River
+    # Runs Through It request going?" is unambiguously a status question,
+    # but the word "request" alone made media_acquisition_language() true,
+    # overriding media_status_question()'s own correct classification and
+    # falling through with no route to the real status capability at all.
+    status_request_noun = re.search(r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b", t)
+    if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and (not media_acquisition_language(text) or status_request_noun or re.search(r"\bget\s+found\b", t)):
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:

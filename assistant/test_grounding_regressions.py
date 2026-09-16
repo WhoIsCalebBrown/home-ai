@@ -979,6 +979,38 @@ def test_descriptive_media_clue_excludes_imperative_verb_plus_service_name():
     assert preflight_plan("Restart Lidarr") == [("restart_container", {"name": "lidarr"})]
 
 
+def test_status_request_noun_outranks_descriptive_clue_and_acquisition_language():
+    """Real gap found investigating status-tracking (a recurring user pain
+    point): a multi-word capitalized movie TITLE ("A River Runs Through
+    It", "Cast Away") can match the same two-Title-Case-words shape used
+    to detect a person's name, and the word "request" (as a NOUN naming an
+    EXISTING request) collided with media_acquisition_language's "request"
+    VERB check -- either one alone used to make these unambiguous status
+    questions fail to route to the real status capability at all."""
+    for text in (
+        "How is my A River Runs Through It request going?",
+        "Did A River Runs Through It download yet?",
+        "Did Cast Away download yet?",
+        "is my cast away request done",
+        "How is my Cast Away request going?",
+        "Has my Interstellar request finished?",
+    ):
+        assert media_status_question(text) is True, text
+        assert preflight_plan(text) == [("media_status", {"query": text})], text
+
+
+def test_status_request_noun_fix_does_not_regress_descriptive_discovery():
+    """Negative control: the "request"-as-noun and title-shape carve-outs
+    above must not resurrect the descriptive-discovery misclassification
+    fixed two rounds ago."""
+    for text in (
+        "What's that Tom Hanks movie where he's stuck on an island with a volleyball?",
+        "What's that Brad Pitt movie about fly fishing in Montana?",
+    ):
+        assert media_status_question(text) is False, text
+        assert preflight_plan(text) == [("media_plan_goal", {"goal": text})], text
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

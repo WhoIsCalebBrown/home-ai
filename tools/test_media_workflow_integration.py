@@ -179,3 +179,113 @@ async def test_repeated_status_observation_does_not_duplicate_transition_events(
         "types precisely so a repeated observation is never confused with "
         "a fresh identification"
     )
+
+
+@pytest.mark.asyncio
+async def test_status_check_finds_a_real_confirmed_request_by_natural_phrasing(app, monkeypatch):
+    """Real bug found investigating a recurring user pain point ("after
+    successfully requesting a movie, asking about its status later says it
+    can't find/track it"): drives the FULL real lifecycle -- identify,
+    confirm, fake write -- through the exact same production code as the
+    confirmation round-trip test above, then asks for status the way a
+    person actually would ("How is my Dune request going?"), not by the
+    workflow_id or the bare title. Before the fix, media_status's
+    title-extraction fallback required an EXACT normalized match against
+    the stored canonical title; the crude regex-strip left "my Dune
+    request" behind, which never equals "Dune", so a genuinely existing,
+    correctly-identified request silently reported NOT_FOUND."""
+    module, events = app
+
+    plan = await module.media_plan_goal({"goal": "get Dune 2021", "media_type": "movie", "session_id": "sess-1"})
+    workflow_id = plan["workflow_id"]
+    confirmation = plan["confirmation_record"]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+        content = b'{"ok": true}'
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(module, "httpx", type("FakeHttpxModule", (), {"AsyncClient": FakeAsyncClient}))
+    evidence_calls = {"count": 0}
+
+    def fake_evidence(payload):
+        evidence_calls["count"] += 1
+        # After the fake write, cli_debrid evidence reports the request as
+        # actively queued/searching -- a realistic post-request state.
+        return {"matched": evidence_calls["count"] > 1, "rows": [{"state": "queued"}] if evidence_calls["count"] > 1 else []}
+
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", fake_evidence)
+
+    result = await module.media_standard_request({
+        "workflow_id": workflow_id, "media_type": "movie", "canonical_external_id": 438631,
+        "confirmation_context": confirmation, "session_id": "sess-1",
+    })
+    assert result["status"] == "submitted" and result["write_executed"] is True
+
+    for phrasing in (
+        "How is my Dune request going?",
+        "Did Dune download yet?",
+        "is my dune request done",
+        "Has my Dune request finished?",
+    ):
+        status = await module.media_status({"query": phrasing})
+        assert status["found"] is True, f"real confirmed request not found for phrasing: {phrasing!r}"
+        assert status["workflow_id"] == workflow_id
+        assert status["canonical_identity"]["tmdb_id"] == 438631
+
+
+@pytest.mark.asyncio
+async def test_status_check_does_not_confuse_two_similarly_titled_requests(app):
+    """Negative control: the filler-tolerant title matching in media_status
+    must still fail closed on genuine ambiguity -- two different real
+    workflows sharing the exact same title (a real, common case: a remake)
+    must never be silently collapsed into one match. Also proves the
+    fallback does not accidentally widen matching to an UNRELATED title
+    that merely shares one word ("Dune: Part Two" must not match a query
+    naming plain "Dune")."""
+    module, events = app
+    await module.media_plan_goal({"goal": "get Dune 2021", "media_type": "movie", "session_id": "sess-1"})
+
+    async def fake_radarr_search_part_two(args):
+        return {"matches": [{"title": "Dune: Part Two", "year": "2024", "tmdbId": 693134}]}
+
+    module.radarr_search = fake_radarr_search_part_two
+    await module.media_plan_goal({"goal": "get Dune Part Two 2024", "media_type": "movie", "session_id": "sess-1"})
+
+    # A query naming only "Dune" must match the "Dune" workflow alone --
+    # "Dune: Part Two" shares one word but not the full title, so it must
+    # never be treated as a candidate.
+    status = await module.media_status({"query": "how is my dune request going"})
+    assert status["found"] is True
+    assert status["canonical_identity"]["title"] == "Dune"
+
+    # Two DIFFERENT real workflows that genuinely share the exact same
+    # title (e.g. a remake, or two Radarr entries the user requested
+    # separately) must still fail closed as ambiguous, never guessed.
+    async def fake_radarr_search_dune_1984(args):
+        return {"matches": [{"title": "Dune", "year": "1984", "tmdbId": 950}]}
+
+    module.radarr_search = fake_radarr_search_dune_1984
+    await module.media_plan_goal({"goal": "get Dune 1984", "media_type": "movie", "session_id": "sess-1"})
+
+    ambiguous_status = await module.media_status({"query": "how is my dune request going"})
+    assert ambiguous_status["found"] is False
+    assert ambiguous_status["status"] == "AMBIGUOUS"
+    assert len(ambiguous_status["candidates"]) == 2

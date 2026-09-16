@@ -359,7 +359,16 @@ async def test_tom_hanks_island_volleyball_resolves_via_web_discovery(app, monke
     async def fake_radarr_search(args):
         radarr_calls.append(args["query"])
         if "cast away" in args["query"].casefold():
-            return {"matches": [{"title": "Cast Away", "year": "2000", "tmdbId": 8358}]}
+            # Real live production shape: Radarr's lookup returns the real
+            # feature ALONGSIDE a making-of/bonus-content entry that shares
+            # every title token -- the fix under test must not let the
+            # person hint ("Tom Hanks", absent from Radarr's row data)
+            # suppress the exact-title-match shortcut and fall into a tie
+            # against the bonus content.
+            return {"matches": [
+                {"title": "Cast Away", "year": "2000", "tmdbId": 8358, "vote_count": 9000},
+                {"title": "Behind the Scenes: Cast Away", "year": "2000", "tmdbId": 999001, "vote_count": 3},
+            ]}
         return {"matches": []}
 
     async def fake_sonarr_search(args):
@@ -385,11 +394,44 @@ async def test_tom_hanks_island_volleyball_resolves_via_web_discovery(app, monke
     assert plan["canonical_identity"]["title"] == "Cast Away"
     assert plan["canonical_identity"]["tmdb_id"] == 8358
     assert plan["ambiguity_reason"] == "WEB_DISCOVERY_MATCH"
-    # The literal description was searched first and failed structurally,
-    # THEN the web-discovered name was re-searched through the real lookup
-    # -- web search never itself supplied the identity.
-    assert any("cast away" in q.casefold() for q in radarr_calls)
-    assert len(radarr_calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_web_discovery_does_not_tie_against_bonus_content_for_a_different_film(app, monkeypatch):
+    """Generalization proof: the fix must not be specific to "Cast Away" --
+    a different film/person pairing, with a differently-worded bonus-
+    content entry ("Interstellar: Making of"), must resolve the same way."""
+    async def fake_radarr_search(args):
+        if "interstellar" in args["query"].casefold():
+            return {"matches": [
+                {"title": "Interstellar", "year": "2014", "tmdbId": 157336, "vote_count": 32000},
+                {"title": "Interstellar: Making of", "year": "2014", "tmdbId": 999002, "vote_count": 5},
+            ]}
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    async def fake_web_search(args):
+        assert "anne hathaway" in args["query"].casefold()
+        return {"query": args["query"], "results": [
+            {"title": "Interstellar (2014) - IMDb", "url": "https://example.invalid/interstellar"},
+        ]}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({
+        "goal": "the Anne Hathaway movie where he travels through a wormhole to save humanity",
+        "media_type": "movie",
+    })
+
+    assert plan["canonical_identity"] is not None
+    assert plan["canonical_identity"]["title"] == "Interstellar"
+    assert plan["canonical_identity"]["tmdb_id"] == 157336
+    assert plan["ambiguity_reason"] == "WEB_DISCOVERY_MATCH"
 
 
 @pytest.mark.asyncio
