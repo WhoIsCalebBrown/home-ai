@@ -3568,6 +3568,19 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     return answer, client_id, trace
 
 
+async def _wav_to_mp3(wav: bytes) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "128k", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    encoded, error = await proc.communicate(wav)
+    if proc.returncode != 0:
+        raise RuntimeError(f"TTS audio conversion failed: {error.decode(errors='ignore')[:160]}")
+    return encoded
+
+
 @app.get("/v1/models")
 async def openai_models(request: Request):
     _require_openai_auth(request)
@@ -3627,9 +3640,11 @@ async def openai_speech(request: Request):
         if not text:
             return _openai_error("input is required", "invalid_request", 400)
         requested_format = str(body.get("response_format") or "wav").casefold()
-        if requested_format not in {"wav", "pcm"}:
-            return _openai_error("Home-AI TTS currently supports wav output", "unsupported_format", 400)
+        if requested_format not in {"wav", "pcm", "mp3"}:
+            return _openai_error("Home-AI TTS currently supports wav and mp3 output", "unsupported_format", 400)
         wav = await synthesize_pocket(text)
+        if requested_format == "mp3":
+            return Response(content=await _wav_to_mp3(wav), media_type="audio/mpeg", headers={"X-Home-AI-TTS-Provider": "pocket"})
         return Response(content=wav, media_type="audio/wav", headers={"X-Home-AI-TTS-Provider": "pocket"})
     except Exception as exc:
         print(f"OPENAI_COMPAT_TTS_FAILED error={type(exc).__name__}", flush=True)
