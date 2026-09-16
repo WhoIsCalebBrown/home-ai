@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Open-WebUI</Name>
+  <Repository>ghcr.io/open-webui/open-webui:v0.11.3</Repository>
+  <Registry>https://ghcr.io/</Registry>
+  <Network>voiceai</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://docs.openwebui.com/</Support>
+  <Project>https://github.com/open-webui/open-webui</Project>
+  <Overview>Official Open WebUI client configured to use Home-AI as its only model provider.</Overview>
+  <WebUI>http://[IP]:[PORT:13000]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/open-webui/open-webui/main/static/favicon.png</Icon>
+  <Config Name="Web UI" Target="8080" Default="13000" Mode="tcp" Description="LAN-only host port for the Open WebUI client." Type="Port" Display="always" Required="true" Mask="false">13000</Config>
+  <Config Name="Open WebUI data" Target="/app/backend/data" Default="/mnt/cache/appdata/home-ai/open-webui" Mode="rw" Description="Persistent Open WebUI data." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/home-ai/open-webui</Config>
+  <Config Name="Home-AI API base" Target="OPENAI_API_BASE_URL" Default="http://Home-AI-Assistant:8088/v1" Mode="" Description="Private Home-AI OpenAI-compatible facade; do not point this at Ollama." Type="Variable" Display="always" Required="true" Mask="false">http://Home-AI-Assistant:8088/v1</Config>
+  <Config Name="Home-AI API key" Target="OPENAI_API_KEY" Default="CHANGE_ME" Mode="" Description="Bearer key shared only with Home-AI; configure through a protected Unraid secret field." Type="Variable" Display="advanced" Required="true" Mask="true">CHANGE_ME</Config>
+  <Config Name="WebUI secret key" Target="WEBUI_SECRET_KEY" Default="CHANGE_ME" Mode="" Description="Persistent Open WebUI session/encryption secret." Type="Variable" Display="advanced" Required="true" Mask="true">CHANGE_ME</Config>
+  <Config Name="STT engine" Target="AUDIO_STT_ENGINE" Default="openai" Mode="" Description="Use Home-AI's Faster-Whisper compatibility endpoint." Type="Variable" Display="advanced" Required="true" Mask="false">openai</Config>
+  <Config Name="STT API base" Target="AUDIO_STT_OPENAI_API_BASE_URL" Default="http://Home-AI-Assistant:8088/v1" Mode="" Description="Home-AI transcription facade." Type="Variable" Display="advanced" Required="true" Mask="false">http://Home-AI-Assistant:8088/v1</Config>
+  <Config Name="STT API key" Target="AUDIO_STT_OPENAI_API_KEY" Default="CHANGE_ME" Mode="" Description="Same protected Home-AI bearer key; never expose in chat/tool context." Type="Variable" Display="advanced" Required="true" Mask="true">CHANGE_ME</Config>
+  <Config Name="STT model" Target="AUDIO_STT_MODEL" Default="whisper-1" Mode="" Description="Compatibility model name translated by Home-AI." Type="Variable" Display="advanced" Required="true" Mask="false">whisper-1</Config>
+  <Config Name="TTS engine" Target="AUDIO_TTS_ENGINE" Default="openai" Mode="" Description="Use Home-AI's Pocket-TTS compatibility endpoint." Type="Variable" Display="advanced" Required="true" Mask="false">openai</Config>
+  <Config Name="TTS API base" Target="AUDIO_TTS_OPENAI_API_BASE_URL" Default="http://Home-AI-Assistant:8088/v1" Mode="" Description="Home-AI speech facade." Type="Variable" Display="advanced" Required="true" Mask="false">http://Home-AI-Assistant:8088/v1</Config>
+  <Config Name="TTS API key" Target="AUDIO_TTS_OPENAI_API_KEY" Default="CHANGE_ME" Mode="" Description="Same protected Home-AI bearer key; never expose in chat/tool context." Type="Variable" Display="advanced" Required="true" Mask="true">CHANGE_ME</Config>
+  <Config Name="TTS model" Target="AUDIO_TTS_MODEL" Default="tts-1" Mode="" Description="Compatibility model name translated by Home-AI." Type="Variable" Display="advanced" Required="true" Mask="false">tts-1</Config>
+  <Config Name="TTS voice" Target="AUDIO_TTS_VOICE" Default="alloy" Mode="" Description="Voice name accepted by the compatibility facade." Type="Variable" Display="advanced" Required="true" Mask="false">alloy</Config>
+  <Config Name="Disable Ollama integration" Target="ENABLE_OLLAMA_API" Default="false" Mode="" Description="Keep Open WebUI from becoming a second agent/provider." Type="Variable" Display="advanced" Required="true" Mask="false">false</Config>
+</Container>
