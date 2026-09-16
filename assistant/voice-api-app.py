@@ -3062,6 +3062,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             context["resolved_request"]["selected_tools"] = [tool.get("name") for tool in tools]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if context.get("tool_selection_status") == "UNANCHORED_NO_TOOL":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "This turn has no grounded live-tool target. Answer only the newest user request. "
+                    "Do not reuse or invent camera, media, weather, server, or other household facts "
+                    "from earlier turns. If the request is unclear, ask a concise clarification."
+                ),
+            })
         if tools:
             # Qwen3.5 can still emit a prose refusal when the long global
             # contract and the structured request are both present, even
