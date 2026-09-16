@@ -81,6 +81,27 @@ def _load_app():
     return module
 
 
+# Mirrors tools/server-tools-app.py's _media_title_candidate_words /
+# assistant/voice-api-app.py's copy of the same classifier (separate
+# processes each carry their own copy; this fake mirrors the shape rather
+# than importing production code, consistent with the rest of this file's
+# "mirror the contract" philosophy).
+_TITLELESS_CATEGORY_WORDS = {"movie", "movies", "film", "films", "show", "shows", "series", "tv",
+                             "episode", "episodes", "season", "seasons", "album", "albums", "music",
+                             "song", "songs", "track", "tracks", "library", "libraries", "anime"}
+_TITLELESS_SCAFFOLDING = {"do", "does", "did", "i", "have", "has", "any", "some", "what",
+                          "what's", "whats", "which", "how", "many", "show", "me", "my", "in",
+                          "on", "is", "are", "of", "the", "a", "an", "to", "for", "your",
+                          "server", "plex", "got", "get", "give", "grab", "find", "add", "mean",
+                          "request", "want", "put", "can", "could", "would", "you", "please",
+                          "there"}
+
+
+def _looks_titleless(text: str) -> bool:
+    tokens = re.findall(r"[a-z0-9']+", text.casefold())
+    return not [t for t in tokens if t not in _TITLELESS_SCAFFOLDING and t not in _TITLELESS_CATEGORY_WORDS]
+
+
 # --- Fake Home-AI-Tools backend --------------------------------------------
 
 class FakeToolsBackend:
@@ -148,6 +169,21 @@ class FakeToolsBackend:
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
+            if _looks_titleless(goal):
+                # Simulates the real tools/server-tools-app.py NO_TITLE_GIVEN
+                # shape (media_plan_goal short-circuits before touching any
+                # provider when the goal has no title-shaped content) -- this
+                # conversation-level test proves the ASSISTANT correctly
+                # stages/consumes the pending-clarification mechanism around
+                # that shape, not that this fake reimplements the real
+                # _media_title_candidate_words classifier itself (that is
+                # unit/integration-tested directly against the real function
+                # in tools/test_media_plan_goal_ambiguity_and_no_title.py).
+                return {"tool": name, "status": "ok", "result": {
+                    "canonical_identity": None, "current_state": "NO_TITLE_GIVEN", "ambiguous": False,
+                    "confirmation_required": False, "goal": {"title_query": ""},
+                    "message": "I didn't catch a specific title -- what would you like me to look for?",
+                }}
             if self.simulate_drift_for and self.simulate_drift_for.casefold() in goal.casefold():
                 # Simulates the real tools/server-tools-app.py query-drift
                 # guardrail's output shape for a search that resolved a
@@ -1623,3 +1659,85 @@ async def test_genuine_chat_message_through_gateway_still_uses_the_real_pipeline
 
     assert called["respond"] is True
     assert answer == "It is sunny today."
+
+
+# --- Generalized replay of a live production transcript (real bug: a stale --
+# --- garbled title survived a fresh restatement, and a bare clarification ---
+# --- answer got hijacked by an unrelated capability) -----------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title,creator", [
+    ("Interstellar", "Christopher Nolan"),
+    ("Whiplash", "Damien Chazelle"),
+])
+async def test_fresh_title_restatement_replaces_stale_subject_and_bare_reply_resolves(session, title, creator):
+    """Generalized version of a real live transcript (not hardcoded to one
+    title -- run for two unrelated titles/creators to prove the fix is
+    generic):
+
+    1. An acquisition request for a title that fails to resolve stages a
+       stale UnresolvedSubject.
+    2. A full, clean restatement of a DIFFERENT, real title must REPLACE
+       that stale subject rather than merging onto it or echoing the old
+       garbled text back to the user.
+    3. A later titleless request ("Can you request the movie?") stages a
+       pending clarification.
+    4. The very next turn -- a bare one-word reply that IS the title -- must
+       be tried directly against that clarification instead of falling
+       through to unrelated routing.
+    """
+    session.backend.seed_library(title, media_type="movie", state="IDENTIFIED", tmdb_id=hash(title) % 100000)
+
+    # Turn 1: a request for something that does not exist -- stages a stale,
+    # garbled UnresolvedSubject the way a real failed resolution would.
+    reply1 = await session.turn("Can you get me the movie Zzyzx Nonexistent Title?")
+    assert "zzyzx" in reply1.casefold() or "couldn't find" in reply1.casefold() or "confident" in reply1.casefold()
+    stale = session.app.conversation_context.get(session.client_id, {}).get("latest_unresolved_subject")
+    assert stale is not None, "a failed resolution must stage an UnresolvedSubject to enrich against"
+    assert "zzyzx" in stale["title_or_name"].casefold()
+
+    # Turn 2: a full, clean restatement of a real, different title. Must
+    # REPLACE the stale "Zzyzx..." subject -- not merge a hint onto it, and
+    # never echo "Zzyzx" back to the user.
+    reply2 = await session.turn(f"Can you give me the movie {title} by {creator}?")
+    assert "zzyzx" not in reply2.casefold(), "a fresh title restatement must never echo the old garbled subject back"
+    assert title.casefold() in reply2.casefold(), "the fresh title must actually be used, not discarded"
+    last_goal_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
+    assert "zzyzx" not in str(last_goal_calls[-1]).casefold(), "the retry must not carry the stale title forward"
+
+    # Turn 3: a titleless request must ask a direct clarifying question and
+    # stage a pending clarification (root cause #3's new mechanism).
+    reply3 = await session.turn("Can you request the movie?")
+    assert "what would you like me to look for" in reply3.casefold()
+    clarification = session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification")
+    assert clarification is not None, "the clarifying question must stage a pending_title_clarification, mirroring pending_offers/pending_disambiguation"
+
+    # Turn 4: a bare one-word reply that IS the answer to that question must
+    # be tried directly as the title -- not routed to an unrelated
+    # capability, which is the exact live production bug this proves fixed.
+    calls_before = len(session.backend.call_log)
+    reply4 = await session.turn(title)
+    assert title.casefold() in reply4.casefold(), f"the bare reply must resolve as the title, got: {reply4!r}"
+    new_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
+    assert new_calls, "the bare reply must be tried against media_plan_goal, not silently dropped"
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is None, (
+        "the clarification must be consumed once answered"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unrelated_explicit_request_still_outranks_a_pending_title_clarification(session):
+    """Same discipline as pending_offers/pending_disambiguation: a
+    genuinely new, clearly-unrelated explicit request must outrank a stale
+    clarification prompt rather than being force-fed into title resolution."""
+    await session.turn("Can you request the movie?")
+    assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is not None
+
+    reply = await session.turn(
+        "What's the weather like today?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "weather_forecast", "arguments": {"location": "Welland"}}},
+        ]}}],
+        final_text="It is 12 degrees in Welland.",
+    )
+    assert "movie" not in reply.casefold() and "title" not in reply.casefold()

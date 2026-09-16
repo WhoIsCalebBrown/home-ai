@@ -112,3 +112,29 @@ def test_creator_hint_does_not_redefine_media_type_when_already_known():
     assert parts["media_type"] == "movie"
     assert parts["artist_query"] == "Tommy Wiseau"
     assert parts["title_query"] == "The Room"
+
+
+def test_comma_separated_creator_hint_is_handled_like_by_name():
+    """Real live bug: "The Room, Tommy Wiseau." still failed to resolve
+    even with an unambiguous title, because the trailing ", Tommy Wiseau"
+    clause polluted the search string instead of being split out as a
+    creator hint the same way "by Tommy Wiseau" already is. Generic --
+    tested with a second, unrelated name too."""
+    parts = _media_goal_parts("The Room, Tommy Wiseau.", media_type="movie")
+    assert parts["title_query"] == "The Room"
+    assert parts["artist_query"] == "Tommy Wiseau"
+
+    parts2 = _media_goal_parts("Whiplash, Damien Chazelle.", media_type="movie")
+    assert parts2["title_query"] == "Whiplash"
+    assert parts2["artist_query"] == "Damien Chazelle"
+
+
+def test_comma_hint_does_not_misfire_on_a_real_title_with_a_comma():
+    """A comma followed by media-structure language (a year, "the 2014
+    movie", "Vol. 2") is part of the title/qualifier itself, not a
+    separate creator name -- must not be split out."""
+    parts = _media_goal_parts("Interstellar, the 2014 movie.", media_type="movie")
+    assert parts["artist_query"] is None
+
+    parts2 = _media_goal_parts("Kill Bill, Vol. 2", media_type="movie")
+    assert parts2["artist_query"] is None

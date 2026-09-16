@@ -408,16 +408,22 @@ class UnresolvedSubject:
     def new(subject_type: str, title_or_name: str, **hints) -> "UnresolvedSubject":
         return UnresolvedSubject(subject_type=subject_type, title_or_name=title_or_name, hints=hints)
 
-    def enrich(self, **hints) -> "UnresolvedSubject":
+    def enrich(self, title_or_name: str | None = None, **hints) -> "UnresolvedSubject":
         """Merge new hints (e.g. a year given in a follow-up) without losing
         anything already known. Never overwrites an existing hint value with
-        an empty one; a later, more specific hint replaces an earlier one."""
+        an empty one; a later, more specific hint replaces an earlier one.
+
+        A follow-up that restates a real new title (not merely a bare
+        year/type refinement) passes `title_or_name` to REPLACE the stale
+        one, rather than being merged as another hint on top of it -- a
+        fresh title is not additional detail about the old one, it is a
+        correction of it."""
         merged_hints = dict(self.hints)
         for key, value in hints.items():
             if value not in (None, "", []):
                 merged_hints[key] = value
         return UnresolvedSubject(
-            subject_type=self.subject_type, title_or_name=self.title_or_name,
+            subject_type=self.subject_type, title_or_name=title_or_name or self.title_or_name,
             hints=merged_hints, constraints=dict(self.constraints),
             candidate_ids=list(self.candidate_ids), confidence=self.confidence,
             source_turn=self.source_turn, failed_resolution_attempts=self.failed_resolution_attempts,

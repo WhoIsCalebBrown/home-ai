@@ -1403,12 +1403,24 @@ def media_acquisition_language(text: str) -> bool:
 
 
 def media_goal_request(text: str) -> bool:
-    """True only for library-goal language, never direct file delivery/playback."""
+    """True only for library-goal language, never direct file delivery/playback.
+
+    A compound sentence can contain acquisition-flavored words ("request",
+    "get", "put") while actually being a STATUS question about whether an
+    action already happened ("did I request it or get it put on my plex
+    server") rather than an imperative to perform one now -- real production
+    bug: such a sentence was sent to media_plan_goal with the entire raw
+    sentence as the literal search title. media_status_question() already
+    exists to recognize this question shape; it must outrank acquisition
+    language here, the same way it already outranks other classification in
+    preflight_plan.
+    """
     return (
         media_acquisition_language(text)
         and media_identity_signal(text)
         and not direct_file_request(text)
         and not playback_request(text)
+        and not media_status_question(text)
     )
 
 
@@ -1421,8 +1433,15 @@ def media_status_question(text: str) -> bool:
         return False
     if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
-    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was)|i\s+was|can i)\b", routed_text, re.I)
-    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already)\b", routed_text, re.I)
+    # Generic status/diagnosis question shapes -- "did I ever request X",
+    # "is X on my server or not", "what happened when I asked for X" are all
+    # asking whether/how something already happened, not issuing a new
+    # acquisition command, even though they contain acquisition-flavored
+    # words like "request"/"ask". Bounded to a question-frame + status-word
+    # combination, same discipline as the original two lists, just widened
+    # with more of the same kind of word rather than a per-phrase special case.
+    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was|\s+happened)|i\s+was|can i)\b", routed_text, re.I)
+    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|happened|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already|request(?:ed)?|ask(?:ed)?|or\s+not)\b", routed_text, re.I)
     if question_frame and status_word:
         return True
     # STT often drops the opening question frame. Treat a multi-token media
@@ -1727,7 +1746,7 @@ _MEDIA_CATEGORY_WORDS = {"movie", "movies", "film", "films", "show", "shows", "s
 _MEDIA_QUESTION_SCAFFOLDING = {"do", "does", "did", "i", "have", "has", "any", "some", "what",
                                "what's", "whats", "which", "how", "many", "show", "me", "my", "in",
                                "on", "is", "are", "of", "the", "a", "an", "to", "for", "your",
-                               "server", "plex", "got", "get", "give", "grab", "find", "add",
+                               "server", "plex", "got", "get", "give", "grab", "find", "add", "mean",
                                "request", "want", "put", "can", "could", "would", "you", "please",
                                "there"}
 
@@ -2127,12 +2146,47 @@ def guess_media_title(text: str) -> str:
     fails. Deliberately generic (strips known request/question framing and
     media-type words), never a per-title special case."""
     working = text.strip().rstrip("?.!")
-    working = re.sub(r"^(?:do you know|have you heard of|i want to request|i want|can you get|get me|please get|request|can you find|find)\s+", "", working, flags=re.I)
+    # A leading correction clause ("No, that's not what I mean. I want to
+    # add a movie called The Room.") must not survive into the title --
+    # same discipline as stripping request framing below, just applied
+    # first since a correction always precedes the actual restatement.
+    working = re.sub(r"^\s*no[,.]?\s+(?:that'?s not what i mean[.,]?\s*)?", "", working, flags=re.I)
+    # Speech/typed disfluencies can repeat or stack request framing ("I want
+    # to add a movie called ..."); strip it in a bounded loop the same way
+    # tools/server-tools-app.py's _media_goal_parts already does, rather
+    # than relying on a single one-shot regex that only catches one layer.
+    for _ in range(5):
+        before = working
+        working = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", working, flags=re.I)
+        working = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", working, flags=re.I)
+        working = re.sub(r"^\s*to\s+(?:get|give|grab|find|add|request|want)\s+", "", working, flags=re.I)
+        working = re.sub(r"^(?:do you know|have you heard of)\s+", "", working, flags=re.I)
+        if working == before:
+            break
     working = re.sub(r"^(?:a|an|the)\s+(?:movie|show|series|album|film|anime)\s+(?:called|named)\s+", "", working, flags=re.I)
     working = re.sub(r"^(?:a|an|the)\s+(?:movie|show|series|album|film|anime)\s+", "", working, flags=re.I)
     working = re.sub(r"^(?:movie|show|series|album|film|anime)\s+(?:called|named)\s+", "", working, flags=re.I)
     working = re.sub(r"\s+from\s+(?:19|20)\d{2}$", "", working, flags=re.I)
     return working.strip()
+
+
+def fresh_title_restatement(text: str) -> str | None:
+    """Returns a real new title from a fresh utterance, or None when it is
+    only a bare refinement ("2003.", "the movie", "the 2003 one") with no
+    title-shaped content of its own. Same "judge by utterance shape"
+    discipline as _media_title_candidate_words: a candidate left with no
+    real content words after removing bare years and bare media-type/filler
+    words is not a title restatement -- it is guess_media_title() plus a
+    sanity check, not a second, incompatible extraction style."""
+    guessed = guess_media_title(text)
+    if not guessed:
+        return None
+    stripped = re.sub(r"^\s*(?:it'?s|it\s+is|that'?s|this\s+is)\s+", "", guessed, flags=re.I)
+    stripped = re.sub(r"\b(?:19|20)\d{2}\b", "", stripped)
+    stripped = re.sub(r"\b(?:movie|show|series|album|film|anime|one)\b", "", stripped, flags=re.I)
+    if not _media_title_candidate_words(stripped):
+        return None
+    return guessed
 
 
 def stage_unresolved_media_subject(client_id: str, title: str, **hints) -> None:
@@ -2278,6 +2332,30 @@ def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: 
 
 def _disambiguation_expired(entry: dict) -> bool:
     return time.time() - float(entry.get("created_at", 0)) > _DISAMBIGUATION_TTL_SECONDS
+
+
+_TITLE_CLARIFICATION_TTL_SECONDS = 90
+
+
+def stage_title_clarification(client_id: str, original_goal: str) -> None:
+    """Persist that the assistant just asked a direct clarifying question
+    ("I didn't catch a specific title -- what would you like me to look
+    for?", the NO_TITLE_GIVEN path) so the very next reply -- especially a
+    bare one-word answer like "room." -- is tried FIRST as a direct answer
+    to that specific question, instead of falling through to normal
+    capability discovery where an unrelated capability can hijack a short
+    reply (real production bug: a bare "room." answer got routed to an
+    unrelated capability instead of being tried as the title). Same
+    additive conversation_context shape and TTL/expiry convention as
+    pending_offers/pending_disambiguation -- not a fourth state-tracking
+    style."""
+    context = dict(conversation_context.get(client_id, {}))
+    context["pending_title_clarification"] = {"original_goal": original_goal, "created_at": time.time()}
+    conversation_context[client_id] = context
+
+
+def _title_clarification_expired(entry: dict) -> bool:
+    return time.time() - float(entry.get("created_at", 0)) > _TITLE_CLARIFICATION_TTL_SECONDS
 
 
 def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | None:
@@ -2722,14 +2800,20 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     unresolved_subject = unresolved_subject_from_dict(conversation_context.get(client_id, {}).get("latest_unresolved_subject"))
     if unresolved_subject is not None:
         enrichment_hint = enrichment_reply_hint(user_text, unresolved_subject)
+        # A fresh, title-shaped restatement ("Can you give me the movie The
+        # Room by Tommy Wiseau?", "I want to add a movie called The Room.")
+        # must REPLACE the stale title, not merely add a year/type hint on
+        # top of it -- real production bug: the old, already-wrong title
+        # was silently kept and the new title text discarded entirely.
+        fresh_title = fresh_title_restatement(user_text)
         # A genuinely different explicit domain outranks the pending
         # unresolved subject, same precedent as offers/disambiguation --
         # "media" itself is not competing (a media-type-word enrichment
         # reply is media-flavored language by construction).
         enrichment_domain = explicit_domain(user_text)
         has_competing_domain = enrichment_domain is not None and enrichment_domain != "media"
-        if enrichment_hint and not has_competing_domain:
-            enriched = unresolved_subject.enrich(**enrichment_hint)
+        if (enrichment_hint or fresh_title) and not has_competing_domain:
+            enriched = unresolved_subject.enrich(title_or_name=fresh_title, **(enrichment_hint or {}))
             enriched_goal = enriched.resolution_goal_text()
             result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": request_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
@@ -2770,6 +2854,55 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # leave the unresolved subject exactly as staged and fall through
         # to normal routing for this turn (mirrors the offer/disambiguation
         # precedent -- never silently consumed on an unrecognized reply).
+    title_clarification = conversation_context.get(client_id, {}).get("pending_title_clarification")
+    if title_clarification and _title_clarification_expired(title_clarification):
+        context_after_expiry = dict(conversation_context.get(client_id, {}))
+        context_after_expiry.pop("pending_title_clarification", None)
+        conversation_context[client_id] = context_after_expiry
+        title_clarification = None
+    if title_clarification:
+        # A genuinely new, clearly-unrelated explicit request still
+        # outranks a stale clarification prompt, same precedent as
+        # offers/disambiguation -- "media" itself is not competing.
+        clarification_domain = explicit_domain(user_text)
+        has_competing_domain = clarification_domain is not None and clarification_domain != "media"
+        candidate_title = fresh_title_restatement(user_text)
+        if candidate_title and not has_competing_domain:
+            context_cleared = dict(conversation_context.get(client_id, {}))
+            context_cleared.pop("pending_title_clarification", None)
+            conversation_context[client_id] = context_cleared
+            result = await invoke_tool("media_plan_goal", {"goal": candidate_title, "session_id": request_id}, client_id, request_id)
+            plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            live_results_clarified = [result]
+            if plan_result.get("canonical_identity"):
+                promote_unresolved_subject(client_id)
+                record_tool_referent(client_id, "media_plan_goal", {"goal": candidate_title}, result)
+                resolved_text = direct_structured_answer(user_text, live_results_clarified) or media_plan_response(user_text, live_results_clarified)
+                if not resolved_text:
+                    resolved_text = f"I found {plan_result['canonical_identity'].get('title', candidate_title)}."
+                if plan_result.get("confirmation_required"):
+                    stage_media_confirmation(client_id, request_id, plan_result)
+                elif not plan_result.get("ambiguous"):
+                    offer_question = stage_media_offer(client_id, plan_result)
+                    if offer_question:
+                        resolved_text = f"{resolved_text} {offer_question}"
+            elif plan_result.get("ambiguous") and plan_result.get("candidates"):
+                stage_disambiguation(client_id, plan_result["candidates"], candidate_title)
+                resolved_text = media_plan_response(user_text, live_results_clarified) or "I found more than one possible match. Which one do you mean?"
+            else:
+                resolved_text = media_plan_response(user_text, live_results_clarified) or f"I still couldn't find anything called '{candidate_title}'."
+                if plan_result.get("current_state") != "NO_TITLE_GIVEN":
+                    stage_unresolved_media_subject(client_id, candidate_title, media_type=extract_media_type_hint(user_text))
+            store_provenance(client_id, live_results_clarified)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="title_clarification_reply")
+            history.append({"role": "assistant", "content": resolved_text})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        # No title-shaped reply recognized, or a competing domain took over:
+        # leave the pending clarification in place (it will still be tried
+        # again next turn, up to its TTL) and fall through to normal routing
+        # -- never force-feed an unrelated reply into title resolution.
     disambiguation = conversation_context.get(client_id, {}).get("pending_disambiguation")
     if disambiguation and _disambiguation_expired(disambiguation):
         context_after_expiry = dict(conversation_context.get(client_id, {}))
@@ -3199,6 +3332,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if plan_result:
                 if plan_result.get("canonical_identity"):
                     promote_unresolved_subject(client_id)
+                elif plan_result.get("current_state") == "NO_TITLE_GIVEN":
+                    # No title was ever extracted -- there is nothing real to
+                    # stage as an UnresolvedSubject (guess_media_title() on
+                    # this same titleless utterance would only produce
+                    # leftover scaffolding words, e.g. "for me"). Stage the
+                    # pending clarification instead so the very next reply is
+                    # tried as a direct title answer.
+                    stage_title_clarification(client_id, user_text)
                 elif not plan_result.get("ambiguous"):
                     # Genuinely unresolvable: retain what the user named
                     # rather than letting the failure erase the subject
