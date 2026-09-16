@@ -3015,6 +3015,25 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         context["retrieval_confidence"] = retrieval_confidence(candidates)
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
+        # A low-confidence, domain-free utterance must not inherit a stale
+        # referent by giving Qwen a noisy cross-domain tool set.  This is a
+        # safety boundary, not a language vocabulary rule: explicit domains,
+        # structured discovery subjects, and genuine referential follow-ups
+        # remain eligible; an unanchored phrase such as "Question 1?" gets a
+        # tool-free clarification/general response instead of accidentally
+        # dispatching Frigate because short-query n-grams happened to score.
+        current_domain = explicit_domain(user_text, context)
+        anchored_turn = bool(
+            current_domain
+            or has_referential_language(user_text)
+            or context.get("discovery_subject")
+            or media_goal_request(user_text)
+            or current_external_question(user_text)
+        )
+        top_score = float((candidates[0].get("metadata") or {}).get("score", 0) or 0) if candidates else 0.0
+        if not anchored_turn and top_score < 5.0:
+            tools = []
+            context["tool_selection_status"] = "UNANCHORED_NO_TOOL"
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
         # Semantic retrieval supplies the bounded model-facing tool set. Only
