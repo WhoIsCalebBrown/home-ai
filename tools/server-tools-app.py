@@ -579,8 +579,30 @@ async def weather_forecast(args: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
         geo = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": geocoder_location, "count": 1, "language": "en", "format": "json"})
         geo.raise_for_status(); places = geo.json().get("results") or []
-        if not places: return {"location": location, "found": False}
-        place = places[0]
+        if places:
+            place = places[0]
+        else:
+            # Open-Meteo's geocoder omits some small communities. Use the
+            # public OSM geocoder only as a bounded fallback, then keep the
+            # forecast data source and all weather semantics unchanged.
+            fallback = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": geocoder_location, "format": "jsonv2", "limit": 1, "addressdetails": 1},
+                headers={"User-Agent": "Home-AI-Tools/1.0 weather geocoder"},
+            )
+            fallback.raise_for_status()
+            candidates = fallback.json() or []
+            if not candidates:
+                return {"location": location, "found": False}
+            candidate = candidates[0]
+            address = candidate.get("address") or {}
+            place = {
+                "name": address.get("village") or address.get("town") or address.get("city") or address.get("hamlet") or location,
+                "admin1": address.get("state") or address.get("province"),
+                "country": address.get("country"),
+                "latitude": float(candidate["lat"]),
+                "longitude": float(candidate["lon"]),
+            }
         forecast = await client.get("https://api.open-meteo.com/v1/forecast", params={
             "latitude": place["latitude"], "longitude": place["longitude"],
             "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",

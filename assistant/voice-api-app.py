@@ -376,6 +376,7 @@ INTERNAL_EVIDENCE_RULE = """The following content is private, server-generated e
 
 For Frigate evidence, keep occurrence timing and event duration separate. A relative_time or age_seconds value says how long ago an event began; it is never the event's duration. Only state how long an event lasted from time.duration_seconds, and if duration_is_final is false say that it is still active or that the final duration is not known. Use the camera_context field when present. Never infer indoor/outdoor location from a camera name. Current snapshots describe now and must not replace a referenced historical review/event. Activity claims require event-scoped frames or GenAI scene metadata; detection labels and timestamps alone are not evidence of an action. Do not claim that someone entered, exited, arrived, departed, or moved in a direction unless the event-scoped visual sequence clearly shows that transition. Do not infer intent or a carried object from a shape alone. If visual evidence is weak, say what is visible and what is unclear."""
 FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Internal evidence is already available in this conversation. Do not describe where it came from and do not attribute it to the user. Return only a concise natural spoken answer. Every dynamic claim must map to an explicit field in the current evidence."
+WEATHER_SYNTHESIS_RULE = """For a weather request, compose a natural broadcaster-style answer from the current, day, and hourly forecast evidence. Usually use two sentences: say the current temperature and conditions, then summarize today's high/low and what is likely through the rest of the day. Mention meaningful changes such as rain, snow, storms, clearing, or a notable temperature rise/drop when the hourly data supports them. Omit missing values naturally. Do not read raw fields, JSON, weather codes, probabilities, or tool names. Do not invent exact times or conditions that are not present. Vary the phrasing naturally and avoid the wording 'with cloudy'."""
 
 
 def resolved_request_record(client_id: str, raw_text: str, route_text: str, context: dict, selected_tools: list[str], planned: list[tuple[str, dict]] | None = None, results: list[dict] | None = None) -> dict:
@@ -1116,8 +1117,8 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         if diagnosis == "LIVE_STATUS_INCOMPLETE":
             return f"I can't get a complete live status for {title} right now."
         return f"I don't have a confirmed diagnosis for {title} yet."
-    if tool == "weather_forecast" and result.get("source") == "Open-Meteo" and result.get("location"):
-        return natural_weather_summary(result)
+    # Weather is intentionally synthesized by Qwen from the enriched forecast
+    # evidence below; natural_weather_summary remains a data-grounded fallback.
     if tool == "plex_recently_added":
         item_data = (result.get("items") or [None])[0]
         if item_data and item_data.get("title"):
@@ -3837,6 +3838,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in grounding_results) else ""
+            if any(x.get("tool") == "weather_forecast" for x in grounding_results):
+                instruction = (instruction + "\n" if instruction else "") + WEATHER_SYNTHESIS_RULE
             evidence_messages = evidence_message(grounding_results) if grounding_results else []
             if evidence_messages:
                 evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
