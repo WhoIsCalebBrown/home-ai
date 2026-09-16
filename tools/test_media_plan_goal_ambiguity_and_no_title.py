@@ -342,3 +342,189 @@ async def test_unknown_media_type_cross_domain_ambiguity_retains_candidates(app,
     assert plan["ambiguity_reason"] == "NO_CONFIDENT_MATCH"
     media_types = {c["media_type"] for c in plan["candidates"]}
     assert media_types == {"movie", "tv"}
+
+
+# --- Web discovery fallback: descriptive/person-based resolution ----------
+
+@pytest.mark.asyncio
+async def test_tom_hanks_island_volleyball_resolves_via_web_discovery(app, monkeypatch):
+    """The target scenario this fallback exists for: no title at all, only
+    a descriptive clue and a person mention. Structured lookup (Radarr)
+    finds nothing for the literal description; web_search names the real
+    film; that NAME is re-searched through the REAL Radarr lookup, never
+    trusted directly -- proving "natural-language text is NOT canonical
+    media identity" holds even for this new path."""
+    radarr_calls = []
+
+    async def fake_radarr_search(args):
+        radarr_calls.append(args["query"])
+        if "cast away" in args["query"].casefold():
+            return {"matches": [{"title": "Cast Away", "year": "2000", "tmdbId": 8358}]}
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    async def fake_web_search(args):
+        assert "tom hanks" in args["query"].casefold(), "the person hint must reach the web search query"
+        return {"query": args["query"], "results": [
+            {"title": "Cast Away (2000) - IMDb", "url": "https://example.invalid/cast-away", "snippet": "A FedEx employee is stranded on an island."},
+        ], "source": "SearXNG", "untrusted": True}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({
+        "goal": "the Tom Hanks movie where he's stuck on an island with a volleyball",
+        "media_type": "movie",
+    })
+
+    assert plan["canonical_identity"] is not None, "web discovery must resolve this, not dead-end"
+    assert plan["canonical_identity"]["title"] == "Cast Away"
+    assert plan["canonical_identity"]["tmdb_id"] == 8358
+    assert plan["ambiguity_reason"] == "WEB_DISCOVERY_MATCH"
+    # The literal description was searched first and failed structurally,
+    # THEN the web-discovered name was re-searched through the real lookup
+    # -- web search never itself supplied the identity.
+    assert any("cast away" in q.casefold() for q in radarr_calls)
+    assert len(radarr_calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_web_discovery_only_triggers_with_a_real_person_or_description_clue(app, monkeypatch):
+    """Negative control: a titleless request with NO descriptive/person
+    clue must never trigger a web search fishing expedition -- it still
+    goes through the existing NO_TITLE_GIVEN clarification path."""
+    web_called = {"value": False}
+
+    async def fake_web_search(args):
+        web_called["value"] = True
+        return {"query": args["query"], "results": []}
+
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+
+    plan = await app.media_plan_goal({"goal": "Can you request a movie for me?"})
+
+    assert plan["current_state"] == "NO_TITLE_GIVEN"
+    assert web_called["value"] is False
+
+
+@pytest.mark.asyncio
+async def test_web_discovery_does_not_trigger_for_an_ordinary_unmatched_title(app, monkeypatch):
+    """A plain, clean title that genuinely does not exist must NOT trigger
+    a web search fishing expedition just because it found zero matches --
+    only a real person/description clue should activate this fallback."""
+    web_called = {"value": False}
+
+    async def fake_radarr_search(args):
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    async def fake_web_search(args):
+        web_called["value"] = True
+        return {"query": args["query"], "results": []}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+
+    plan = await app.media_plan_goal({"goal": "request the movie Zzyzx Nonexistent Reel", "media_type": "movie"})
+
+    assert web_called["value"] is False
+    assert plan["canonical_identity"] is None
+
+
+@pytest.mark.asyncio
+async def test_web_discovery_result_is_re_validated_not_trusted_directly(app, monkeypatch):
+    """If web_search names something that Radarr does NOT recognize at
+    all, the fallback must fail honestly, never fabricate identity from
+    the web result text itself."""
+    async def fake_radarr_search(args):
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    async def fake_web_search(args):
+        return {"query": args["query"], "results": [
+            {"title": "Some Unrelated Fan Blog Post - Not a real movie", "url": "https://example.invalid/x"},
+        ]}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+
+    plan = await app.media_plan_goal({
+        "goal": "the Tom Hanks movie where he's stuck on an island with a volleyball",
+        "media_type": "movie",
+    })
+
+    assert plan["canonical_identity"] is None
+    assert plan.get("ambiguity_reason") != "WEB_DISCOVERY_MATCH"
+
+
+# --- Candidate ranking: a minor, capped popularity tiebreaker -------------
+
+def test_pick_match_uses_vote_count_to_rank_candidates_when_still_ambiguous():
+    """The real live gap: several equally-token-matching "Avengers"-titled
+    rows (an obscure TV series and the well-known MCU film both contain
+    "avengers") used to surface in an arbitrary/order-dependent sequence in
+    the candidate list -- the coordinator's live re-test found obscure
+    shows listed ahead of the well-known movie. vote_count (extracted
+    defensively from Radarr/Sonarr's `ratings` field -- see
+    _lookup_vote_count) is capped well below the 0.25 confidence-margin
+    threshold, so a genuine tie correctly remains ambiguous (never
+    silently guessed) -- but it now orders the SURFACED candidates toward
+    the popular title first, so the clarification question names the real
+    movie, not the obscure one."""
+    matches = [
+        {"title": "The Avengers: United They Stand", "year": "1999", "tmdbId": 1, "vote_count": 12},
+        {"title": "The Avengers", "year": "2012", "tmdbId": 2, "vote_count": 28000},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "avengers")
+    assert ambiguous is True
+    assert candidates[0]["tmdbId"] == 2, "the popular, well-known title must be ranked first among the surfaced candidates"
+
+
+def test_pick_match_vote_count_cannot_override_a_real_title_mismatch():
+    """The popularity bonus is capped well below the margin threshold --
+    a hugely popular but token-mismatched row must never win over a real,
+    exact/near-exact title match."""
+    matches = [
+        {"title": "The Room", "year": "2003", "tmdbId": 1, "vote_count": 5},
+        {"title": "Interstellar", "year": "2014", "tmdbId": 2, "vote_count": 9000000},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "The Room")
+    assert identity["tmdbId"] == 1
+
+
+def test_pick_match_missing_vote_count_is_a_safe_no_op():
+    """Rows without a vote_count field (a Radarr/Sonarr response that does
+    not carry the ratings data) must score exactly as before -- no
+    fabricated popularity signal."""
+    matches = [
+        {"title": "The Avengers", "year": "1998", "tmdbId": 1},
+        {"title": "The Avengers", "year": "2012", "tmdbId": 2},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "the avengers")
+    assert ambiguous is True
+    assert len(candidates) == 2
+
+
+def test_lookup_vote_count_extracts_from_documented_radarr_sonarr_shapes():
+    """Direct coverage of the defensive extraction itself against the
+    documented Radarr/Sonarr v3 lookup `ratings` shapes -- NOT verified
+    against a live instance this round (no network access from this
+    environment); this proves the extraction is a safe no-op for any row
+    shape that does not match, rather than proving the shape is correct
+    against real production data."""
+    vote_count = app_module()._lookup_vote_count
+    assert vote_count({"ratings": {"votes": 500, "value": 7.2}}) == 500
+    assert vote_count({"ratings": {"tmdb": {"votes": 300, "value": 6.1}}}) == 300
+    assert vote_count({"ratings": {}}) == 0
+    assert vote_count({}) == 0
+    assert vote_count({"ratings": "not a dict"}) == 0

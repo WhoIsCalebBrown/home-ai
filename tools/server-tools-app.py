@@ -7,6 +7,7 @@ import html
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -991,17 +992,37 @@ async def arr_queue(service: str, _: dict[str, Any]) -> dict[str, Any]:
     return {"service": service, "total": data.get("totalRecords", len(records)) if isinstance(data, dict) else len(records), "items": [{"title": x.get("title"), "status": x.get("status"), "sizeleft": x.get("sizeleft"), "protocol": x.get("protocol")} for x in records[:50]]}
 
 
+def _lookup_vote_count(row: dict[str, Any]) -> int:
+    """Radarr/Sonarr's v3 lookup rows carry a `ratings` object (TMDb-backed
+    for movies, TheTVDB/TMDb-backed for series) shaped like
+    {"votes": int, "value": float}, sometimes nested per-source
+    (e.g. {"tmdb": {"votes": ..., "value": ...}}). Extracted defensively --
+    every access is a bounded .get() with a numeric fallback of 0 -- so an
+    instance whose lookup response omits or reshapes this field simply
+    contributes no popularity signal, rather than raising or fabricating one."""
+    ratings = row.get("ratings")
+    if not isinstance(ratings, dict):
+        return 0
+    if isinstance(ratings.get("votes"), (int, float)):
+        return int(ratings["votes"])
+    for nested in ratings.values():
+        if isinstance(nested, dict) and isinstance(nested.get("votes"), (int, float)):
+            return int(nested["votes"])
+    return 0
+
+
 async def sonarr_search(args):
     rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": args["query"]})
     return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"),
                           "tmdbId": x.get("tmdbId"),
                           "seriesType": x.get("seriesType"), "genres": x.get("genres") or [],
-                          "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
+                          "overview": x.get("overview", "")[:240], "vote_count": _lookup_vote_count(x)} for x in rows[:20]]}
 
 
 async def radarr_search(args):
     rows = await arr_get("radarr", "/api/v3/movie/lookup", {"term": args["query"]})
-    return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tmdbId": x.get("tmdbId"), "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
+    return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tmdbId": x.get("tmdbId"), "overview": x.get("overview", "")[:240],
+                          "vote_count": _lookup_vote_count(x)} for x in rows[:20]]}
 
 
 async def lidarr_search(args):
@@ -1931,6 +1952,16 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
         score = len(wanted & tokens) / max(len(wanted), 1)
         if artist_cf and artist_cf in json.dumps(row).casefold():
             score += 1.0
+        # A minor popularity tiebreaker only -- capped well below the 0.25
+        # margin threshold below, so it can only decide between candidates
+        # that are ALREADY effectively tied on title/artist relevance
+        # (e.g. several "Avengers"-titled entries), never override a real
+        # title mismatch. vote_count is 0 when Radarr/Sonarr's response
+        # does not carry a ratings field for a given row (see
+        # _lookup_vote_count) -- this is then simply a no-op for that row.
+        vote_count = row.get("vote_count")
+        if isinstance(vote_count, (int, float)) and vote_count > 0:
+            score += min(0.05, math.log10(vote_count + 1) / 100)
         scored.append((score, row))
     scored.sort(key=lambda pair: -pair[0])
     if len(scored) == 1:
@@ -1941,6 +1972,64 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
         return scored[0][1], False, []
     top_candidates = [row for _, row in scored[:3]]
     return None, True, top_candidates
+
+
+def _person_mention_hint(text: str, known_artist: str | None) -> str | None:
+    """Generic capitalized-name detector for a person mention with no "by"/
+    ", NAME" marker at all ("the Tom Hanks movie where he's stuck on an
+    island with a volleyball") -- the same shape "by NAME"/", NAME" already
+    capture explicitly in _media_goal_parts, just without either marker.
+    Never itself identity; only ever used to build a web search query when
+    structured lookup has already failed.
+
+    A bare two-word Title-Case sequence alone is not enough signal -- a
+    genuinely garbled title ("Zzyzx Nonexistent Reel") can match the same
+    shape. Also require the sentence to actually be description-length
+    (a real title restatement is short; a description is not), so a short
+    unmatched title never spuriously triggers a web search fishing
+    expedition."""
+    if known_artist:
+        return None
+    if len(re.findall(r"[a-zA-Z']+", text)) < 8:
+        return None
+    match = re.search(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b", text)
+    return match.group(1) if match else None
+
+
+def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | None:
+    """Extract a plausible title from the top web_search result -- never
+    canonical identity on its own (natural-language text is NOT canonical
+    media identity). The caller re-searches this NAME through the real
+    Radarr/Sonarr lookup; nothing here resolves or confirms anything."""
+    if not results:
+        return None
+    candidate = str(results[0].get("title") or "").strip()
+    if not candidate:
+        return None
+    candidate = re.split(r"\s*[-|:]\s*(?:imdb|rotten tomatoes|wikipedia|the movie database|tmdb|plex)\b", candidate, flags=re.I)[0]
+    candidate = re.sub(r"\s*\(\d{4}\)\s*$", "", candidate).strip()
+    return candidate or None
+
+
+async def _web_discover_title(description_hint: str, person_hint: str | None, media_type: str) -> str | None:
+    """Bounded, read-only fallback used only when structured media lookup
+    (Radarr/Sonarr) has already found nothing and the utterance carries a
+    real descriptive/person constraint -- e.g. "the Tom Hanks movie where
+    he's stuck on an island with a volleyball". Uses the EXISTING
+    web_search tool (already a legitimate media-resolution-adjacent
+    capability elsewhere in this flow); reaches nothing but that one tool,
+    never camera/weather/other capabilities. The name it returns is only
+    ever fed back into the real canonical lookup by the caller -- this
+    function cannot resolve, confirm, or write anything on its own."""
+    query_parts = [description_hint]
+    if person_hint:
+        query_parts.append(person_hint)
+    query_parts.append(media_type if media_type in {"movie", "tv"} else "movie")
+    try:
+        result = await web_search({"query": " ".join(p for p in query_parts if p)})
+    except Exception:
+        return None
+    return _web_discovery_title_from_results(result.get("results") or [])
 
 
 async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
@@ -2024,7 +2113,35 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                        "media_type": "tv", "tmdb_id": tv_match.get("tmdbId"), "tvdb_id": tv_match.get("tvdbId")}]
                 plan["ambiguity_reason"] = "CROSS_DOMAIN_CANDIDATE"
                 ambiguous = True
-        if (identity and not ambiguous and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
+        # Structured lookup found nothing at all (not a tie -- a genuine
+        # zero) and the utterance carries a real descriptive/person clue
+        # ("the Tom Hanks movie where he's stuck on an island with a
+        # volleyball") -- fall back to a bounded web search for a likely
+        # NAME, then re-search that name through the SAME real canonical
+        # lookup below. A titleless request with no such clue never
+        # reaches here; it already returned via NO_TITLE_GIVEN above.
+        person_hint = artist or _person_mention_hint(parts["raw_goal"], artist)
+        if not identity and not ambiguous and person_hint:
+            discovered_title = await _web_discover_title(title, person_hint, "movie")
+            if discovered_title and discovered_title.casefold() != title.casefold():
+                web_lookup = await radarr_search({"query": discovered_title})
+                identity, ambiguous, near_candidates = _pick_match(web_lookup.get("matches", []), discovered_title, person_hint)
+                if identity:
+                    matches = web_lookup.get("matches", [])
+                    title = discovered_title
+                    plan["ambiguity_reason"] = "WEB_DISCOVERY_MATCH"
+                elif ambiguous and near_candidates:
+                    plan["candidates"] = _candidate_summaries(near_candidates, "movie")
+                    plan["ambiguity_reason"] = "WEB_DISCOVERY_CANDIDATES"
+        # The query-drift guardrail compares the ORIGINAL utterance's title
+        # hint to the resolved candidate -- a web-discovered title is
+        # EXPECTED to differ substantially from a long description
+        # ("the Tom Hanks movie where he's stuck on an island with a
+        # volleyball" vs "Cast Away"), that is the entire point of this
+        # fallback, so drift-checking against the description would always
+        # incorrectly flag a correct web-discovery match as ambiguous.
+        if (identity and not ambiguous and plan.get("ambiguity_reason") != "WEB_DISCOVERY_MATCH"
+                and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
                 and _query_drift_detected(parts["title_hint"], identity.get("title"))):
             ambiguous = True
             plan["candidates"] = [{"title": identity.get("title"), "year": identity.get("year"),
