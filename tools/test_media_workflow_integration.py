@@ -318,6 +318,92 @@ async def test_media_standard_request_never_appears_in_discovery_for_any_query(a
         assert "media_execute_goal" not in names, query
 
 
+@pytest.mark.asyncio
+async def test_fresh_session_verb_form_status_phrasings_find_the_real_workflow(app, monkeypatch):
+    """Item 3's fresh-session integration test: ESP32-class voice devices
+    will send every utterance as a brand-new, context-free session -- no
+    shared conversation_context at all, ever. This test never touches
+    conversation_context, pending, or any assistant-side session state --
+    it drives the exact real request->confirm->fake-write lifecycle (same
+    production code as the confirmation round-trip test above), then asks
+    status purely via media_status({"query": ...}) with no workflow_id,
+    proving the lookup works off the stored workflow + raw utterance text
+    alone, for the natural VERB-form phrasing family a voice device would
+    actually use ("Did I already request X?", not "is my X request
+    going?")."""
+    module, events = app
+
+    plan = await module.media_plan_goal({"goal": "get Dune 2021", "media_type": "movie", "session_id": "sess-1"})
+    workflow_id = plan["workflow_id"]
+    confirmation = plan["confirmation_record"]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+        content = b'{"ok": true}'
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(module, "httpx", type("FakeHttpxModule", (), {"AsyncClient": FakeAsyncClient}))
+    evidence_calls = {"count": 0}
+
+    def fake_evidence(payload):
+        evidence_calls["count"] += 1
+        return {"matched": evidence_calls["count"] > 1, "rows": [{"state": "queued"}] if evidence_calls["count"] > 1 else []}
+
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", fake_evidence)
+
+    result = await module.media_standard_request({
+        "workflow_id": workflow_id, "media_type": "movie", "canonical_external_id": 438631,
+        "confirmation_context": confirmation, "session_id": "sess-1",
+    })
+    assert result["status"] == "submitted" and result["write_executed"] is True
+
+    # A genuinely fresh call, no prior state referenced whatsoever -- this
+    # IS the fresh-session proof: media_status() only ever consults
+    # _media_workflows() (the persisted store) and the raw query text.
+    for phrasing in (
+        "Did I already request Dune?",
+        "Did I request Dune yet?",
+        "Have I requested Dune?",
+        "Did I ask for Dune already?",
+        "Have I already asked for Dune?",
+        "Was Dune ever requested?",
+    ):
+        status = await module.media_status({"query": phrasing})
+        assert status["found"] is True, f"fresh-session lookup failed for: {phrasing!r}"
+        assert status["workflow_id"] == workflow_id
+        assert status["canonical_identity"]["tmdb_id"] == 438631
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_status_check_for_never_requested_title_is_honest(app):
+    """Item 5: a genuine "you never requested this" case (no workflow
+    exists at all for the named title) must report NOT_FOUND honestly and
+    specifically -- confirms what media_status actually returns so the
+    assistant-side phrasing can reflect it clearly, rather than the vague
+    "no matching live workflow" error-shaped wording."""
+    module, events = app
+    status = await module.media_status({"query": "Did I already request Interstellar?"})
+    assert status["found"] is False
+    assert status["status"] == "NOT_FOUND"
+
+
 def test_media_standard_request_excluded_from_registry_endpoint_source(app):
     """The /registry endpoint (used when the assistant has no route text --
     the other real model-facing discovery entry point) must draw from the

@@ -1676,8 +1676,33 @@ def media_status_question(text: str) -> bool:
         r"|\bdownload(?:ed|ing)?\s+yet\b",
         routed_text, re.I,
     )
-    if _descriptive_media_clue(routed_text) and not strong_status_marker:
+    # A PAST/PERFECT-tense auxiliary ("did"/"have"/"has" + I/we, or "was
+    # ... ever") asking about a request/ask action is asking whether
+    # something ALREADY happened -- status-shaped, regardless of which
+    # verb form follows ("did I request" is grammatically past tense even
+    # though "request" itself is bare). This is the generic, tense-based
+    # signal distinguishing "Did I already request Primer?" / "Have I
+    # requested Primer?" / "Was Primer ever requested?" (status) from
+    # "Can I request Primer?" / "I'd like to request Primer." (a fresh
+    # request, present/future/modal framing) -- real production gap: a
+    # voice device asking blind, with zero shared conversation_context,
+    # relies entirely on phrasing like this to be classified correctly
+    # since there is no prior turn to inherit a referent from. Computed
+    # BEFORE the descriptive-clue guard below (like strong_status_marker)
+    # since "Was Primer ever requested?" -- "Was" is not on the
+    # determiner-exclusion list for a good reason (it is not a title
+    # article) -- can otherwise trip the person-name shape check on a
+    # single-word title and get suppressed before this signal is ever
+    # consulted.
+    past_request_status = re.search(
+        r"\b(?:did|have|has)\s+(?:i|we)\b.{0,25}\b(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\b"
+        r"|\bwas\b.{0,30}\bever\s+requested\b",
+        routed_text, re.I,
+    )
+    if _descriptive_media_clue(routed_text) and not (strong_status_marker or past_request_status):
         return False
+    if past_request_status:
+        return True
     if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
     # Generic status/diagnosis question shapes -- "did I ever request X",
@@ -1687,7 +1712,12 @@ def media_status_question(text: str) -> bool:
     # words like "request"/"ask". Bounded to a question-frame + status-word
     # combination, same discipline as the original two lists, just widened
     # with more of the same kind of word rather than a per-phrase special case.
-    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was|\s+happened)|i\s+was|can i)\b", routed_text, re.I)
+    # "can i" was deliberately removed from this frame: it is a modal/
+    # request-intent marker ("Can I request X?" asks to START something),
+    # not a past-tense status marker, and combined with the bare
+    # "request"/"ask" status_word entries below it produced a real
+    # false-positive misclassifying a fresh request as a status check.
+    question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was|\s+happened)|i\s+was)\b", routed_text, re.I)
     status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|happened|going on|in plex|import(?:ed)?|added|there yet|status|progress|watch(?:ed)?|pipeline|already|request(?:ed)?|ask(?:ed)?|or\s+not)\b", routed_text, re.I)
     if question_frame and status_word:
         return True
@@ -1718,6 +1748,17 @@ def media_title_status_signal(text: str) -> bool:
     # though media_status_question() itself correctly recognized it,
     # leaving no OR-branch to route it to the real status capability.
     if re.search(r"\b(?:my|our)\s+(?:[a-z0-9]+\s+){1,5}request\s+(?:is\s+)?(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going|there\s+yet|status)\b", text, re.I):
+        return True
+    # Same past/perfect-tense "did/have/has I/we request(ed)/ask(ed) for
+    # <title>" shape as media_status_question()'s own generic signal --
+    # real production gap: "Did I already request Primer?" / "Did I
+    # request Primer yet?" correctly classified as MEDIA_STATUS but never
+    # reached the real capability because this function (one of the two
+    # required OR-branches in preflight_plan's routing gate) had no
+    # matching alternative for a bare title with no leading "the"/"a"/
+    # "my"/"our" at all -- exactly the phrasing a voice device asking
+    # blind, with no shared conversation_context, would naturally use.
+    if re.search(r"\b(?:did|have|has)\s+(?:i|we)\b.{0,25}\b(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\b", text, re.I):
         return True
     # A standalone "where's <title>?" is a read-only lifecycle question when
     # the subject is title-shaped. Keep this bounded to multi-token subjects
@@ -1769,8 +1810,18 @@ def retained_media_status_repair(text: str, context: dict) -> bool:
 def media_status_display_title(result: dict, user_text: str) -> str:
     """Extract a short human title for a truthful not-found status response."""
     query = str(result.get("query") or user_text).strip(" .?!")
-    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|has|did|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+was)\s+", "", query, flags=re.I)
+    query = re.sub(r"^\s*(?:how(?:'s|\s+is)|is|as|has|have|did|was|where(?:'s|\s+is)|what(?:'s|\s+is)|i\s+was)\s+", "", query, flags=re.I)
+    # Real production gap found alongside the fresh-session verb-form
+    # status fix: "Did I already request Interstellar?" only had its
+    # leading "did" stripped, leaving "I already request Interstellar" as
+    # the displayed title -- strip the SAME past/perfect-tense
+    # request/ask verb phrase this function's leading-word regex above was
+    # never built to cover, in either word order ("I already request X" or
+    # bare "X ... ever requested").
+    query = re.sub(r"^\s*(?:i|we)\s+(?:already\s+)?(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\s+", "", query, flags=re.I)
     query = re.sub(r"\s+(?:doing|going|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b.*$", "", query, flags=re.I)
+    query = re.sub(r"\s+(?:already|yet)\s*$", "", query, flags=re.I)
+    query = re.sub(r"\s+ever\s+requested\s*$", "", query, flags=re.I)
     return query.strip(" .?!") or "that media"
 
 
@@ -2189,12 +2240,60 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # but the word "request" alone made media_acquisition_language() true,
     # overriding media_status_question()'s own correct classification and
     # falling through with no route to the real status capability at all.
-    status_request_noun = re.search(r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b", t)
+    status_request_noun = re.search(
+        r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b"
+        r"|\b(?:did|have|has)\s+(?:i|we)\b.{0,25}\b(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\b",
+        t,
+    )
     if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and (not media_acquisition_language(text) or status_request_noun or re.search(r"\bget\s+found\b", t)):
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:
         return [("media_plan_goal", {"goal": text})]
+    # An explicit request verb with NO type word at all ("Can you request
+    # Sagwa The Chinese Siamese Cat") must still reach media_plan_goal --
+    # real production bug: Qwen claimed it had no capability to request
+    # media at all for this exact phrasing, because this deterministic
+    # gate required BOTH a request verb AND a type-word noun, and never
+    # pushed it toward the tool that (via its own kind=="unknown"
+    # cross-domain resolution, built for the analogous "Do I have Avengers
+    # on Plex?" case) can resolve an untyped title on its own. Requires a
+    # request verb PLUS real title-shaped remaining content (the same "is
+    # this actually a title" discipline used elsewhere, not a bare
+    # pronoun/referential reply like "Get it." -- those are caught by
+    # is_confirmation()/offer-acceptance earlier in respond(), never
+    # reaching this deterministic dispatch in the first place) so a
+    # genuinely different domain's own use of these verbs ("add milk to my
+    # grocery list") is not swept in. Deliberately narrower than the
+    # `media_goal` regex above: excludes "do i have"/"is it in
+    # plex"/"where is"-style library-QUERY phrasing (those legitimately
+    # fall through to semantic retrieval/Qwen for referential "it"
+    # resolution against conversation context -- routing them
+    # deterministically here bypassed that referential resolution
+    # entirely, a real regression caught by the existing test suite).
+    # "find" is deliberately excluded here (unlike the media_goal regex
+    # above, which is safely gated by requiring media_nouns too) -- "find
+    # it on the internet" is a genuine web-search phrase, and a real
+    # regression was caught by the existing test suite where this branch
+    # otherwise hijacked it deterministically into media_plan_goal because
+    # "internet" survived as non-scaffolding "title" content.
+    acquisition_verb = re.search(r"\b(get|give|grab|add|request|want)\b", t)
+    if acquisition_verb and not media_nouns:
+        remaining = [w for w in _media_title_candidate_words(text)
+                     if w not in {"it", "that", "this", "one", "them", "those",
+                                  "yeah", "yes", "yep", "sure", "okay", "ok",
+                                  "no", "then", "well", "so", "actually", "anyway", "right", "hey", "oh"}]
+        # Real title-shaped content is bounded to genuine multi-word
+        # remainders ("Sagwa The Chinese Siamese Cat") -- a single stray
+        # leftover word is far more often conversational noise than an
+        # actual one-word title in this specific untyped-request shape
+        # (real regression caught by the existing suite: "No? Then get
+        # it." left "no"/"then" as non-scaffolding tokens before those
+        # were added to the exclusion set above; a single-word floor adds
+        # a second, independent safety margin against the next word this
+        # exclusion list has not yet anticipated).
+        if len(remaining) >= 2 and not re.search(r"\b(?:list|grocery|shopping|todo|to-do|task|reminder|calendar|coffee|alarm|timer|note)\b", t):
+            return [("media_plan_goal", {"goal": text})]
     # A descriptive identity question ("What's that Tom Hanks movie where
     # he's stuck on an island with a volleyball?", "What's that Brad Pitt
     # movie about fly fishing in Montana?") names an item by DESCRIPTION,
@@ -2326,12 +2425,19 @@ def is_confirmation(text: str) -> bool:
     because the interposed politeness word "please" was not tolerated
     between the affirmation and the action phrase. Added a generic,
     optional "please" slot rather than hardcoding this one sentence."""
+    # "it" and "that" are interchangeable anaphoric references to an
+    # already-offered/identified action ("do it"/"do that", "request it"/
+    # "request that") -- real production bug: "yes do that" (continuing an
+    # already-resolved identity toward confirmation) was not recognized,
+    # only the "it" forms were, losing the resolved subject entirely on a
+    # completely natural, common phrasing. One shared pattern, not a
+    # duplicated it/that phrase list.
     return bool(re.fullmatch(
-        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)"
+        r"\s*(?:(?:yes|yeah|yep|sure|confirm|confirmed|okay|ok|please do|i confirm)"
         r"(?:\s*,?\s*please)?"
-        r"(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it|let's\s+(?:get|request|add)\s+it))?"
-        r"|(?:do|get|request|add)\s+it|go ahead|go for it|proceed"
-        r"|please\s+(?:go ahead|do it|proceed|get it|request it|add it))\s*[.!]?\s*",
+        r"(?:\s*,?\s*(?:go ahead|go for it|do (?:it|that)|proceed|get (?:it|that)|request (?:it|that)|add (?:it|that)|let's\s+(?:get|request|add)\s+(?:it|that)))?"
+        r"|(?:do|get|request|add)\s+(?:it|that)|go ahead|go for it|proceed"
+        r"|please\s+(?:go ahead|do (?:it|that)|proceed|get (?:it|that)|request (?:it|that)|add (?:it|that)))\s*[.!]?\s*",
         text,
         re.I,
     ))

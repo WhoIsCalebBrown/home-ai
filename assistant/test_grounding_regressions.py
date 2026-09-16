@@ -1033,6 +1033,104 @@ def test_status_request_noun_fix_does_not_regress_descriptive_discovery():
         assert preflight_plan(text) == [("media_plan_goal", {"goal": text})], text
 
 
+def test_past_tense_verb_form_status_family_reaches_media_status():
+    """Fresh-session status classification fix: ESP32-class voice devices
+    send every utterance as a brand-new, context-free session, so the
+    natural VERB-form phrasing family ("Did I already request X?") must
+    classify and route correctly with zero prior turn to lean on. Generic
+    tense-based signal (an auxiliary "did/have/has" + I/we, or "was ...
+    ever"), not a phrase list -- distinguishes past/perfect tense (status)
+    from present/future/modal framing (a fresh request)."""
+    for text in (
+        "Did I already request Primer?", "Did I request Primer yet?",
+        "Have I requested Primer?", "Did I ask for Primer already?",
+        "Have I already asked for Primer?", "Was Primer ever requested?",
+    ):
+        assert media_status_question(text) is True, text
+        assert preflight_plan(text) == [("media_status", {"query": text})], text
+
+
+def test_past_tense_verb_form_fix_does_not_misclassify_fresh_requests():
+    """Negative control: present/future/modal framing ("Can I...", "I'd
+    like to...", "I want to...") must never be swept into status just
+    because it shares the word "request"/"ask" with the past-tense family
+    above -- this is the exact false positive the coordinator's own
+    negative control demanded ("Can I request Primer?" must NOT become a
+    status check on a nonexistent request)."""
+    for text in (
+        "Can I request Primer?", "I'd like to request Primer.",
+        "I want to request Primer.", "Can we request Primer?",
+    ):
+        assert media_status_question(text) is False, text
+
+
+def test_bug_a_untyped_media_request_reaches_media_plan_goal():
+    """Bug A: an explicit request verb with NO type word at all ("Can you
+    request Sagwa The Chinese Siamese Cat") must still reach
+    media_plan_goal deterministically -- real production bug, Qwen
+    claimed it had no capability to request media at all for this exact
+    phrasing because the prior gate required BOTH a request verb AND a
+    type-word noun."""
+    for text in (
+        "Can you request Sagwa The Chinese Siamese Cat",
+        "Add Sagwa The Chinese Siamese Cat",
+        "Get me Sagwa The Chinese Siamese Cat",
+        "I want Sagwa The Chinese Siamese Cat",
+    ):
+        assert preflight_plan(text) == [("media_plan_goal", {"goal": text})], text
+
+
+def test_bug_a_fix_does_not_misroute_unrelated_domains_or_bare_offer_replies():
+    """Negative controls for Bug A's broadened gate: a different domain's
+    own use of these verbs, and a bare pronoun/interjection offer-
+    acceptance reply (caught by is_confirmation()/offer-acceptance earlier
+    in respond(), never meant to reach this deterministic dispatch at
+    all), must not be swept into media_plan_goal."""
+    assert preflight_plan("add milk to my grocery list") != [("media_plan_goal", {"goal": "add milk to my grocery list"})]
+    for text in ("Get it.", "Yeah, get it.", "No? Then get it.", "Can you find it on the internet?"):
+        plan = preflight_plan(text)
+        assert not (plan and plan[0][0] == "media_plan_goal"), text
+
+
+def test_bug_b_do_that_and_it_are_interchangeable_confirmation_replies():
+    """Bug B: "it" and "that" are interchangeable anaphoric references to
+    an already-offered action -- real production bug, "yes do that" lost
+    an already-resolved identity because only the "it" forms were
+    recognized."""
+    for text in ("yes do that", "yeah do that", "okay do that", "sure, do that",
+                 "get that", "request that", "add that", "do that"):
+        assert is_confirmation(text), text
+
+
+def test_bug_b_fix_does_not_regress_existing_confirmation_phrasings():
+    """No-regression confirmation: the existing "it" forms and the
+    "please" phrasings from two rounds ago must still all work."""
+    for text in ("yes do it", "get it", "request it", "add it", "do it",
+                 "Yes, please request it.", "Yeah, please add it.", "please go ahead"):
+        assert is_confirmation(text), text
+    for text in ("What is the weather like?", "Get me Dumb and Dumber from 1994.", "maybe"):
+        assert not is_confirmation(text), text
+
+
+def test_never_requested_status_display_title_is_clean_for_verb_form_phrasings():
+    """Item 5: a genuine "you never requested this" case must name the
+    title cleanly ("I don't have a tracked request for Interstellar
+    yet."), not echo the verb-phrase framing back ("...for I already
+    request Interstellar yet.") -- real gap found alongside the
+    fresh-session verb-form status fix, since media_status_display_title
+    was only ever built to strip the older "how's X doing" framing."""
+    for query, expected_title in (
+        ("Did I already request Interstellar?", "Interstellar"),
+        ("Did I request Interstellar yet?", "Interstellar"),
+        ("Have I requested Interstellar?", "Interstellar"),
+        ("Did I ask for Interstellar already?", "Interstellar"),
+        ("Have I already asked for Interstellar?", "Interstellar"),
+        ("Was Interstellar ever requested?", "Interstellar"),
+    ):
+        result = {"found": False, "status": "NOT_FOUND", "query": query}
+        assert media_status_display_title(result, query) == expected_title, query
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
