@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -68,6 +68,7 @@ guess_media_title = namespace["guess_media_title"]
 fresh_title_restatement = namespace["fresh_title_restatement"]
 media_intent = namespace["media_intent"]
 media_library_query = namespace["media_library_query"]
+_descriptive_media_clue = namespace["_descriptive_media_clue"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -931,6 +932,51 @@ def test_media_intent_titleless_request_is_still_media_request():
 def test_media_intent_none_for_unrelated_text():
     assert media_intent("What's the weather like today?") is None
     assert media_intent("How many containers are running?") is None
+
+
+def test_media_status_question_negative_regressions_item_9():
+    """Real production bug: media_status_question() incorrectly classified
+    descriptive media-identification questions as workflow status checks
+    purely because a plot word (e.g. "stuck") collided with legitimate
+    download-status vocabulary. None of these describe a KNOWN item's
+    current state/progress -- they ask to IDENTIFY an unknown item from a
+    description, and must never be MEDIA_STATUS."""
+    for text in (
+        "What's that movie where Tom Hanks is on an island?",
+        "What's the movie where Brad Pitt goes fishing?",
+        "What's that show about a chemistry teacher making meth?",
+        "What's the name of that movie with dreams inside dreams?",
+        "Which movie has Matt Damon growing potatoes on Mars?",
+        "What's that Brad Pitt movie about fly fishing in Montana?",
+        "What's that Tom Hanks movie where he's stuck on an island with a volleyball?",
+        "What's the Robin Williams movie where he dresses up as an old woman?",
+    ):
+        assert media_status_question(text) is False, text
+
+
+def test_media_status_question_positive_regressions_item_9():
+    """Negative control: real status/progress/availability questions about
+    an already-known or referenced item must still correctly classify as
+    MEDIA_STATUS -- the descriptive-clue exclusion must not overcorrect
+    into blanket suppression."""
+    for text in (
+        "What's the status of that movie?",
+        "How's that movie doing?",
+        "Did it finish?",
+        "Is it ready yet?",
+        "Has it been added?",
+        "What's the status of my Avengers request?",
+        "How is The Hobbit doing?",
+    ):
+        assert media_status_question(text) is True, text
+
+
+def test_descriptive_media_clue_excludes_imperative_verb_plus_service_name():
+    """Regression: a bare two-capitalized-word shape alone is not enough
+    signal for a person mention -- "Restart Lidarr" must not be mistaken
+    for a person's name, which would misroute a container restart into
+    media identity resolution."""
+    assert preflight_plan("Restart Lidarr") == [("restart_container", {"name": "lidarr"})]
 
 
 if __name__ == "__main__":

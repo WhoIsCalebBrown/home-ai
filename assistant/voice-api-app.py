@@ -1465,12 +1465,38 @@ def media_intent(text: str) -> str | None:
     return None
 
 
+def _descriptive_media_clue(text: str) -> bool:
+    """A rich descriptive clue -- a person name, or a relative-clause plot
+    description ("about"/"where" followed by a description, but not the
+    established "where's"/"where is" status-question shape) -- names a
+    media item by DESCRIPTION rather than a known title or an existing
+    conversational referent. This signal must outrank incidental
+    status-sounding words that happen to appear INSIDE the description
+    itself: real production bug, "he's stuck on an island" (plot language)
+    made media_status_question() true purely because "stuck" is also a
+    legitimate download-status word ("the download is stuck"), routing the
+    web-discovery fallback's own flagship scenario into the old
+    no-live-workflow dead end before Qwen/media_plan_goal were ever
+    reached. The leading-determiner exclusion on the person-name pattern
+    keeps a capitalized TITLE ("The Hobbit", "The Room") from being
+    mistaken for a person's name.
+    """
+    has_person = bool(re.search(
+        r"\b(?!(?:The|This|That|These|Those|Is|What|Did|How|Has|Can|Will|A|An"
+        r"|Restart|Reboot|Reload|Get|Give|Add|Request|Play|Stop|Start|Check|Show|Send|Grab|Find|Please)\b)"
+        r"[A-Z][a-z]+ [A-Z][a-z]+\b", text))
+    has_plot_clause = bool(re.search(r"\b(?:where|about)\b(?!(?:'s|\s+is|\s+it))", text, re.I))
+    return has_person or has_plot_clause
+
+
 def media_status_question(text: str) -> bool:
     # Keep backend-pipeline investigations on their existing route.  This
     # predicate is for a concrete media item's lifecycle, not questions such
     # as "Is anything in Lidarr going to Plex?".
     routed_text = routing_aliases(text)
     if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
+        return False
+    if _descriptive_media_clue(routed_text):
         return False
     if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
@@ -1482,7 +1508,7 @@ def media_status_question(text: str) -> bool:
     # combination, same discipline as the original two lists, just widened
     # with more of the same kind of word rather than a per-phrase special case.
     question_frame = re.search(r"\b(?:how(?:'s| is)|is|as|that(?:'s| is)|has|did|where(?:'s| is)|what(?:'s| is| was|\s+happened)|i\s+was|can i)\b", routed_text, re.I)
-    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|happened|going on|in plex|import(?:ed)?|there yet|status|progress|watch(?:ed)?|pipeline|already|request(?:ed)?|ask(?:ed)?|or\s+not)\b", routed_text, re.I)
+    status_word = re.search(r"\b(?:doing|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|happened|going on|in plex|import(?:ed)?|added|there yet|status|progress|watch(?:ed)?|pipeline|already|request(?:ed)?|ask(?:ed)?|or\s+not)\b", routed_text, re.I)
     if question_frame and status_word:
         return True
     # STT often drops the opening question frame. Treat a multi-token media
@@ -1969,6 +1995,21 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
     if media_goal and media_nouns:
+        return [("media_plan_goal", {"goal": text})]
+    # A descriptive identity question ("What's that Tom Hanks movie where
+    # he's stuck on an island with a volleyball?", "What's that Brad Pitt
+    # movie about fly fishing in Montana?") names an item by DESCRIPTION,
+    # not a request and not a status check on a known item -- it must
+    # reach the real media identity resolver (media_plan_goal, including
+    # its web-discovery fallback for exactly this shape), not the generic
+    # plex/library trigger below, which would search Plex for the literal
+    # description and dead-end, nor media_status above (already excluded
+    # by media_status_question's own descriptive-clue guard). Same
+    # machinery as a descriptive REQUEST ("I want the Brad Pitt movie
+    # about fly fishing") -- the only difference is what happens AFTER
+    # identity resolves, decided downstream by media_plan_response, not
+    # by a second resolver here.
+    if media_nouns and _descriptive_media_clue(text):
         return [("media_plan_goal", {"goal": text})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
