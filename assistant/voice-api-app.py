@@ -374,13 +374,20 @@ FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Intern
 
 def resolved_request_record(client_id: str, raw_text: str, route_text: str, context: dict, selected_tools: list[str], planned: list[tuple[str, dict]] | None = None, results: list[dict] | None = None) -> dict:
     """Build the authoritative current-turn contract shared by routing and synthesis."""
+    referent_connected = bool(
+        context.get("domain")
+        or has_referential_language(raw_text)
+        or context.get("discovery_subject")
+        or media_goal_request(raw_text)
+        or current_external_question(raw_text)
+    )
     return {
         "raw_utterance": raw_text,
         "normalized_utterance": routing_aliases(raw_text),
         "route_query": route_text,
         "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
-        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)},
+        "inherited_referents": ({key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)} if referent_connected else {}),
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
         "retrieval_context": discovery_context(context, raw_text),
