@@ -2071,3 +2071,47 @@ async def test_legitimate_confirmed_media_request_still_executes_end_to_end(sess
     await session.turn("Yes, please request it.")
     assert len(session.backend.submitted_writes) == 1
     assert session.client_id not in session.app.pending
+
+
+# --- Bug A: an untyped media request must still reach media_plan_goal, ---
+# --- through the real preflight_plan()/respond() path, no ollama_script --
+# --- needed since this fires deterministically. --------------------------
+
+@pytest.mark.asyncio
+async def test_bug_a_untyped_request_reaches_media_plan_goal_through_respond(session):
+    """Real production bug: "can you request Sagwa The Chinese Siamese
+    Cat" (no type word at all) produced "I don't have any tools or access
+    to request media" with ZERO tools called -- Qwen was never even
+    routed toward media_plan_goal. This must now fire deterministically,
+    with no ollama_script needed at all."""
+    session.backend.seed_web("Sagwa The Chinese Siamese Cat", media_type="tv", tvdb_id="77670")
+    reply = await session.turn("Can you request Sagwa The Chinese Siamese Cat")
+    called = [name for name, _ in session.backend.call_log]
+    assert "media_plan_goal" in called
+    assert "sagwa" in reply.casefold()
+    assert "no tools" not in reply.casefold() and "no access" not in reply.casefold()
+
+
+# --- Bug B: "yes do that" must continue an already-offered identity ------
+# --- toward confirmation, not lose it. ------------------------------------
+
+@pytest.mark.asyncio
+async def test_bug_b_yes_do_that_continues_the_offered_identity(session):
+    """Real production bug: after Sagwa was identified and offered ("I can
+    request it... when you're ready"), "yes do that" produced "I couldn't
+    identify a confident media match without changing anything" -- a
+    fresh, empty media_plan_goal re-run that lost the resolved identity
+    entirely, because is_confirmation() only recognized "it" forms, not
+    "that"."""
+    session.backend.seed_library("Sagwa The Chinese Siamese Cat", media_type="tv", state="ABSENT", tvdb_id="77670")
+    await session.turn(
+        "Get me Sagwa The Chinese Siamese Cat",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Sagwa The Chinese Siamese Cat"}}},
+        ]}}],
+    )
+    assert session.client_id in session.app.pending
+
+    await session.turn("yes do that")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending
