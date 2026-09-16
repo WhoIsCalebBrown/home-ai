@@ -374,13 +374,20 @@ FINAL_SYNTHESIS_RULE = "Answer the user's original question directly now. Intern
 
 def resolved_request_record(client_id: str, raw_text: str, route_text: str, context: dict, selected_tools: list[str], planned: list[tuple[str, dict]] | None = None, results: list[dict] | None = None) -> dict:
     """Build the authoritative current-turn contract shared by routing and synthesis."""
+    referent_connected = bool(
+        context.get("domain")
+        or has_referential_language(raw_text)
+        or context.get("discovery_subject")
+        or media_goal_request(raw_text)
+        or current_external_question(raw_text)
+    )
     return {
         "raw_utterance": raw_text,
         "normalized_utterance": routing_aliases(raw_text),
         "route_query": route_text,
         "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
-        "inherited_referents": {key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)},
+        "inherited_referents": ({key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)} if referent_connected else {}),
         "selected_tools": selected_tools,
         "planned_tools": [name for name, _ in (planned or [])],
         "retrieval_context": discovery_context(context, raw_text),
@@ -3015,6 +3022,25 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         context["retrieval_confidence"] = retrieval_confidence(candidates)
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
+        # A low-confidence, domain-free utterance must not inherit a stale
+        # referent by giving Qwen a noisy cross-domain tool set.  This is a
+        # safety boundary, not a language vocabulary rule: explicit domains,
+        # structured discovery subjects, and genuine referential follow-ups
+        # remain eligible; an unanchored phrase such as "Question 1?" gets a
+        # tool-free clarification/general response instead of accidentally
+        # dispatching Frigate because short-query n-grams happened to score.
+        current_domain = explicit_domain(user_text, context)
+        anchored_turn = bool(
+            current_domain
+            or has_referential_language(user_text)
+            or context.get("discovery_subject")
+            or media_goal_request(user_text)
+            or current_external_question(user_text)
+        )
+        top_score = float((candidates[0].get("metadata") or {}).get("score", 0) or 0) if candidates else 0.0
+        if not anchored_turn and top_score < 5.0:
+            tools = []
+            context["tool_selection_status"] = "UNANCHORED_NO_TOOL"
         discovery_audit({"event": "discovery", "client_id": client_id, "request_id": request_id, "utterance": user_text, "route_query": route_text, "context": context, "candidates": candidates, "selected_schemas": [tool.get("name") for tool in tools], "latency_ms": discovery_latency})
         live_results = []
         # Semantic retrieval supplies the bounded model-facing tool set. Only
@@ -3043,6 +3069,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             context["resolved_request"]["selected_tools"] = [tool.get("name") for tool in tools]
         discovery_audit({"event": "resolved_entities", "client_id": client_id, "request_id": request_id, "raw_transcript": user_text, "normalized_transcript": user_text, "canonical_entities": contextual["entities"], "entity_confidence": contextual["confidence"], "repair": bool(context.get("repair"))})
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if context.get("tool_selection_status") == "UNANCHORED_NO_TOOL":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "This turn has no grounded live-tool target. Answer only the newest user request. "
+                    "Do not reuse or invent camera, media, weather, server, or other household facts "
+                    "from earlier turns. If the request is unclear, ask a concise clarification."
+                ),
+            })
         if tools:
             # Qwen3.5 can still emit a prose refusal when the long global
             # contract and the structured request are both present, even
