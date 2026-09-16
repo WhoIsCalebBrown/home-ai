@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -63,6 +63,7 @@ media_nouns_for_status = namespace["media_nouns_for_status"]
 media_title_status_signal = namespace["media_title_status_signal"]
 retained_media_status_repair = namespace["retained_media_status_repair"]
 media_status_display_title = namespace["media_status_display_title"]
+plex_query_from_speech = namespace["plex_query_from_speech"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -768,6 +769,71 @@ def test_streaming_does_not_split_numeric_periods():
     assert not complete_speakable_sentence("The host is 192.168.40.44.")
     assert complete_speakable_sentence("The temperature is 18.9 degrees.")
     assert complete_speakable_sentence("Tomorrow will be warmer.")
+
+
+def test_media_plan_response_no_title_given_asks_what_to_look_for():
+    """Root cause #3, live production bug: "Can you request a movie for
+    me?" / "I want to add a movie to my server." used to search a provider
+    for garbage text. media_plan_goal now short-circuits with
+    current_state=NO_TITLE_GIVEN before any provider is touched; the
+    assistant must turn that into an honest question, not the generic
+    "not confident" dead end."""
+    live_results = [{"tool": "media_plan_goal", "status": "ok", "result": {
+        "current_state": "NO_TITLE_GIVEN", "ambiguous": False,
+        "message": "I didn't catch a specific title -- what would you like me to look for?",
+    }}]
+    assert media_plan_response("Can you request a movie for me?", live_results) == \
+        "I didn't catch a specific title -- what would you like me to look for?"
+
+
+def test_media_plan_response_zero_matches_is_honest_not_generic_dead_end():
+    """Root cause #1's second half: a genuinely empty match list (not an
+    ambiguous tie) must say what was actually searched for, not the vague
+    "I couldn't identify a confident media match" dead end."""
+    live_results = [{"tool": "media_plan_goal", "status": "ok", "result": {
+        "canonical_identity": None, "ambiguous": False, "current_state": "UNKNOWN",
+        "goal": {"title_query": "Some Nonexistent Film"},
+    }}]
+    assert media_plan_response("do I have Some Nonexistent Film", live_results) == \
+        "I couldn't find anything called 'Some Nonexistent Film'."
+
+
+def test_media_plan_response_ambiguous_tie_still_asks_which_one():
+    """Negative control: root cause #1's NO_CONFIDENT_MATCH candidates path
+    must still produce the existing "did you mean X or Y?" question, not
+    the new zero-match message."""
+    live_results = [{"tool": "media_plan_goal", "status": "ok", "result": {
+        "canonical_identity": None, "ambiguous": True, "ambiguity_reason": "NO_CONFIDENT_MATCH",
+        "candidates": [{"title": "The Avengers", "year": "2012"}, {"title": "Avengers: Endgame", "year": "2019"}],
+        "goal": {"title_query": "avengers"},
+    }}]
+    response = media_plan_response("do I have avengers", live_results)
+    assert "Which one do you mean?" in response
+    assert "The Avengers" in response and "Avengers: Endgame" in response
+
+
+def test_preflight_plan_routes_browse_shaped_movie_question_to_library_counts():
+    """Addendum, live production bug: "do i have any movies on my server?"
+    was sent to plex_search with the literal garbled sentence as the query
+    (zero real matches, later mislabeled as a tool failure). A browse-shaped
+    question with no real title must route to plex_library_counts instead,
+    generically -- tested with several phrasings, not just this one
+    sentence."""
+    for text in ("do i have any movies on my server?", "what movies do i have?",
+                 "how many movies do i have", "show me my tv shows"):
+        assert preflight_plan(text) == [("plex_library_counts", {})], text
+
+
+def test_preflight_plan_still_routes_a_real_title_to_plex_search():
+    """Negative control: an utterance that DOES name something must not be
+    swept into the generic browse/count route -- it goes to whichever
+    real-title tool it already routed to (media_plan_goal, since this
+    phrasing also reads as acquisition-shaped; a plex-only phrasing below
+    proves the plex_search branch itself is unaffected)."""
+    plan = preflight_plan("do i have avengers on my plex server?")
+    assert plan and plan[0][0] != "plex_library_counts"
+    plan2 = preflight_plan("which library is interstellar in")
+    assert ("plex_search", {"query": plex_query_from_speech("which library is interstellar in")}) in plan2
 
 
 if __name__ == "__main__":

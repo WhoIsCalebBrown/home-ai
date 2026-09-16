@@ -773,6 +773,27 @@ def _query_drift_check_skipped(args: dict[str, Any], requested_year: int | None,
     return False
 
 
+def _candidate_summaries(rows: list[dict[str, Any]], media_type: str) -> list[dict[str, Any]]:
+    """Normalize raw Radarr/Sonarr/Lidarr rows into the same
+    {"title","year","media_type",...ids} candidate shape media_plan_goal
+    already uses for CROSS_DOMAIN_CANDIDATE/QUERY_DRIFT, so
+    media_plan_response has one consistent shape to build a "did you mean
+    X or Y?" question from regardless of which ambiguity path produced it."""
+    summaries = []
+    for row in rows[:3]:
+        if media_type == "album":
+            summaries.append({"title": row.get("title"), "artist": row.get("artist"),
+                               "year": str(row.get("release_date", ""))[:4] or None,
+                               "media_type": "album", "foreign_album_id": row.get("foreign_album_id")})
+        elif media_type in {"tv", "anime"}:
+            summaries.append({"title": row.get("title"), "year": row.get("year"), "media_type": media_type,
+                               "tmdb_id": row.get("tmdbId"), "tvdb_id": row.get("tvdbId")})
+        else:
+            summaries.append({"title": row.get("title"), "year": row.get("year"),
+                               "media_type": "movie", "tmdb_id": row.get("tmdbId")})
+    return summaries
+
+
 def _query_drift_detected(title_hint: str, candidate_title: str | None) -> bool:
     if not title_hint or not candidate_title:
         return False
@@ -1743,6 +1764,35 @@ def _save_media_workflows(rows: list[dict[str, Any]]) -> None:
     tmp.replace(MEDIA_WORKFLOWS_PATH)
 
 
+# Generic vocabulary for judging whether an utterance actually NAMES a media
+# item, versus asking a browse/count-shaped question about a whole category
+# ("do I have any movies", "what's in my library", "add a movie to my
+# server"). Same discipline as the UnresolvedSubject grammar: judge by SHAPE
+# (which words survive after stripping scaffolding + category nouns), not by
+# matching one literal phrase -- a "title" made only of scaffolding/category
+# words was never a title.
+_MEDIA_CATEGORY_WORDS = {"movie", "movies", "film", "films", "show", "shows", "series", "tv",
+                         "episode", "episodes", "season", "seasons", "album", "albums", "music",
+                         "song", "songs", "track", "tracks", "library", "libraries", "anime"}
+_MEDIA_QUESTION_SCAFFOLDING = {"do", "does", "did", "i", "have", "has", "any", "some", "what",
+                               "what's", "whats", "which", "how", "many", "show", "me", "my", "in",
+                               "on", "is", "are", "of", "the", "a", "an", "to", "for", "your",
+                               "server", "plex", "got", "get", "give", "grab", "find", "add",
+                               "request", "want", "put", "can", "could", "would", "you", "please",
+                               "there"}
+
+
+def _media_title_candidate_words(text: str) -> list[str]:
+    """Strip generic request/question scaffolding and category nouns from an
+    utterance; whatever tokens survive are the closest thing to a specific
+    item name. An empty result means the utterance never named anything --
+    it is browse/count-shaped ("what movies do I have") or has no title at
+    all ("add a movie to my server"), not a real title.
+    """
+    tokens = re.findall(r"[a-z0-9']+", text.casefold())
+    return [t for t in tokens if t not in _MEDIA_QUESTION_SCAFFOLDING and t not in _MEDIA_CATEGORY_WORDS]
+
+
 def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any]:
     text = re.sub(r"\s+", " ", str(goal or "").strip())
     lowered = text.casefold()
@@ -1833,20 +1883,30 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
             "requested_year": requested_year}
 
 
-def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool]:
+def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool, list[dict[str, Any]]]:
+    """Returns (identity, ambiguous, candidates). `candidates` is only ever
+    populated when ambiguous=True -- it carries the top close/tied rows so
+    the caller can build a real "did you mean X or Y?" question instead of
+    a dead end (previously `scored` was entirely local to this function, so
+    an ambiguous result from a close/tied score -- as opposed to the
+    CROSS_DOMAIN_CANDIDATE/QUERY_DRIFT paths added later, which already
+    populated plan["candidates"] -- silently produced no candidates at
+    all). Real production bug: found on live deployed traffic, not by
+    inspection.
+    """
     if not matches:
-        return None, False
+        return None, False, []
     title_cf = title.casefold()
     artist_cf = (artist or "").casefold()
     exact = [m for m in matches if str(m.get("title") or m.get("artistName") or "").casefold() == title_cf
               and (not artist_cf or artist_cf in json.dumps(m).casefold())]
     if len(exact) == 1:
-        return exact[0], False
+        return exact[0], False, []
     wanted = set(re.findall(r"[a-z0-9]+", title_cf))
     if "kai" in wanted:
         kai_matches = [row for row in matches if "kai" in set(re.findall(r"[a-z0-9]+", str(row.get("title") or "").casefold()))]
         if len(kai_matches) == 1:
-            return kai_matches[0], False
+            return kai_matches[0], False, []
     scored = []
     for row in matches:
         candidate = str(row.get("title") or row.get("artistName") or "").casefold()
@@ -1857,10 +1917,13 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
         scored.append((score, row))
     scored.sort(key=lambda pair: -pair[0])
     if len(scored) == 1:
-        return scored[0][1], False
+        return scored[0][1], False, []
     # A strong top match is safe; a close tie remains a clarification case.
     margin = scored[0][0] - scored[1][0]
-    return (scored[0][1], False) if scored[0][0] >= 0.75 and margin >= 0.25 else (None, True)
+    if scored[0][0] >= 0.75 and margin >= 0.25:
+        return scored[0][1], False, []
+    top_candidates = [row for _, row in scored[:3]]
+    return None, True, top_candidates
 
 
 async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
@@ -1869,11 +1932,25 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     kind, title, artist = parts["media_type"], parts["title_query"], parts["artist_query"]
     plan: dict[str, Any] = {"plan_only": True, "goal": parts, "mode": parts.get("mode", "standard"), "writes_required": [], "confirmation_required": False,
                             "canonical_identity": None, "current_state": "UNKNOWN", "steps": [], "providers": {}}
+    if not _media_title_candidate_words(parts["raw_goal"]):
+        # Nothing survives stripping request/question scaffolding and
+        # category nouns -- this is either a browse/count-shaped question
+        # ("do I have any movies", "what's in my library") or a request with
+        # no title at all ("add a movie to my server"). Neither should ever
+        # reach Radarr/Sonarr/Lidarr/Plex as a literal search string -- that
+        # silently searches for garbage and reports a confusing result.
+        plan["current_state"] = "NO_TITLE_GIVEN"
+        plan["ambiguous"] = False
+        plan["message"] = "I didn't catch a specific title -- what would you like me to look for?"
+        return plan
     matches: list[dict[str, Any]] = []
     if kind == "album":
         lookup = await lidarr_search_album({"query": " ".join(x for x in (title, artist) if x)})
         matches = lookup.get("matches", [])
-        identity, ambiguous = _pick_match(matches, title, artist)
+        identity, ambiguous, near_candidates = _pick_match(matches, title, artist)
+        if ambiguous and near_candidates:
+            plan["candidates"] = _candidate_summaries(near_candidates, "album")
+            plan["ambiguity_reason"] = "NO_CONFIDENT_MATCH"
         if (identity and not ambiguous and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
                 and _query_drift_detected(parts["title_hint"], identity.get("title"))):
             ambiguous = True
@@ -1906,20 +1983,25 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         matches = lookup.get("matches", [])
         if parts.get("requested_year"):
             matches = [row for row in matches if str(row.get("year", "")).isdigit() and int(row.get("year")) == parts["requested_year"]]
-        identity, ambiguous = _pick_match(matches, title)
+        identity, ambiguous, near_candidates = _pick_match(matches, title, artist)
+        if ambiguous and near_candidates:
+            plan["candidates"] = _candidate_summaries(near_candidates, "movie")
+            plan["ambiguity_reason"] = "NO_CONFIDENT_MATCH"
         if re.search(r"\boriginal\b", parts["raw_goal"], re.I) and re.search(r"\banimated\b", parts["raw_goal"], re.I):
             preferred = next((row for row in matches
                               if str(row.get("title", "")).casefold().strip() in {title.casefold(), f"the {title.casefold()}"}
                               and str(row.get("year", "")).isdigit() and int(row.get("year")) <= 1985), None)
             if preferred:
                 identity, ambiguous = preferred, False
+                plan.pop("candidates", None)
+                plan.pop("ambiguity_reason", None)
         # If a request explicitly says movie but Radarr has no canonical
         # result, perform one bounded cross-domain lookup.  This does not
         # change state; it prevents a TV title from being silently treated as
         # an unresolved movie and later described as if a request started.
         if not identity:
             tv_lookup = await sonarr_search({"query": title})
-            tv_match, tv_ambiguous = _pick_match(tv_lookup.get("matches", []), title)
+            tv_match, tv_ambiguous, _tv_near = _pick_match(tv_lookup.get("matches", []), title)
             if tv_match:
                 plan["candidates"] = [{"title": tv_match.get("title"), "year": tv_match.get("year"),
                                        "media_type": "tv", "tmdb_id": tv_match.get("tmdbId"), "tvdb_id": tv_match.get("tvdbId")}]
@@ -1955,7 +2037,10 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
     elif kind in {"tv", "anime"}:
         lookup = await sonarr_search({"query": title})
         matches = lookup.get("matches", [])
-        identity, ambiguous = _pick_match(matches, title)
+        identity, ambiguous, near_candidates = _pick_match(matches, title, artist)
+        if ambiguous and near_candidates:
+            plan["candidates"] = _candidate_summaries(near_candidates, kind)
+            plan["ambiguity_reason"] = "NO_CONFIDENT_MATCH"
         # Sonarr's canonical lookup classification outranks the loose language
         # heuristic (e.g. "Dragon Ball Z Kai" is anime even when the user does
         # not say the word "anime"). This selects the policy for a new item;
