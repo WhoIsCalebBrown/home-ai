@@ -2157,7 +2157,21 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             discovered_title = await _web_discover_title(title, person_hint, "movie")
             if discovered_title and discovered_title.casefold() != title.casefold():
                 web_lookup = await radarr_search({"query": discovered_title})
-                identity, ambiguous, near_candidates = _pick_match(web_lookup.get("matches", []), discovered_title, person_hint)
+                # _pick_match's `artist` parameter's contract assumes the
+                # value appears somewhere in the candidate row's own JSON --
+                # true for Lidarr album/artist lookups (which carry cast/
+                # collaborator fields), but Radarr's movie-lookup rows carry
+                # no cast/crew data at all. Passing the person hint here
+                # made the exact-title-match shortcut reject every row
+                # (including one literally titled "Cast Away"), falling
+                # into the scored/tied path where a making-of/bonus-content
+                # entry ("Behind the Scenes: Cast Away") shares every title
+                # token and ties. Real bug, live-verified. The vote_count
+                # popularity signal (see _lookup_vote_count) already
+                # provides the generic tiebreaker for any residual tie
+                # between the real feature and bonus content when Radarr
+                # genuinely returns no single exact-title match.
+                identity, ambiguous, near_candidates = _pick_match(web_lookup.get("matches", []), discovered_title)
                 if identity:
                     matches = web_lookup.get("matches", [])
                     title = discovered_title
@@ -2456,6 +2470,9 @@ async def media_get_workflow(args: dict[str, Any]) -> dict[str, Any]:
     return {"found": bool(row), "workflow": row}
 
 
+_STATUS_TITLE_STOPWORDS = {"a", "an", "the", "of", "is", "it", "in", "on", "at", "to"}
+
+
 async def media_status(args: dict[str, Any]) -> dict[str, Any]:
     """Read-only live status for one canonical workflow.
 
@@ -2484,11 +2501,42 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
                 requested_year = int(parenthesized_year.group(0).strip("()"))
             title_query = re.sub(r"\s*\((?:19|20)\d{2}\)", "", title_query).strip(" .?!")
         norm = re.sub(r"[^a-z0-9]+", " ", title_query.casefold()).strip()
+        query_tokens = set(re.findall(r"[a-z0-9]+", query.casefold()))
         candidates = []
         for candidate in workflow_rows:
             identity = candidate.get("canonical_identity") or {}
             candidate_title = re.sub(r"[^a-z0-9]+", " ", str(identity.get("title") or "").casefold()).strip()
-            if candidate_title != norm:
+            title_tokens = set(re.findall(r"[a-z0-9]+", candidate_title))
+            title_content_tokens = title_tokens - _STATUS_TITLE_STOPWORDS
+            # Exact match on the crudely line-stripped title_query is the
+            # fast, narrow path; when that finds nothing (real production
+            # bug: "How is my A River Runs Through It request going?"
+            # strips down to "my A River Runs Through It request", which
+            # never equals the stored title exactly, so a genuinely
+            # existing, correctly-named workflow silently reported
+            # NOT_FOUND), fall back to checking whether every meaningful
+            # word of the STORED canonical title literally appears
+            # somewhere in the raw query -- order-independent and
+            # filler-tolerant, but still requires the FULL real title
+            # (never a partial/single-word guess: skipped when fewer than
+            # two content words remain), so a genuinely different, shorter
+            # title can never match by accident and "ambiguous title
+            # matches fail closed" still holds.
+            # A single remaining content word is only trusted as a fallback
+            # anchor when it is a genuinely distinctive word (not a short,
+            # common one like "it"/"up"/"her" that could coincidentally
+            # appear in almost any sentence) -- most single-word movie
+            # titles ("Dune", "Jaws", "Tenet") clear this easily; the
+            # length check exists only to keep a short common-word title
+            # from matching by accident, not to exclude short titles
+            # outright (an exact-title query for one still matches via the
+            # `candidate_title == norm` branch regardless of this guard).
+            single_word_is_distinctive = len(title_content_tokens) == 1 and len(next(iter(title_content_tokens))) >= 4
+            title_matches = candidate_title == norm or (
+                (len(title_content_tokens) >= 2 or single_word_is_distinctive)
+                and title_content_tokens.issubset(query_tokens)
+            )
+            if not title_matches:
                 continue
             if requested_year is not None and str(identity.get("year")) != str(requested_year):
                 continue
