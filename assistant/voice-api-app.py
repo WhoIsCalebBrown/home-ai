@@ -67,6 +67,19 @@ def _openai_compat_key() -> str:
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
+# Mirrors tools/server-tools-app.py's MODEL_FACING_EXCLUDED_TOOLS (separate
+# process, so duplicated rather than imported): tools that perform a real
+# write and already have their own dedicated, hash/session-bound
+# confirmation system (stage_media_confirmation() / pending[client_id] on
+# this side; plan_version_hash/arguments_hash validation on the Tools
+# side). These must be structurally unreachable from Qwen's own
+# tool-selection -- excluded from every discovered schema on the Tools
+# side, AND refused outright if a model still emits a tool_call by name
+# for one anyway (see the Qwen tool-dispatch loop in respond()). The
+# legitimate deterministic path (respond()'s confirmed-action branch)
+# invokes these tools directly by name from Python, never through this
+# set's enforcement.
+MODEL_FACING_EXCLUDED_TOOLS = frozenset({"media_standard_request"})
 # PENDING_OFFER is a distinct, deliberately weaker concept from `pending`
 # above (PENDING_CONFIRMATION). `pending` entries are session/workflow/
 # plan-hash/args-hash/TTL-bound write authorizations validated server-side
@@ -2306,8 +2319,18 @@ def investigation_query_from_speech(text: str) -> str:
 
 
 def is_confirmation(text: str) -> bool:
+    """Real production bug found investigating why a real confirmation
+    turn never got caught deterministically: "Yes, please request it." --
+    an entirely natural, common confirmation phrasing -- never fullmatched
+    because the interposed politeness word "please" was not tolerated
+    between the affirmation and the action phrase. Added a generic,
+    optional "please" slot rather than hardcoding this one sentence."""
     return bool(re.fullmatch(
-        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it|let's\s+(?:get|request|add)\s+it))?|(?:do|get|request|add)\s+it|go ahead|go for it|proceed)\s*[.!]?\s*",
+        r"\s*(?:(?:yes|yeah|yep|confirm|confirmed|okay|ok|please do|i confirm)"
+        r"(?:\s*,?\s*please)?"
+        r"(?:\s*,?\s*(?:go ahead|go for it|do it|proceed|get it|request it|add it|let's\s+(?:get|request|add)\s+it))?"
+        r"|(?:do|get|request|add)\s+it|go ahead|go for it|proceed"
+        r"|please\s+(?:go ahead|do it|proceed|get it|request it|add it))\s*[.!]?\s*",
         text,
         re.I,
     ))
@@ -3756,6 +3779,32 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             for call in calls[:4]:
                 fn = call.get("function", {})
                 name, arguments = fn.get("name"), fn.get("arguments", {})
+                if name in MODEL_FACING_EXCLUDED_TOOLS:
+                    # This tool has its own dedicated, hash/session-bound
+                    # confirmation system (stage_media_confirmation() /
+                    # pending[client_id]) and must be structurally
+                    # unreachable from Qwen's own tool-selection. Discovery
+                    # exclusion (tools/server-tools-app.py's
+                    # MODEL_FACING_EXCLUDED_TOOLS / _discoverable_registry)
+                    # already keeps it out of every offered schema, but
+                    # that alone only stops it from being OFFERED -- a
+                    # model can still emit a tool_call by name for
+                    # something it was never given (hallucinated or
+                    # replayed from training/context). Real production
+                    # bug: Qwen called media_standard_request directly with
+                    # invented {"title", "year"} arguments; it only failed
+                    # to write because that tool's OWN internal argument-
+                    # hash validation happened to catch it -- this refusal
+                    # is the primary enforcement boundary, not a secondary
+                    # one. The legitimate path (respond()'s confirmed-
+                    # action branch, invoking this exact tool by name
+                    # directly from Python, never through this loop) is
+                    # completely unaffected.
+                    result = {"tool": name, "status": "error",
+                              "result": {"error": "That action requires the existing confirmation flow, not a direct tool call."}}
+                    live_results.append(result)
+                    messages.append({"role": "tool", "name": name or "unknown", "content": json.dumps(result["result"], separators=(",", ":"))})
+                    continue
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
                 arguments = normalize_home_tool_arguments(name, arguments, user_text)

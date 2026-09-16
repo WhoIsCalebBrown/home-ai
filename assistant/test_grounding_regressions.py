@@ -579,6 +579,24 @@ def test_common_affirmations_are_confirmation_candidates_but_scope_is_elsewhere(
         assert not is_confirmation(text)
 
 
+def test_is_confirmation_tolerates_an_interposed_please():
+    """Real production bug: a live end-to-end test showed "Yes, please
+    request it." never fullmatched is_confirmation()'s regex -- the
+    politeness word "please" interposed between the affirmation and the
+    action phrase was not tolerated, so a genuine confirmation reply fell
+    through to Qwen's own tool-selection instead of the deterministic
+    pending[client_id] path. Generic fix (an optional "please" slot), not
+    a hardcode of this one sentence -- tested with several phrasings."""
+    for text in ("Yes, please request it.", "Yeah, please add it.", "yes please",
+                 "please request it", "please go ahead", "okay please request it", "Yes please"):
+        assert is_confirmation(text), text
+    # Negative control: an unrelated sentence or a fresh request must not
+    # be swept in just because it contains "please" or an action verb.
+    for text in ("Please tell me the weather.", "Get me Dumb and Dumber from 1994, please.",
+                 "Can you please check the containers?"):
+        assert not is_confirmation(text), text
+
+
 def test_external_blackhawk_topic_overrides_camera_context():
     conversation_context["blackhawk"] = {"domain": "camera", "group": "cameras", "camera": "front_door"}
     text = resolved_followup_text("blackhawk", "I heard something about a Blackhawk flying over Toronto. Look into that for me.")
