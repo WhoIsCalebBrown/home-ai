@@ -51,7 +51,19 @@ NEMO_CACHE_DIR = Path(os.getenv("NEMO_CACHE_DIR", "/app/pronunciation/nemo-cache
 TTS_DEBUG_LOG = os.getenv("TTS_DEBUG_LOG", "/app/pronunciation/tts-debug.jsonl")
 DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/discovery-debug.jsonl")
 OPENAI_COMPAT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "")
+OPENAI_COMPAT_API_KEY_FILE = os.getenv("OPENAI_COMPAT_API_KEY_FILE", "")
 OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "home-ai")
+
+
+def _openai_compat_key() -> str:
+    """Read the private gateway key without exposing it in logs or responses."""
+    if OPENAI_COMPAT_API_KEY_FILE:
+        try:
+            with open(OPENAI_COMPAT_API_KEY_FILE, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+    return OPENAI_COMPAT_API_KEY.strip()
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
@@ -3505,11 +3517,12 @@ def _openai_error(message: str, code: str, status_code: int) -> JSONResponse:
 
 
 def _require_openai_auth(request: Request) -> None:
-    if not OPENAI_COMPAT_API_KEY:
+    configured_key = _openai_compat_key()
+    if not configured_key:
         raise HTTPException(503, detail="OpenAI-compatible API is not configured")
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
-    if scheme.casefold() != "bearer" or not hmac.compare_digest(token, OPENAI_COMPAT_API_KEY):
+    if scheme.casefold() != "bearer" or not hmac.compare_digest(token, configured_key):
         raise HTTPException(401, detail="Invalid bearer token")
 
 
