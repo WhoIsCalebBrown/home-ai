@@ -2015,3 +2015,59 @@ async def test_knowledge_to_request_handoff(session):
     action = session.app.pending.get(session.client_id)
     assert action is not None, "a request following identity resolution must stop at a real confirmation prompt"
     assert not session.backend.submitted_writes
+
+
+# --- Structural unreachability of media_standard_request from Qwen's own --
+# --- tool-selection: real live production bug, most safety-critical fix  --
+# --- of the session. --------------------------------------------------- --
+
+@pytest.mark.asyncio
+async def test_qwen_cannot_call_media_standard_request_directly_even_if_it_tries(session):
+    """Real production bug: Qwen selected media_standard_request directly
+    as an ordinary tool, invented its own {"title", "year"} arguments from
+    conversational memory, and only failed to write because that tool's
+    OWN internal argument-hash validation happened to catch it -- a
+    secondary safety layer, not the primary gate this session's write-
+    safety guarantees were built around. Simulates a misbehaving/
+    hallucinating model that emits a tool_call for a name that was never
+    even offered (the fake catalog here, like the real discovery surface,
+    never includes media_standard_request) -- the dispatch loop must
+    refuse to execute it outright, not merely rely on it failing
+    downstream."""
+    reply = await session.turn(
+        "Yes, please request it.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_standard_request", "arguments": {"title": "Primer", "year": "2004"}}},
+        ]}}],
+        final_text="I can't do that directly.",
+    )
+    assert not any(name == "media_standard_request" for name, _ in session.backend.call_log), (
+        "media_standard_request must never reach invoke_tool via the model tool-selection loop"
+    )
+    assert not session.backend.submitted_writes
+    action = session.app.pending.get(session.client_id)
+    assert action is None or action.get("name") != "media_standard_request", (
+        "a hallucinated tool_call must never populate a real pending confirmation for this tool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legitimate_confirmed_media_request_still_executes_end_to_end(session):
+    """Negative control: closing the Qwen-direct-call gap must not break
+    the actual legitimate path -- a real staged pending[client_id]
+    confirmation, answered with a real "yes", must still execute the fake
+    write exactly as before."""
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn(
+        "Get Dune 2021.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune 2021"}}},
+        ]}}],
+    )
+    action = session.app.pending.get(session.client_id)
+    assert action is not None
+    assert action["name"] in {"media_standard_request", "media_execute_goal"}
+
+    await session.turn("Yes, please request it.")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending

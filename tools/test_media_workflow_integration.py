@@ -289,3 +289,45 @@ async def test_status_check_does_not_confuse_two_similarly_titled_requests(app):
     assert ambiguous_status["found"] is False
     assert ambiguous_status["status"] == "AMBIGUOUS"
     assert len(ambiguous_status["candidates"]) == 2
+
+
+# --- Structural unreachability of media_standard_request from Qwen's own --
+# --- tool-selection: the discovery-side half of the fix. -------------------
+
+@pytest.mark.asyncio
+async def test_media_standard_request_never_appears_in_discovery_for_any_query(app):
+    """Real production bug: media_standard_request (a real write tool with
+    its own dedicated hash/session-bound confirmation system) was
+    reachable from Qwen's own tool-selection because nothing filtered it
+    out of discover_capabilities()'s results -- Qwen selected it directly,
+    invented its own arguments, and only failed because the tool's own
+    internal validation happened to catch the malformed call. Swept across
+    many query shapes, including obviously media-write-shaped ones, since
+    the real live failure was triggered by exactly that kind of phrasing."""
+    module, events = app
+    for query in (
+        "yes please request it", "get me primer 2004", "add the movie primer",
+        "request dune", "download primer", "submit a request for dune",
+        "confirm the request", "please add it", "media standard request",
+        "", "what's the weather", "restart lidarr",
+    ):
+        max_results = 8 if query else 1
+        results = module.discover_capabilities(query, max_results=max_results) if query else module.discover_capabilities("", max_results=1)
+        names = {r["metadata"]["canonical_name"] for r in results}
+        assert "media_standard_request" not in names, query
+        assert "media_execute_goal" not in names, query
+
+
+def test_media_standard_request_excluded_from_registry_endpoint_source(app):
+    """The /registry endpoint (used when the assistant has no route text --
+    the other real model-facing discovery entry point) must draw from the
+    same filtered source, not iterate the raw REGISTRY directly."""
+    module, events = app
+    discoverable_names = {item[0] for item in module._discoverable_registry()}
+    assert "media_standard_request" not in discoverable_names
+    # The real invocation path must remain completely unaffected -- TOOLS
+    # (used by /invoke) is built from the FULL, unfiltered REGISTRY.
+    assert "media_standard_request" in module.TOOLS
+    # A simple confirm-permission tool with no dedicated confirmation
+    # system of its own must remain reachable exactly as before.
+    assert "restart_container" in discoverable_names

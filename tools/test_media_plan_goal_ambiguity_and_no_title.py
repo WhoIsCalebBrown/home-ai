@@ -532,6 +532,63 @@ def test_pick_match_uses_vote_count_to_rank_candidates_when_still_ambiguous():
     assert candidates[0]["tmdbId"] == 2, "the popular, well-known title must be ranked first among the surfaced candidates"
 
 
+# --- Exact-title-tie resolution: live-verified second root cause of the ---
+# --- "Cast Away" disambiguation-against-obscure-content complaint --------
+
+def test_pick_match_resolves_a_decisive_exact_title_tie_by_popularity():
+    """Live-verified real second root cause (distinct from the artist-hint
+    bug fixed last round): "Cast Away" (2000, the real Tom Hanks film) and
+    "Cast Away" (2017, an obscure unrelated film) are both genuine
+    EXACT-title matches for the query -- len(exact) == 2, so the exact-
+    match shortcut correctly refuses to blindly pick one. With a
+    695,975-to-1 real vote_count ratio, the capped fuzzy-match tiebreaker
+    (max +0.05) could never bridge the required 0.25 margin -- this is a
+    SEPARATE, more decisive rule specifically for a tie among the `exact`
+    list itself, where there is zero remaining title-relevance
+    uncertainty."""
+    matches = [
+        {"title": "Cast Away", "year": 2000, "tmdbId": 8358, "vote_count": 695975},
+        {"title": "Cast Away", "year": 2017, "tmdbId": 534416, "vote_count": 1},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "Cast Away")
+    assert ambiguous is False
+    assert identity["tmdbId"] == 8358
+
+
+def test_pick_match_exact_tie_with_comparable_popularity_stays_ambiguous():
+    """Negative control: a genuine remake-ambiguity case -- two exact-title
+    matches with COMPARABLE vote_counts (same order of magnitude, well
+    under the 10x/50-vote-floor threshold) -- must still fail closed and
+    surface both for disambiguation, never guessed."""
+    matches = [
+        {"title": "A Star Is Born", "year": 1976, "tmdbId": 1, "vote_count": 850},
+        {"title": "A Star Is Born", "year": 2018, "tmdbId": 2, "vote_count": 3200},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "A Star Is Born")
+    assert ambiguous is True
+    assert identity is None
+    tmdb_ids = {c["tmdbId"] for c in candidates}
+    assert tmdb_ids == {1, 2}
+
+
+def test_pick_match_exact_tie_rule_never_promotes_a_fuzzy_bonus_content_match():
+    """Fuzzy-match isolation: alongside the two genuine exact "Cast Away"
+    ties, the live-observed fuzzy matches ("Behind the Scenes: Cast Away",
+    "Miss Cast Away and the Island Girls") are NOT exact-title matches --
+    the new rule only ever compares within the `exact` list itself, so
+    these must never factor into or be promoted by this decision, and the
+    real popular film must still win outright."""
+    matches = [
+        {"title": "Cast Away", "year": 2000, "tmdbId": 8358, "vote_count": 695975},
+        {"title": "Cast Away", "year": 2017, "tmdbId": 534416, "vote_count": 1},
+        {"title": "Behind the Scenes: Cast Away", "year": 2000, "tmdbId": 999001, "vote_count": 3},
+        {"title": "Miss Cast Away and the Island Girls", "year": 2004, "tmdbId": 999002, "vote_count": 8},
+    ]
+    identity, ambiguous, candidates = app_module()._pick_match(matches, "Cast Away")
+    assert ambiguous is False
+    assert identity["tmdbId"] == 8358
+
+
 def test_pick_match_vote_count_cannot_override_a_real_title_mismatch():
     """The popularity bonus is capped well below the margin threshold --
     a hugely popular but token-mismatched row must never win over a real,

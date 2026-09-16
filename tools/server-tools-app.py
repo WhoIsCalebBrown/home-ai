@@ -1994,6 +1994,31 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
               and (not artist_cf or artist_cf in json.dumps(m).casefold())]
     if len(exact) == 1:
         return exact[0], False, []
+    if len(exact) > 1:
+        # Real live-verified gap: an EXACT title tie (e.g. two genuinely
+        # different Radarr entries both literally titled "Cast Away", one
+        # the real 2000 Tom Hanks film, one an obscure 2017 film) has zero
+        # remaining title-relevance uncertainty -- the only open question
+        # is WHICH same-named entry, so a decisive real-world popularity
+        # gap is trusted here specifically. This is deliberately a much
+        # stronger rule than the capped fuzzy-match tiebreaker below (which
+        # must stay weak: a small vote_count edge between two DIFFERENT
+        # titles must never manufacture false confidence -- that is a
+        # different question with real remaining uncertainty). Threshold:
+        # an order-of-magnitude-plus gap (>=10x) AND a real minimum floor
+        # (>=50 votes) on the leader, so two near-zero counts (noise, not
+        # signal) can never manufacture confidence -- chosen against the
+        # live-observed shape (695,975 vs 1: ratio ~696,000x) with headroom
+        # for a real remake-ambiguity case (comparable counts) to still
+        # correctly fail closed below.
+        ranked_exact = sorted(exact, key=lambda m: m.get("vote_count") or 0, reverse=True)
+        top_votes = ranked_exact[0].get("vote_count") or 0
+        runner_up_votes = ranked_exact[1].get("vote_count") or 0
+        if top_votes >= 50 and runner_up_votes * 10 <= top_votes:
+            return ranked_exact[0], False, []
+        # Otherwise fall through to the generic scored/margin path below --
+        # a genuinely comparable-popularity exact tie must still fail
+        # closed and surface real candidates, exactly as before this fix.
     wanted = set(re.findall(r"[a-z0-9]+", title_cf))
     if "kai" in wanted:
         kai_matches = [row for row in matches if "kai" in set(re.findall(r"[a-z0-9]+", str(row.get("title") or "").casefold()))]
@@ -3403,6 +3428,46 @@ REGISTRY = [
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
+# Tools that perform a real write and already have their OWN dedicated,
+# deterministic confirmation system (a hash-bound plan_version_hash/
+# arguments_hash, a workflow_id, and a real conversation_context/
+# pending[client_id] round trip built and staged server-side by
+# stage_media_confirmation()/the assistant's confirmed-action branch) must
+# never be reachable from Qwen's own tool-selection at all -- the generic
+# permission=="confirm" short-circuit at /invoke (a fresh action_id, a bare
+# confirmed=true echo-back, no hash/session/workflow binding) is the right,
+# intentional mechanism for a SIMPLE confirm tool like restart_container,
+# but it is not the mechanism this session's write-safety guarantees were
+# built around for media writes. Real production bug: Qwen selected
+# media_standard_request directly from its discovered tool set, invented
+# its own {"title": "Primer", "year": "2004"} arguments from conversational
+# memory, and only failed to write because media_standard_request's OWN
+# internal UNEXPECTED_ARGUMENT rejection happened to catch it -- that is a
+# real but secondary safety layer, not the primary gate.
+#
+# This exclusion is discovery-only: it removes the tool from what
+# discover_capabilities()/the /registry and /discover endpoints ever
+# return, so Qwen can never see or choose it -- it does NOT touch /invoke
+# itself, which still executes media_standard_request exactly as before
+# when called directly by name from respond()'s deterministic confirmed-
+# action branch (never through model tool-selection). media_execute_goal
+# is not listed here because it is not a real registered tool at all (see
+# its one reference above, a confirmation `operation` string for the
+# non-standard-media path -- TOOLS.get("media_execute_goal") is always
+# None, an existing structural dead end, not something discovery could
+# ever surface regardless).
+MODEL_FACING_EXCLUDED_TOOLS = frozenset({"media_standard_request"})
+
+
+def _discoverable_registry() -> list:
+    """The subset of REGISTRY Qwen's tool-selection is ever allowed to see.
+    The single choke point for both model-facing listing endpoints
+    (discover_capabilities() and /registry) -- add a new discovery entry
+    point on top of this function, never by iterating REGISTRY directly,
+    so this exclusion cannot be silently bypassed later."""
+    return [item for item in REGISTRY if item[0] not in MODEL_FACING_EXCLUDED_TOOLS]
+
+
 GROUP_SERVICES = {
     "server": {"server", "storage", "gpu", "docker", "netdata"},
     "home": {"home"},
@@ -3479,7 +3544,7 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
     referents = _search_tokens(" ".join(str(item) for item in context.get("referents", [])))
     q_grams = _semantic_ngrams(query)
     ranked = []
-    for item in REGISTRY:
+    for item in _discoverable_registry():
         record = capability_record(item)
         meta = record["metadata"]
         terms = _search_tokens(meta["search_text"])
@@ -3525,7 +3590,8 @@ async def health():
 async def registry(groups: str = ""):
     requested = {item.strip() for item in groups.split(",") if item.strip()}
     services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
-    items = REGISTRY if not requested else [item for item in REGISTRY if item[3] in services]
+    discoverable = _discoverable_registry()
+    items = discoverable if not requested else [item for item in discoverable if item[3] in services]
     return {"tools": [public_schema(x) for x in items], "groups": sorted(requested), "contract_version": TOOL_CONTRACT_VERSION}
 
 
