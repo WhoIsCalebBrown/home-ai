@@ -532,9 +532,13 @@ def test_weather_asr_frame_does_not_become_a_location():
 
 
 def test_simple_structured_reads_bypass_synthesis_pass():
+    # Weather is no longer a direct_structured_answer bypass -- it is now
+    # intentionally always synthesized by Qwen from the enriched forecast
+    # evidence (WEATHER_SYNTHESIS_RULE) for more natural broadcaster-style
+    # phrasing, so there is no deterministic string to assert here anymore.
     weather = {"source": "Open-Meteo", "days_from_now": 0, "temperature_unit": "C",
                "location": {"name": "Welland"}, "current": {"temperature_2m": 20, "weather_code": 0}}
-    assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) == "Today in Welland, it's currently 20 degrees Celsius and clear."
+    assert direct_structured_answer("What's the weather?", [{"tool": "weather_forecast", "status": "ok", "result": weather}]) is None
     assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
 
 
