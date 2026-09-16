@@ -76,7 +76,8 @@ for example `esp32:kitchen`, unless an explicit continuation is requested.
 - Container: `Open-WebUI`
 - Network: `voiceai`
 - Persistent data: `/mnt/cache/appdata/home-ai/open-webui`
-- LAN host port: `13000` (not a public exposure)
+- LAN host port: `13000`
+- HTTPS route: `https://assistant.calebs.online` through the existing Nginx Proxy Manager
 - Home-AI gateway key: `/mnt/cache/appdata/home-ai/secrets/openai-compat.key`
 - Open WebUI encryption key: `/mnt/cache/appdata/home-ai/open-webui/.webui-secret`
 - Template: `deployment/Open-WebUI.xml`
@@ -85,6 +86,10 @@ The server-side Assistant key is read from a private mounted file. No key is
 logged or included in Qwen context. The Open WebUI container receives only the
 same private bearer key needed to call the facade; it does not receive any
 backend service secrets.
+
+The existing `assistant.calebs.online` proxy host was intentionally repointed
+from the retired Assistant frontend at port `18088` to Open WebUI at port
+`13000`. The Nginx Proxy Manager database was backed up before this change.
 
 ## Current qualification status
 
