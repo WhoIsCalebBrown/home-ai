@@ -270,6 +270,12 @@ def repeat_intent(text: str) -> bool:
     )
 
 
+def home_retry_intent(text: str) -> bool:
+    lowered = text.casefold().strip()
+    return bool(re.fullmatch(r"(?:yeah[, ]*)?(?:just\s+)?(?:try|do)\s+(?:it|that)\s+again[.!]?", lowered)
+                or re.fullmatch(r"(?:please\s+)?retry[.!]?", lowered))
+
+
 def rephrase_intent(text: str) -> bool:
     lowered = text.casefold().strip()
     return bool(
@@ -685,6 +691,8 @@ def tool_groups(text: str) -> set[str]:
         groups.add("media")
     if re.search(r"\b(camera|cameras|frigate|door|garage|motion)\b", t):
         groups.add("cameras")
+    if re.search(r"\b(light|lights|lamp|outlet|switch|plug|brightness|dim|dimmer|downstairs|upstairs|bedroom|living room|office|couch|bed|home assistant|smart home)\b", t):
+        groups.add("home")
     if re.search(r"\b(request|overseerr)\b", t):
         groups.add("requests")
     if re.search(r"\b(search|fetch|weather|news|current|rules|documentation|release notes|product)\b", t):
@@ -1006,11 +1014,51 @@ def grounded_event_timing_answer(result: dict) -> str | None:
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
     """Answer narrow, high-confidence single-source reads without a second LLM pass."""
     successful = [item for item in live_results if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
+    if len(successful) > 1 and len({item.get("tool") for item in successful}) == 1 and successful[0].get("tool", "").startswith("home_"):
+        successful = [successful[-1]]
     if len(successful) != 1:
         return None
     item = successful[0]
     tool = item.get("tool")
     result = item["result"]
+    if tool in {"home_find_device", "home_get_state", "home_get_area_state"}:
+        if result.get("status") == "ambiguous":
+            candidates = result.get("candidates") or []
+            names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in candidates[:6])
+            return f"I found more than one matching device: {names}. Which one did you mean?"
+        devices = [device for device in result.get("devices", []) if isinstance(device, dict)]
+        if not devices:
+            return "I couldn't find any Home Assistant lights or outlets matching that request."
+        labels = []
+        for device in devices:
+            label = str(device.get("name") or device.get("entity_id"))
+            state = str(device.get("state") or "unknown")
+            brightness = device.get("brightness_pct")
+            if brightness is not None and state not in {"off", "unavailable"}:
+                labels.append(f"{label}: {state} at {brightness:g} percent")
+            else:
+                labels.append(f"{label}: {state}")
+        prefix = f"I found {len(devices)} Home Assistant devices: "
+        return prefix + "; ".join(labels) + "."
+    if tool == "home_control":
+        if result.get("status") == "not_found":
+            return "I couldn't find a matching Home Assistant light or outlet."
+        if result.get("status") == "ambiguous":
+            return str(result.get("message") or "I found more than one matching device. Which one did you mean?")
+        if result.get("status") == "unsupported_capability":
+            names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("devices", [])[:6])
+            return f"Brightness isn't supported by {names or 'that device'}."
+        if result.get("status") == "unavailable":
+            names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("devices", [])[:6])
+            return f"{names or 'That device'} is currently unavailable in Home Assistant."
+        if result.get("status") == "partial":
+            unavailable = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unavailable", [])[:6])
+            return f"I controlled the available matching devices. These remain unavailable in Home Assistant: {unavailable or 'unknown device'}."
+        return "The Home Assistant command was executed."
+    if tool == "home_activate_scene":
+        if result.get("status") != "executed":
+            return "I couldn't identify exactly one matching Home Assistant scene."
+        return f"Activated {result.get('scene', {}).get('name') or 'the Home Assistant scene'}."
     if tool == "media_plan_goal":
         identity = result.get("canonical_identity") or {}
         title = identity.get("title") or result.get("goal", {}).get("title_query") or "that item"
@@ -1077,7 +1125,9 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             code = result.get("current", {}).get("weather_code")
             condition = {0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "cloudy", 45: "foggy", 51: "light rain", 61: "rainy", 71: "snowy", 80: "showers"}.get(code)
             place = result["location"].get("name") or result.get("resolved_location", "there")
-            return f"It's about {temperature} {suffix} in {place}" + (f" with {condition}." if condition else ".")
+            if condition:
+                return f"It's about {temperature} {suffix} in {place}. It's {condition}."
+            return f"It's about {temperature} {suffix} in {place}."
         day = result.get("day", {})
         high = day.get("temperature_2m_max")
         low = day.get("temperature_2m_min")
@@ -1161,7 +1211,38 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str 
     if tts_suppressed.get():
         return
     prepared = await prepare_tts_text(request_id, text)
-    await asyncio.gather(*(speak(ws, request_id, chunk, prepared=True) for chunk in speakable_chunks(prepared)))
+    # Pocket audio must be generated and sent in order. Concurrent chunk tasks
+    # can acquire the provider lock out of order and make the browser overlap
+    # or clip the start of a chunk.
+    for chunk in speakable_chunks(prepared):
+        await speak(ws, request_id, chunk, prepared=True)
+
+
+def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) -> dict:
+    """Repair only bounded, obvious Home Assistant argument omissions from Qwen."""
+    if name != "home_control" or not isinstance(arguments, dict):
+        return arguments
+    normalized = dict(arguments)
+    target = str(normalized.get("entity_or_area") or "").strip()
+    lowered = user_text.casefold()
+    if str(normalized.get("action") or "").casefold() in {"on", "off"}:
+        normalized["action"] = f"turn_{str(normalized['action']).casefold()}"
+    if not normalized.get("action"):
+        if re.match(r"^\s*on\b", lowered):
+            normalized["action"] = "turn_on"
+        elif re.match(r"^\s*off\b", lowered):
+            normalized["action"] = "turn_off"
+    if not target:
+        device_type = str(normalized.get("device_type") or "").casefold()
+        if "neon" in lowered or "neon" in device_type:
+            target = "Neon Lights"
+        elif re.search(r"\b(all|everything)\b.*\b(light|lights|lamp|lamps)\b", lowered):
+            target = "all lights"
+        elif re.search(r"\b(all|everything)\b", lowered):
+            target = "everything"
+    if target:
+        normalized["entity_or_area"] = target
+    return normalized
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
@@ -1199,6 +1280,12 @@ ARTIST_ALIASES = {"travis": "Travis Scott", "travis scott": "Travis Scott"}
 
 def routing_aliases(text: str) -> str:
     """Normalize high-confidence STT aliases only for routing, never for display/history."""
+    # Whisper sometimes drops the imperative verb from short lighting commands
+    # ("on all the lights" / "off all the lights"). Repair only at the start
+    # of an obvious all-lights command; the raw transcript remains unchanged.
+    text = re.sub(r"^\s*(on|off)\s+(all\s+(?:the\s+)?(?:lights?|lamps?))\b",
+                  lambda match: f"turn {match.group(1)} {match.group(2)}",
+                  text, flags=re.I)
     # Bounded Whisper repair observed in the audio corpus: "Docker running
     # count" can become "dock or run and count".  Require the complete server
     # shape before repairing; ordinary uses of "dock" remain untouched.
@@ -1661,6 +1748,8 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     # test_storage_topic_switch_and_return_to_media_subject.
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu|cache|terabytes|gigabytes)\b", lowered) or re.search(r"\bspace\b.{0,20}\b(?:cache|disk|drive|storage|left|free)\b|\b(?:free|left)\b.{0,20}\bspace\b", lowered):
         return "server"
+    if re.search(r"\b(light|lights|lamp|outlet|switch|plug|brightness|dim|dimmer|downstairs|upstairs|bedroom|living room|office|couch|bed|home assistant|smart home)\b", lowered):
+        return "home"
     if re.search(r"\b(weather|forecast|temperature|rain|snow|cold|hot|warm)\b", lowered):
         return "weather"
     if explicit_web_search_request(text) or re.search(r"\b(news|headline|headlines|technology|tech|ai|artificial intelligence|current events|politics|political|government|congress|election|president|prime minister|trump|trade war|trade dispute)\b", lowered):
@@ -2525,7 +2614,6 @@ def synthesis_violation(text: str, user_text: str = "") -> str | None:
 async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None, guard_domain: str | None = None) -> str:
     sentence = ""
     full = full_seed
-    tts_tasks: list[asyncio.Task] = []
 
     async def emit_sentence(value: str) -> None:
         if value.strip():
@@ -2539,7 +2627,8 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
             await ws.send_json({"type": "state", "state": "speaking", "request_id": request_id})
             if not tts_suppressed.get():
                 prepared = await prepare_tts_text(request_id, safe)
-                tts_tasks.extend(asyncio.create_task(speak(ws, request_id, chunk, prepared=True)) for chunk in speakable_chunks(prepared))
+                for chunk in speakable_chunks(prepared):
+                    await speak(ws, request_id, chunk, prepared=True)
 
     try:
         async with httpx.AsyncClient(timeout=None) as http:
@@ -2564,13 +2653,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
                         break
         if sentence.strip():
             await emit_sentence(sentence)
-        if tts_tasks:
-            await asyncio.gather(*tts_tasks)
     except asyncio.CancelledError:
-        for task in tts_tasks:
-            task.cancel()
-        if tts_tasks:
-            await asyncio.gather(*tts_tasks, return_exceptions=True)
         raise
     return repair_decimal_spacing(full.strip())
 
@@ -3172,6 +3255,16 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
+        previous_home = conversation_context.get(client_id, {}).get("latest_home_action")
+        if home_retry_intent(user_text) and isinstance(previous_home, dict):
+            result = await invoke_tool(previous_home["name"], previous_home["arguments"], client_id, request_id)
+            direct = direct_structured_answer(user_text, [result])
+            full = direct or "I couldn't retry the previous Home Assistant command."
+            await emit_answer(ws, request_id, full, client_id=client_id)
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": result.get("tool"), "status": result.get("status"), "sources_checked": []}]})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         if social_acknowledgement(user_text):
             full = "You're welcome."
             await emit_answer(ws, request_id, full, client_id=client_id)
@@ -3194,7 +3287,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # into the present-tense answer.
         if current_camera_presence_question(user_text):
             model_history = []
-        messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": user_text}]
+        # Give Qwen the bounded routing repair while retaining the original
+        # transcript for display, history, and audit.
+        llm_user_text = routing_aliases(user_text)
+        messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": llm_user_text}]
         context = turn_context(client_id, user_text)
         contextual = contextual_entity_resolution(user_text, context)
         context["canonical_entities"] = contextual["entities"]
@@ -3525,7 +3621,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 name, arguments = fn.get("name"), fn.get("arguments", {})
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
+                arguments = normalize_home_tool_arguments(name, arguments, user_text)
                 result = await invoke_tool(name, arguments, client_id, request_id)
+                if name == "home_control":
+                    conversation_context.setdefault(client_id, {})["latest_home_action"] = {
+                        "name": name, "arguments": dict(arguments), "timestamp": time.time()
+                    }
                 live_results.append(result)
                 if result.get("status") == "confirmation_required":
                     pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": request_id, "expires": time.time() + 60}
@@ -3879,6 +3980,28 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     return answer, client_id, trace
 
 
+def openai_tool_trace_footer(trace: list[dict]) -> str:
+    """Make the existing bounded trace visible in Open WebUI chat output."""
+    if not trace:
+        return ""
+    rows = []
+    for item in trace:
+        tool = str(item.get("tool") or "unknown")
+        status = str(item.get("status") or "unknown")
+        rows.append(f"- `{tool}` — {status}")
+    # Keep this as ordinary Markdown because Open WebUI may display raw HTML
+    # rather than sanitizing it into a hidden DOM region. The speech endpoint
+    # removes this diagnostic section before sending text to Pocket.
+    return "\n\n---\n**Tools used**\n" + "\n".join(rows)
+
+
+def remove_openai_tool_trace(text: str) -> str:
+    """Keep Open WebUI diagnostics visible but exclude them from Pocket speech."""
+    cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", text, flags=re.I | re.S)
+    cleaned = re.sub(r"\s*---\s*\n\s*\*?\*?Tools used\*?\*?.*$", " ", cleaned, flags=re.I | re.S)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 async def _wav_to_mp3(wav: bytes) -> bytes:
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
@@ -3908,7 +4031,8 @@ async def openai_chat_completions(request: Request):
         model = str(body.get("model") or OPENAI_COMPAT_MODEL)
         if model != OPENAI_COMPAT_MODEL:
             raise HTTPException(404, detail=f"Unknown model: {model}")
-        answer, session_id, _trace = await _openai_chat_turn(body, request)
+        answer, session_id, trace = await _openai_chat_turn(body, request)
+        answer += openai_tool_trace_footer(trace)
     except HTTPException as exc:
         return _openai_error(str(exc.detail), "invalid_request", exc.status_code)
     except Exception as exc:
@@ -3948,6 +4072,7 @@ async def openai_speech(request: Request):
     try:
         body = await request.json()
         text = str(body.get("input") or "").strip()
+        text = remove_openai_tool_trace(text)
         if not text:
             return _openai_error("input is required", "invalid_request", 400)
         requested_format = str(body.get("response_format") or "wav").casefold()
