@@ -19,8 +19,13 @@ def _load_helpers():
     }
     module = types.SimpleNamespace(OPENAI_COMPAT_MODEL="home-ai")
     namespace = module.__dict__
-    selected = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    selected = [
+        node for node in tree.body
+        if isinstance(node, ast.Import)
+        and any(alias.name == "re" for alias in node.names)
+    ]
     selected += [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace["Request"] = object
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
     return module
 
