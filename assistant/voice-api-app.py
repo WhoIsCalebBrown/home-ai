@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextvars
+import hashlib
 import hmac
 import io
 import json
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -22,7 +24,7 @@ from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
-from tts_audio import apply_pcm16_headroom, merge_wav_chunks, prepend_silence
+from tts_audio import prepend_silence
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -225,6 +227,28 @@ pronunciation_entries: dict[str, str] = {}
 normalization_init_seconds: float | None = None
 tools_backend_status: dict[str, object] = {"ok": False, "status": "NOT_CHECKED", "url": TOOLS_URL}
 tts_suppressed = contextvars.ContextVar("tts_suppressed", default=False)
+# Open WebUI receives a display response that may include the server-generated
+# tool trace. Keep the corresponding speech-only response separately so its
+# TTS request does not parse UI/diagnostic markup.
+openai_tts_text_by_display_digest: dict[str, tuple[float, str]] = {}
+OPENAI_TTS_TEXT_TTL = 15 * 60
+
+
+def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
+    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
+    now = time.time()
+    openai_tts_text_by_display_digest[digest] = (now, spoken_text)
+    for key, (created, _) in list(openai_tts_text_by_display_digest.items()):
+        if now - created > OPENAI_TTS_TEXT_TTL:
+            openai_tts_text_by_display_digest.pop(key, None)
+
+
+def spoken_text_for_openai_display(display_text: str) -> str:
+    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
+    entry = openai_tts_text_by_display_digest.get(digest)
+    if entry and time.time() - entry[0] <= OPENAI_TTS_TEXT_TTL:
+        return entry[1]
+    return display_text
 
 
 async def check_tools_backend() -> None:
@@ -499,25 +523,35 @@ async def synthesize_pocket(text: str) -> bytes:
     async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
         response = await http.post(POCKET_API_URL, json={"input": text})
         response.raise_for_status()
-        return prepend_silence(response.content)
+        return response.content
 
 
 async def stream_pocket(ws: WebSocket, request_id: str, text: str) -> None:
+    started = time.perf_counter()
     print(f"TTS_TIMING request={request_id} event=pocket_stream_request t={time.time():.6f}", flush=True)
     async with httpx.AsyncClient(timeout=CHATTERBOX_TIMEOUT) as http:
         async with http.stream("POST", POCKET_API_URL.rsplit("/", 1)[0] + "/stream", json={"input": text}) as response:
             response.raise_for_status()
-            pocket_chunks: list[bytes] = []
+            sent_start = False
+            sent_audio = False
             async for line in response.aiter_lines():
                 if not line:
                     continue
                 payload = json.loads(line)
-                pocket_chunks.append(base64.b64decode(payload["audio"], validate=True))
-            # Pocket's stream is WAV-framed per ~80 ms chunk.  Reassemble it
-            # before sending so the browser plays one continuous source.
-            wav = prepend_silence(apply_pcm16_headroom(merge_wav_chunks(pocket_chunks)))
-            discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav", "transport": "reassembled"})
-            await send_wav(ws, request_id, wav, provider="pocket")
+                wav = base64.b64decode(payload["audio"], validate=True)
+                if not wav:
+                    continue
+                if not sent_start:
+                    sent_start = True
+                    await ws.send_json({"type": "audio_start", "request_id": request_id})
+                await ws.send_json({"type": "audio_chunk", "request_id": request_id, "audio": base64.b64encode(wav).decode("ascii"), "streaming": True})
+                if not sent_audio:
+                    sent_audio = True
+                    print(f"TTS_TIMING request={request_id} event=first_audio_sent elapsed_ms={(time.perf_counter() - started) * 1000:.1f}", flush=True)
+                    discovery_audit({"event": "tts_first_chunk", "request_id": request_id, "provider_used": "pocket", "voice": "persisted_reference_state", "model": "pocket-tts:3.1.0", "audio_format": "wav", "transport": "prefix_gated_stream"})
+            if sent_start:
+                await ws.send_json({"type": "audio_end", "request_id": request_id})
+            print(f"TTS_TIMING request={request_id} event=pocket_stream_complete elapsed_ms={(time.perf_counter() - started) * 1000:.1f}", flush=True)
 
 
 async def synthesize_piper(text: str) -> bytes:
@@ -867,6 +901,8 @@ def unavailable_live_answer(text: str) -> str:
         return "I couldn't verify Lidarr's current status because its live status check was unavailable."
     if re.search(r"\b(litter|plex|plexium|music|album|artist|media|download|downloads?)\b", text, re.I):
         return "I couldn't verify the current media pipeline because its live results were unavailable."
+    if explicit_domain(text) == "web_research" or re.search(r"\b(news|headlines|canada|canadian)\b", text, re.I):
+        return "My web search isn't returning usable results right now, even after broader queries, so I can't reliably answer that yet."
     if current_external_question(text):
         return "I couldn't verify the current external information because live web research was unavailable."
     if re.search(r"\b(news|headline|technology|tech|ai|artificial intelligence|canada|canadian)\b", text, re.I):
@@ -878,6 +914,8 @@ def all_live_results_failed(results: list[dict]) -> bool:
     """Keep a total live-tool outage from becoming a model-invented answer."""
     if not results:
         return False
+    if results and all(item.get("tool") in {"web_search", "web_fetch"} for item in results):
+        return not any(web_result_useful(item) or (item.get("tool") == "web_fetch" and item.get("status") == "ok") for item in results)
     return all(
         item.get("status") != "ok"
         or not isinstance(item.get("result"), dict)
@@ -1027,6 +1065,12 @@ def grounded_event_timing_answer(result: dict) -> str | None:
 
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
     """Answer narrow, high-confidence single-source reads without a second LLM pass."""
+    home_failure = next((item for item in live_results if item.get("tool") == "home_control" and item.get("status") != "ok"), None)
+    if home_failure:
+        detail = home_failure.get("result", {}).get("error") if isinstance(home_failure.get("result"), dict) else None
+        action = "turn off" if re.search(r"\b(?:off|turn off|shut off)\b", user_text, re.I) else "turn on" if re.search(r"\b(?:on|turn on)\b", user_text, re.I) else "control"
+        suffix = f" Details: {detail}." if detail else "."
+        return f"I found the requested devices, but Home Assistant couldn't {action} them{suffix}"
     successful = [item for item in live_results if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
     if len(successful) > 1 and len({item.get("tool") for item in successful}) == 1 and successful[0].get("tool", "").startswith("home_"):
         successful = [successful[-1]]
@@ -1301,13 +1345,17 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
     normalized = dict(arguments)
     target = str(normalized.get("entity_or_area") or "").strip()
     lowered = user_text.casefold()
-    if str(normalized.get("action") or "").casefold() in {"on", "off"}:
-        normalized["action"] = f"turn_{str(normalized['action']).casefold()}"
-    if not normalized.get("action"):
-        if re.match(r"^\s*on\b", lowered):
-            normalized["action"] = "turn_on"
-        elif re.match(r"^\s*off\b", lowered):
+    raw_action = str(normalized.get("action") or "").casefold().strip()
+    if raw_action in {"on", "off"}:
+        normalized["action"] = f"turn_{raw_action}"
+    elif raw_action not in {"turn_on", "turn_off", "set_brightness"}:
+        # Qwen occasionally emits an invented compound action (for example
+        # turn_off_all_lights) or omits the action entirely. Recover only from
+        # the user's explicit intent, and preserve that intent through retries.
+        if re.search(r"\b(?:turn\s+)?off\b", lowered):
             normalized["action"] = "turn_off"
+        elif re.search(r"\b(?:turn\s+)?on\b", lowered):
+            normalized["action"] = "turn_on"
     if not target:
         device_type = str(normalized.get("device_type") or "").casefold()
         if "neon" in lowered or "neon" in device_type:
@@ -1857,6 +1905,8 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     lowered = routing_aliases(text).casefold()
     if social_acknowledgement(text):
         return "general"
+    if current_external_question(text) or explicit_web_search_request(text):
+        return "web_research"
     # A media acquisition request mentioning a Plex/server destination is still
     # media.  Check this before generic infrastructure nouns such as "server";
     # otherwise "add this show to my Plex server" becomes a Docker request.
@@ -2031,6 +2081,11 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return deterministic
     if direct_file_request(text) or playback_request(text):
         return []
+    # Fresh public-information questions must outrank the broad media-status
+    # grammar below ("what's happening in Canada today" was otherwise
+    # mistaken for a retained media workflow).
+    if current_external_question(text) or explicit_web_search_request(text):
+        return [("web_search", {"query": text.strip()})]
     # Library recency questions contain the verb "add" but are read-only
     # Plex queries, not acquisition goals. Resolve them before the broad
     # acquisition-language matcher.
@@ -2301,6 +2356,75 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if re.search(r"\b(download|downloading|queue|stuck|missing)\b", t):
         plan.append(("investigate_downloads", {}))
     return list(dict((name, args) for name, args in plan).items())
+
+
+def research_profile(text: str) -> dict[str, int | str]:
+    """Choose a bounded web-research budget from explicit user intent."""
+    lowered = text.casefold()
+    if re.search(r"\b(in[- ]depth|deep dive|deeply|comprehensive|thorough|full picture|detailed review|properly research|research this)\b", lowered):
+        return {"mode": "deep", "iterations": 8, "max_calls": 16, "num_predict": 720}
+    if re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered):
+        return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360}
+    return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180}
+
+
+def compact_research_result(name: str, result: dict, *, deep: bool = False) -> dict:
+    """Keep staged research evidence useful without flooding Qwen's context."""
+    copy = dict(result)
+    if name == "web_search" and isinstance(copy.get("results"), list):
+        copy["results"] = [{key: value for key, value in item.items() if key in {"title", "url", "domain", "snippet", "date", "engine"}} for item in copy["results"][:40]]
+        for item in copy["results"]:
+            item["snippet"] = str(item.get("snippet") or "")[:700]
+    if name == "web_fetch" and isinstance(copy.get("content"), str):
+        limit = 9000 if deep else 5000
+        copy["content"] = copy["content"][:limit]
+        copy["content_truncated_for_context"] = len(result["content"]) > limit
+    return copy
+
+
+def research_tool_instruction(profile: dict[str, int | str]) -> str:
+    mode = profile["mode"]
+    if mode == "quick":
+        return "Use the web minimally for this lookup: one focused search and fetch at most the strongest source if needed."
+    if mode == "normal":
+        return "Use normal web research: gather several relevant results, fetch multiple strong sources where useful, and avoid duplicate stories."
+    return ("Perform deep, iterative web research before answering. Start with discovery, then issue targeted follow-up searches based on themes you actually find, "
+            "fetch primary or reputable sources for central claims, cross-check important or controversial facts, deduplicate syndicated coverage, and stop when coverage is sufficient. "
+            "Use the supplied bounded research tools; do not answer from search snippets alone.")
+
+
+def enrich_research_arguments(name: str, arguments: dict, profile: dict[str, int | str], user_text: str) -> dict:
+    """Apply depth defaults while preserving any explicit model choices."""
+    if name == "web_search":
+        enriched = dict(arguments)
+        enriched.setdefault("max_results", {"quick": 5, "normal": 12, "deep": 20}.get(profile["mode"], 5))
+        if re.search(r"\b(today|tonight|latest|currently|this morning|breaking)\b", user_text, re.I):
+            enriched.setdefault("recency_days", 1)
+        elif re.search(r"\bthis week\b", user_text, re.I):
+            enriched.setdefault("recency_days", 7)
+        if re.search(r"\b(news|headlines|current events)\b", user_text, re.I):
+            enriched.setdefault("search_type", "news")
+        return enriched
+    if name == "web_fetch":
+        enriched = dict(arguments)
+        enriched.setdefault("max_chars", 9000 if profile["mode"] == "deep" else 6000 if profile["mode"] == "normal" else 4000)
+        enriched.setdefault("extract", "article")
+        return enriched
+    return arguments
+
+
+def web_result_useful(item: dict) -> bool:
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    return item.get("status") == "ok" and bool(result.get("results"))
+
+
+def web_recovery_queries(user_text: str) -> list[str]:
+    today = datetime.now().strftime("%B %-d %Y")
+    return [
+        f"{user_text} {today}",
+        f"{user_text} major developments",
+        f"{user_text} politics economy provincial news",
+    ]
 
 
 def preflight_names(text: str) -> list[str]:
@@ -2772,7 +2896,7 @@ def synthesis_violation(text: str, user_text: str = "") -> str | None:
     return None
 
 
-async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None, guard_domain: str | None = None) -> str:
+async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], full_seed: str = "", guard_user_text: str = "", guard_results: list[dict] | None = None, guard_domain: str | None = None, research_mode: str = "quick") -> str:
     sentence = ""
     full = full_seed
 
@@ -2789,12 +2913,14 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
             if not tts_suppressed.get():
                 prepared = await prepare_tts_text(request_id, safe)
                 for chunk in speakable_chunks(prepared):
+                    print(f"TTS_CHUNK request={request_id} text={json.dumps(chunk, ensure_ascii=False)}", flush=True)
                     await speak(ws, request_id, chunk, prepared=True)
 
     try:
         async with httpx.AsyncClient(timeout=None) as http:
+            output_tokens = {"quick": 180, "normal": 360, "deep": 720}.get(research_mode, 180)
             payload = {"model": MODEL, "messages": messages, "stream": True, "think": False,
-                       "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
+                       "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": output_tokens}}
             async with http.stream("POST", f"{OLLAMA}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -2842,6 +2968,8 @@ def evidence_message(results: list[dict]) -> list[dict]:
         if result.get("image_base64"):
             images.append(result["image_base64"])
             copy["result"] = {k: v for k, v in result.items() if k != "image_base64"}
+        if item.get("tool") in {"web_search", "web_fetch"}:
+            copy["result"] = compact_research_result(str(item.get("tool")), result, deep=True)
         clean.append(copy)
     current_rule = ""
     if has_current_snapshot:
@@ -3461,6 +3589,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         route_text = contextual_entity_resolution(route_text, context)["text"]
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         context["retrieval_confidence"] = retrieval_confidence(candidates)
+        profile = research_profile(user_text)
+        context["research_mode"] = profile["mode"]
+        context["research_budget"] = {key: value for key, value in profile.items() if key != "num_predict"}
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
         # A low-confidence, domain-free utterance must not inherit a stale
         # referent by giving Qwen a noisy cross-domain tool set.  This is a
@@ -3494,6 +3625,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # preflight planner for all known high-confidence routes, while still
         # leaving genuinely novel/ambiguous requests to semantic retrieval.
         planned = preflight_plan(route_text, context)
+        # Quick web lookups retain the fast deterministic path. Broader or
+        # explicitly deep requests stay in the model-facing loop so Qwen can
+        # issue bounded follow-up searches and fetch several sources.
+        if profile["mode"] != "quick" and any(name == "web_search" for name, _ in planned):
+            planned = []
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
@@ -3525,7 +3661,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # without selecting a capability in language-specific code.
             messages.append({
                 "role": "system",
-                "content": "Dispatch now: call the best supplied live capability to answer the current request. Do not answer in prose before making that tool call.",
+                "content": "Dispatch now: call the best supplied live capability to answer the current request. Do not answer in prose before making that tool call. " + research_tool_instruction(profile),
             })
         for name, planned_args in planned:
             args = planned_args
@@ -3749,7 +3885,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         full = ""
-        for _ in range(4):
+        research_calls = 0
+        researched_urls: set[str] = set()
+        for _ in range(int(profile["iterations"])):
             discovery_audit({
                 "event": "ollama_request",
                 "client_id": client_id,
@@ -3762,22 +3900,32 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             })
             async with httpx.AsyncClient(timeout=None) as http:
                 payload = {"model": MODEL, "messages": messages, "tools": tools, "stream": False, "think": False,
-                           "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": 128}}
+                           "keep_alive": "10m", "options": {"temperature": 0.25, "num_ctx": LLM_CONTEXT, "num_predict": int(profile["num_predict"])}}
                 # Qwen3.5 can legitimately choose a plain answer under
                 # tool_choice=auto even when a live capability is required.
                 # The first pass is a dispatch decision, so require one of the
                 # semantically retrieved tools; after execution, synthesis is
                 # intentionally left unconstrained.
-                if _ == 0 and tools:
+                if tools and (_ == 0 or profile["mode"] in {"normal", "deep"}):
                     payload["tool_choice"] = "required"
                 response = await http.post(f"{OLLAMA}/api/chat", json=payload)
                 response.raise_for_status()
                 message = response.json().get("message", {})
             calls = message.get("tool_calls") or []
             if not calls:
+                completed_searches = sum(1 for item in live_results if item.get("tool") == "web_search")
+                minimum_searches = 2 if profile["mode"] == "normal" else 3 if profile["mode"] == "deep" else 1
+                if profile["mode"] in {"normal", "deep"} and completed_searches < minimum_searches and research_calls < int(profile["max_calls"]):
+                    recovery_queries = web_recovery_queries(user_text)
+                    query = recovery_queries[min(completed_searches, len(recovery_queries) - 1)]
+                    followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 7, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
+                    research_calls += 1
+                    live_results.append(followup)
+                    messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
+                    continue
                 break
             messages.append(message)
-            for call in calls[:4]:
+            for call in calls[: min(4, int(profile["max_calls"]) - research_calls)]:
                 fn = call.get("function", {})
                 name, arguments = fn.get("name"), fn.get("arguments", {})
                 if name in MODEL_FACING_EXCLUDED_TOOLS:
@@ -3809,20 +3957,37 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
                 arguments = normalize_home_tool_arguments(name, arguments, user_text)
+                arguments = enrich_research_arguments(name, arguments, profile, user_text)
                 result = await invoke_tool(name, arguments, client_id, request_id)
+                research_calls += 1
                 if name == "home_control":
                     conversation_context.setdefault(client_id, {})["latest_home_action"] = {
                         "name": name, "arguments": dict(arguments), "timestamp": time.time()
                     }
                 live_results.append(result)
+                if name == "web_search" and result.get("status") == "ok" and isinstance(result.get("result"), dict):
+                    candidates_for_fetch = result["result"].get("results") or []
+                    fetch_limit = 2 if profile["mode"] == "deep" else 1 if profile["mode"] == "normal" else 0
+                    for candidate in candidates_for_fetch:
+                        url = str(candidate.get("url") or "").strip()
+                        if not url or url in researched_urls or research_calls >= int(profile["max_calls"]) or fetch_limit <= 0:
+                            continue
+                        researched_urls.add(url)
+                        fetched = await invoke_tool("web_fetch", {"url": url, "max_chars": 9000 if profile["mode"] == "deep" else 6000, "extract": "article"}, client_id, request_id)
+                        research_calls += 1
+                        live_results.append(fetched)
+                        messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(compact_research_result("web_fetch", fetched.get("result", {}) if isinstance(fetched.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
+                        fetch_limit -= 1
                 if result.get("status") == "confirmation_required":
                     pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": request_id, "expires": time.time() + 60}
-                    messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
+                    messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                 else:
-                    messages.append({"role": "tool", "name": name, "content": json.dumps(result.get("result", {}), separators=(",", ":"))})
+                    messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
                     record_tool_referent(client_id, name, arguments, result)
+            if research_calls >= int(profile["max_calls"]):
+                break
         if live_results:
             post_direct = direct_structured_answer(user_text, live_results)
             if post_direct:
@@ -3914,7 +4079,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"))
+        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})
@@ -4187,7 +4352,11 @@ def openai_tool_trace_footer(trace: list[dict]) -> str:
 def remove_openai_tool_trace(text: str) -> str:
     """Keep Open WebUI diagnostics visible but exclude them from Pocket speech."""
     cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", text, flags=re.I | re.S)
-    cleaned = re.sub(r"\s*---\s*\n\s*\*?\*?Tools used\*?\*?.*$", " ", cleaned, flags=re.I | re.S)
+    # Open WebUI may submit the footer as a separate TTS input, flattening
+    # Markdown newlines. This fallback is only for the speech endpoint when
+    # the structured display->speech registry cannot match a streamed piece.
+    cleaned = re.sub(r"\s*---\s*\**Tools used\**.*$", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"\s*\**Tools used\**\s*(?:[-–—]?\s*[a-z0-9_]+\s*[-–—]?\s*\w+\s*)+$", " ", cleaned, flags=re.I | re.S)
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -4221,12 +4390,15 @@ async def openai_chat_completions(request: Request):
         if model != OPENAI_COMPAT_MODEL:
             raise HTTPException(404, detail=f"Unknown model: {model}")
         answer, session_id, trace = await _openai_chat_turn(body, request)
-        answer += openai_tool_trace_footer(trace)
     except HTTPException as exc:
         return _openai_error(str(exc.detail), "invalid_request", exc.status_code)
     except Exception as exc:
         print(f"OPENAI_COMPAT_CHAT_FAILED error={type(exc).__name__}", flush=True)
         return _openai_error("Home-AI could not complete this request", "backend_unavailable", 502)
+    spoken_answer = answer
+    display_answer = answer + openai_tool_trace_footer(trace)
+    register_openai_tts_text(display_answer, spoken_answer)
+    answer = display_answer
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     if body.get("stream"):
@@ -4261,9 +4433,17 @@ async def openai_speech(request: Request):
     try:
         body = await request.json()
         text = str(body.get("input") or "").strip()
-        text = remove_openai_tool_trace(text)
+        # OpenAI-compatible chat responses intentionally contain display-only
+        # tool diagnostics for Open WebUI. Resolve the exact response through
+        # the server-side display->speech registry before synthesis, so the
+        # spoken channel never receives that metadata.
+        text = spoken_text_for_openai_display(text)
+        if text:
+            text = remove_openai_tool_trace(text)
         if not text:
-            return _openai_error("input is required", "invalid_request", 400)
+            # Display-only tool diagnostics can arrive as their own TTS
+            # request. Treat that request as intentionally silent.
+            return Response(status_code=204)
         requested_format = str(body.get("response_format") or "wav").casefold()
         if requested_format not in {"wav", "pcm", "mp3"}:
             return _openai_error("Home-AI TTS currently supports wav and mp3 output", "unsupported_format", 400)

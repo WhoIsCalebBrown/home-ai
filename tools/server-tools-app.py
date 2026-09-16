@@ -488,21 +488,37 @@ def public_url(value: str) -> str:
 
 async def web_search(args: dict[str, Any]) -> dict[str, Any]:
     query = args["query"].strip()
+    max_results = max(3, min(int(args.get("max_results", 8)), 40))
+    recency_days = args.get("recency_days")
+    search_type = str(args.get("search_type") or "general").casefold()
+    domains = [str(item).strip() for item in (args.get("domains") or []) if str(item).strip()][:8]
+    if domains:
+        query = f"{query} " + " ".join(f"site:{domain}" for domain in domains)
+    params = {"q": query, "format": "json"}
+    if search_type == "news":
+        params["categories"] = "news"
+    if recency_days is not None:
+        days = max(1, min(int(recency_days), 365))
+        params["time_range"] = "day" if days <= 1 else "week" if days <= 7 else "month" if days <= 31 else "year"
     async with httpx.AsyncClient(timeout=12) as client:
-        response = await client.get(f"{SEARXNG_URL}/search", params={"q": query, "format": "json"})
+        response = await client.get(f"{SEARXNG_URL}/search", params=params)
         response.raise_for_status()
     results = []
-    for item in response.json().get("results", [])[:8]:
+    for item in response.json().get("results", [])[:max_results]:
         if item.get("url"):
             results.append({"title": item.get("title", ""), "url": item["url"],
                             "domain": urlparse(item["url"]).hostname or "",
                             "snippet": item.get("content", ""), "date": item.get("publishedDate"),
-                            "rank": len(results) + 1})
-    return {"query": query, "results": results, "source": "SearXNG", "untrusted": True}
+                            "rank": len(results) + 1, "engine": item.get("engine")})
+    return {"query": query, "results": results, "result_quality": "useful" if results else "empty",
+            "result_count": len(results), "source": "SearXNG", "search_type": search_type,
+            "recency_days": recency_days, "untrusted": True}
 
 
 async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
     target = public_url(args["url"])
+    max_chars = max(4000, min(int(args.get("max_chars", 20000)), 40000))
+    extract = str(args.get("extract") or "article").casefold()
     async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers={"User-Agent": "Home-AI-Tools/1.0"}) as client:
         for _ in range(4):
             response = await client.get(target)
@@ -513,9 +529,25 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
             content_type = response.headers.get("content-type", "")
             if not any(kind in content_type for kind in ("text/", "application/json", "application/xml")):
                 raise ValueError("only text web pages can be fetched")
-            text = response.text[:200000]
-            text = html.unescape(re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>|<[^>]+>", " ", text, flags=re.I))
-            return {"url": target, "content": re.sub(r"\s+", " ", text).strip(), "untrusted": True}
+            raw = response.text
+            title = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.I | re.S)
+            published = re.search(r'<meta[^>]+(?:property|name)=["\'](?:article:published_time|date|pubdate)["\'][^>]+content=["\']([^"\']+)', raw, flags=re.I)
+            author = re.search(r'<meta[^>]+(?:name|property)=["\']author["\'][^>]+content=["\']([^"\']+)', raw, flags=re.I)
+            if extract == "raw":
+                text = raw
+            else:
+                # Keep article-like text and headings while dropping the most
+                # common page chrome. This remains intentionally conservative;
+                # the model receives source attribution and can discount noise.
+                text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>|<nav[\s\S]*?</nav>|<footer[\s\S]*?</footer>|<header[\s\S]*?</header>", " ", raw, flags=re.I)
+                text = re.sub(r"<[^>]+>", " ", text, flags=re.I)
+                text = html.unescape(text)
+                text = re.sub(r"\s+", " ", text).strip()
+            return {"url": target, "title": html.unescape(title.group(1)).strip() if title else "",
+                    "author": html.unescape(author.group(1)).strip() if author else None,
+                    "published": published.group(1).strip() if published else None,
+                    "content": text[:max_chars], "truncated": len(text) > max_chars,
+                    "extract": extract, "untrusted": True}
     raise ValueError("too many redirects")
 
 
@@ -3318,10 +3350,23 @@ async def home_control(args: dict[str, Any]) -> dict[str, Any]:
             response = await client.post(f"{HOME_ASSISTANT_URL}/api/services/{domain}/{service}", json=data)
             response.raise_for_status()
             results.append({"domain": domain, "entity_ids": entity_ids, "action": action})
-    response = {"status": "executed", "results": results}
+    response = {"status": "executed", "outcome": "action_requested", "results": results}
     if skipped:
         response["status"] = "partial"
+        response["outcome"] = "partial_action"
         response["unavailable"] = [_home_entity_view(item) for item in skipped]
+    desired = "off" if action == "turn_off" else "on" if action == "turn_on" else None
+    if desired:
+        try:
+            latest = await _home_assistant_get("/api/states")
+            states = {str(item.get("entity_id")): str(item.get("state")) for item in latest if isinstance(item, dict)}
+            checked = [entity_id for group in by_domain.values() for entity_id in group]
+            response["verified"] = bool(checked) and all(states.get(entity_id) == desired for entity_id in checked)
+            response["verified_states"] = {entity_id: states.get(entity_id, "unknown") for entity_id in checked}
+            if response["verified"]:
+                response["outcome"] = "verified_success"
+        except Exception:
+            response["verified"] = False
     return response
 
 
@@ -3405,8 +3450,8 @@ REGISTRY = [
     ("torbox_status", "Get sanitized Torbox client state.", "read", "torbox", {}, torbox_status),
     ("overseerr_status", "Get Overseerr service status.", "read", "overseerr", {}, overseerr_status),
     ("overseerr_recent_requests", "Get recent Overseerr request records without exposing credentials.", "read", "overseerr", {}, overseerr_recent_requests),
-    ("web_search", "Search the public internet through the private SearXNG backend.", "read", "internet", {"query": {"type": "string", "required": True}}, web_search),
-    ("web_fetch", "Fetch a public webpage as untrusted reference text; internal and private targets are blocked.", "read", "internet", {"url": {"type": "string", "required": True}}, web_fetch),
+    ("web_search", "Search the public internet through SearXNG. For research, vary queries and use max_results/recency_days/search_type as needed; search results are discovery evidence.", "read", "internet", {"query": {"type": "string", "required": True}, "max_results": {"type": "integer"}, "recency_days": {"type": "integer"}, "domains": {"type": "array"}, "search_type": {"type": "string"}}, web_search),
+    ("web_fetch", "Fetch a public webpage as untrusted evidence. Use max_chars and extract=article for substantial source text; failed sources should be skipped.", "read", "internet", {"url": {"type": "string", "required": True}, "max_chars": {"type": "integer"}, "extract": {"type": "string"}}, web_fetch),
     ("weather_forecast", "Get current conditions or a daily forecast for an explicitly named city or configured home location.", "read", "weather", {"location": {"type": "string"}, "days_from_now": {"type": "integer"}}, weather_forecast),
     ("calculator", "Evaluate a numeric arithmetic expression deterministically.", "read", "utility", {"expression": {"type": "string", "required": True}}, calculator),
     ("unit_convert", "Convert supported storage and temperature units deterministically.", "read", "utility", {"value": {"type": "number", "required": True}, "from_unit": {"type": "string", "required": True}, "to_unit": {"type": "string", "required": True}}, unit_convert),
@@ -3634,7 +3679,8 @@ async def invoke(req: Invoke):
     except asyncio.TimeoutError:
         status, result = "timeout", {"error": f"{service} tool timed out", "error_code": "TIMEOUT", "retryable": True, "evidence_available": False}
     except httpx.HTTPStatusError as exc:
-        status, result = "unavailable", {"error": f"{service} API returned HTTP {exc.response.status_code}", "error_code": "BACKEND_UNAVAILABLE", "http_status": exc.response.status_code, "retryable": True, "evidence_available": False}
+        detail = exc.response.text[:500] if exc.response is not None else ""
+        status, result = "unavailable", {"error": f"{service} API returned HTTP {exc.response.status_code}", "error_code": "BACKEND_UNAVAILABLE", "http_status": exc.response.status_code, "detail": detail, "retryable": True, "evidence_available": False}
     except Exception as exc:
         status, result = "error", {"error": f"{service} tool failed", "error_code": "EXECUTION_FAILED", "detail": type(exc).__name__, "retryable": False, "evidence_available": False}
     finally:
