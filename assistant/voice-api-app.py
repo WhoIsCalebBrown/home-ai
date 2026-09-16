@@ -1105,6 +1105,8 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
         return None
     item = items[-1]
     result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    if result.get("current_state") == "NO_TITLE_GIVEN":
+        return result.get("message") or "I didn't catch a specific title -- what would you like me to look for?"
     if item.get("status") != "ok":
         reason = str(result.get("reason") or result.get("error") or result.get("status") or "").upper()
         if result.get("ambiguous") or "AMBIGUOUS" in reason or "IDENTITY" in reason:
@@ -1125,6 +1127,13 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
                     candidate = candidates[0]
                     return f"I found {labels[0]}, but it is a TV series rather than a movie. Do you want that series?"
                 return "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
+        # A genuinely empty candidate list (as opposed to an ambiguous tie)
+        # means the lookup ran and found nothing at all -- say so truthfully
+        # instead of the generic "not confident" dead-end.
+        if not result.get("ambiguous"):
+            searched_title = (result.get("goal") or {}).get("title_query")
+            if searched_title:
+                return f"I couldn't find anything called '{searched_title}'."
         return "I couldn't identify a confident media match without changing anything."
     # Only plans with an explicit bounded write are actionable.  This keeps
     # planner/read results from being mistaken for an accepted request.
@@ -1698,6 +1707,29 @@ def deterministic_plan(text: str) -> list[tuple[str, dict]]:
     return []
 
 
+# Mirrors the classifier of the same name in tools/server-tools-app.py
+# (separate process/service, so the vocabulary is duplicated rather than
+# imported) -- judges whether an utterance names a specific media item versus
+# asking a browse/count-shaped question about a whole category ("do I have
+# any movies", "what's in my library"). Same discipline as the
+# UnresolvedSubject grammar: judge by SHAPE, not by matching one literal
+# phrase.
+_MEDIA_CATEGORY_WORDS = {"movie", "movies", "film", "films", "show", "shows", "series", "tv",
+                         "episode", "episodes", "season", "seasons", "album", "albums", "music",
+                         "song", "songs", "track", "tracks", "library", "libraries", "anime"}
+_MEDIA_QUESTION_SCAFFOLDING = {"do", "does", "did", "i", "have", "has", "any", "some", "what",
+                               "what's", "whats", "which", "how", "many", "show", "me", "my", "in",
+                               "on", "is", "are", "of", "the", "a", "an", "to", "for", "your",
+                               "server", "plex", "got", "get", "give", "grab", "find", "add",
+                               "request", "want", "put", "can", "could", "would", "you", "please",
+                               "there"}
+
+
+def _media_title_candidate_words(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9']+", text.casefold())
+    return [t for t in tokens if t not in _MEDIA_QUESTION_SCAFFOLDING and t not in _MEDIA_CATEGORY_WORDS]
+
+
 def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, dict]]:
     routed_text = routing_aliases(text)
     t = routed_text.lower()
@@ -1943,7 +1975,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         plan.append(("get_storage_status", {}))
     if re.search(r"\b(gpu|vram|3070|1660|graphics|video card)\b", t): plan.append(("get_gpu_status", {}))
     if re.search(r"\b(container|containers|docker|service|services|server health)\b", t): plan.append(("list_containers", {}))
-    if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t): plan.append(("plex_library_counts" if re.search(r"\bhow many|counts?|libraries\b", t) else "plex_search", {"query": plex_query_from_speech(text)} if not re.search(r"\bhow many|counts?|libraries\b", t) else {}))
+    if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t):
+        browse_shaped = bool(re.search(r"\bhow many|counts?|libraries\b", t)) or not _media_title_candidate_words(plex_query_from_speech(text))
+        plan.append(("plex_library_counts", {}) if browse_shaped else ("plex_search", {"query": plex_query_from_speech(text)}))
     if front_door_presence_question(text) or re.search(r"\b(front door|camera|detection|motion|alert|alerts|last thing detected|what happened)\b", t):
         plan.append(("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 10}))
     elif re.search(r"\b(camera|cameras|garage|frigate|person)\b", t):
