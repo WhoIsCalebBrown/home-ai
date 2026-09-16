@@ -1,6 +1,7 @@
 import asyncio
 import ast
 import base64
+import difflib
 import contextvars
 import html
 import hashlib
@@ -724,6 +725,58 @@ def _evaluate_plex_candidate(candidate: dict[str, Any], requested: dict[str, Any
     if requested.get("year") is not None and candidate.get("year") != requested.get("year"):
         return {**candidate, "rejected_reason": "year_mismatch"}
     return {**candidate, "match_method": "title_year", "confidence": 0.85}
+
+
+# Query-drift guardrail (generic, not per-title). A resolved candidate's
+# title is compared against what the user actually said BEFORE accepting it
+# as canonical_identity, so a search-string extraction quirk elsewhere
+# (like the "the movie The Room" -> "Room" bug this was built to prevent a
+# recurrence of, class of bug, not that specific instance -- that instance
+# is separately fixed at the source in _media_goal_parts) can never again
+# silently resolve to the wrong media item. Threshold chosen empirically
+# against a small corpus (see tools/test_media_goal_title_extraction.py):
+# 0.7 catches "The Room"/"Room" (0.667) and "Moon"/"Moonlight" (0.615, a
+# real distinct-film pair that deserves a clarifying question) while
+# passing legitimate near-matches like "Interstellar"/"Interstellar (2014)"
+# and "Blade Runner"/"Blade Runner 2049" (both 0.828).
+QUERY_DRIFT_SIMILARITY_THRESHOLD = 0.7
+
+
+def _strip_bare_year(value: str) -> str:
+    """A bare year mentioned alongside a title ("Dune 2021") is not part of
+    the title itself for similarity purposes -- _media_goal_parts only
+    strips a year when it appears in an explicit "from/in YYYY" or "(YYYY)"
+    phrase, so a bare adjacent year would otherwise make a perfectly
+    legitimate "Title YEAR" request look artificially dissimilar from a
+    resolved candidate's bare title and produce a false-positive drift
+    trigger."""
+    return re.sub(r"\b(19|20)\d{2}\b", "", value)
+
+
+def _title_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize_identity_title(_strip_bare_year(a)), _normalize_identity_title(_strip_bare_year(b))).ratio()
+
+
+def _query_drift_check_skipped(args: dict[str, Any], requested_year: int | None, matches: list[dict[str, Any]]) -> bool:
+    """Skip conditions (spec item #3):
+    (a) the caller already supplied a hard canonical external ID (an
+        already-established ResolvedSubject/CanonicalIdentity being
+        reused, or a user-pasted ID) -- unambiguous by construction;
+    (b) exactly one candidate came back from a search where the user
+        explicitly gave a year and that year was used to filter matches --
+        a full title+year-filtered singleton is strong evidence on its own.
+    """
+    if any(args.get(key) for key in ("canonical_external_id", "tmdb_id", "tvdb_id", "imdb_id")):
+        return True
+    if requested_year is not None and len(matches) == 1:
+        return True
+    return False
+
+
+def _query_drift_detected(title_hint: str, candidate_title: str | None) -> bool:
+    if not title_hint or not candidate_title:
+        return False
+    return _title_similarity(title_hint, candidate_title) < QUERY_DRIFT_SIMILARITY_THRESHOLD
 
 
 async def plex_match_canonical_media(args: dict[str, Any]) -> dict[str, Any]:
@@ -1755,6 +1808,13 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     elif episode_match:
         title = episode_match.group(2).strip(" .?!")
     title = re.sub(r"\s+and\s+keep(?:\s+it)?\s+permanently\s*$", "", title, flags=re.I).strip(" .?!")
+    # Captured BEFORE the classifier-word-stripping regex below runs, so
+    # callers have the closest available approximation of what the user
+    # actually said the title was (after only request-framing/politeness
+    # stripping, before any word-level cleanup that could itself introduce
+    # drift) -- this is what the query-drift guardrail compares a resolved
+    # candidate's title against.
+    title_hint = title
     if kind in {"movie", "tv", "anime"}:
         # "the" must only be stripped as REQUEST FRAMING ("the movie X", "the
         # whole series") -- stripping it as a bare standalone word destroyed
@@ -1767,7 +1827,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
-    return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
+    return {"raw_goal": text, "media_type": kind, "title_query": title, "title_hint": title_hint, "artist_query": artist,
             "action": "ensure_available" if re.search(r"\b(get|give|grab|find|add|request|want|put)\b", lowered) else "inspect",
             "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope,
             "requested_year": requested_year}
@@ -1814,6 +1874,13 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         lookup = await lidarr_search_album({"query": " ".join(x for x in (title, artist) if x)})
         matches = lookup.get("matches", [])
         identity, ambiguous = _pick_match(matches, title, artist)
+        if (identity and not ambiguous and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
+                and _query_drift_detected(parts["title_hint"], identity.get("title"))):
+            ambiguous = True
+            plan["candidates"] = [{"title": identity.get("title"), "year": str(identity.get("release_date", ""))[:4] or None,
+                                    "media_type": "album", "foreign_album_id": identity.get("foreign_album_id")}]
+            plan["ambiguity_reason"] = "QUERY_DRIFT"
+            identity = None
         plan["steps"].append({"capability": "media.identify", "owner": "lidarr", "reason": "canonical album identity required"})
         if identity:
             plan["canonical_identity"] = build_canonical_identity(
@@ -1858,6 +1925,13 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                                        "media_type": "tv", "tmdb_id": tv_match.get("tmdbId"), "tvdb_id": tv_match.get("tvdbId")}]
                 plan["ambiguity_reason"] = "CROSS_DOMAIN_CANDIDATE"
                 ambiguous = True
+        if (identity and not ambiguous and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
+                and _query_drift_detected(parts["title_hint"], identity.get("title"))):
+            ambiguous = True
+            plan["candidates"] = [{"title": identity.get("title"), "year": identity.get("year"),
+                                    "media_type": "movie", "tmdb_id": identity.get("tmdbId")}]
+            plan["ambiguity_reason"] = "QUERY_DRIFT"
+            identity = None
         plan["steps"].append({"capability": "media.identify", "owner": "radarr", "reason": "canonical movie identity required"})
         if identity:
             plan["canonical_identity"] = build_canonical_identity(
@@ -1890,6 +1964,13 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                          or any(str(genre).casefold() == "anime" for genre in (identity.get("genres") or []))):
             kind = "anime"
             parts["media_type"] = "anime"
+        if (identity and not ambiguous and not _query_drift_check_skipped(args, parts.get("requested_year"), matches)
+                and _query_drift_detected(parts["title_hint"], identity.get("title"))):
+            ambiguous = True
+            plan["candidates"] = [{"title": identity.get("title"), "year": identity.get("year"),
+                                    "media_type": kind, "tmdb_id": identity.get("tmdbId"), "tvdb_id": identity.get("tvdbId")}]
+            plan["ambiguity_reason"] = "QUERY_DRIFT"
+            identity = None
         plan["steps"].append({"capability": "media.identify", "owner": "sonarr", "reason": "canonical series identity required"})
         if identity:
             plan["canonical_identity"] = build_canonical_identity(
