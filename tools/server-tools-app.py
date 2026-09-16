@@ -1827,8 +1827,25 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     if year_match:
         requested_year = int(year_match.group(1))
     by_match = re.search(r"\b(.+?)\s+by\s+(.+?)(?:[.!?]|$)", text, re.I)
+    # A trailing ", NAME" clause is the same creator/cast hint as "by NAME"
+    # in a different, comma-separated phrasing ("The Room, Tommy Wiseau.").
+    # Only treated as a hint when the trailing segment is short and contains
+    # no digits or media-structure words (season/part/vol/...) that would
+    # mean it is actually part of the title itself, not a separate name.
+    comma_match = None
+    if not by_match:
+        candidate = re.search(r"^(.+?),\s*([^,]+?)\s*[.!?]*$", text)
+        if candidate:
+            trailing = candidate.group(2)
+            trailing_words = trailing.split()
+            if (1 <= len(trailing_words) <= 4
+                    and not re.search(r"\d", trailing)
+                    and not re.search(r"\b(?:movie|show|series|season|episode|anime|album|film|version|part|vol|volume)\b", trailing, re.I)):
+                comma_match = candidate
     if by_match:
         title, artist = by_match.group(1), by_match.group(2)
+    elif comma_match:
+        title, artist = comma_match.group(1), comma_match.group(2)
     # Strip polite request framing before identity lookup.  Keep the raw goal
     # unchanged for audit/history, but do not send "Can you get me the movie"
     # as part of the title query to Radarr.

@@ -28,6 +28,27 @@ def test_enrich_never_overwrites_with_empty_value():
     assert enriched.hints == {"media_type": "movie", "year": 2003}
 
 
+def test_enrich_replaces_title_when_a_fresh_one_is_given():
+    """Real production bug: a follow-up that restates a real new title
+    ("Can you give me the movie The Room by Tommy Wiseau?") was merged as a
+    year/type hint on top of a stale, unrelated title instead of replacing
+    it. enrich() must replace title_or_name when given one."""
+    subject = UnresolvedSubject.new("media", "Garbled Old Sentence", media_type="movie")
+    enriched = subject.enrich(title_or_name="The Room by Tommy Wiseau", media_type="movie")
+    assert enriched.title_or_name == "The Room by Tommy Wiseau"
+    assert "Garbled Old Sentence" not in enriched.resolution_goal_text()
+
+
+def test_enrich_without_a_fresh_title_keeps_the_existing_one():
+    """A bare refinement ("2003.") must still merge onto the existing
+    title, not clear it -- enrich(title_or_name=None) is the same as
+    omitting it entirely."""
+    subject = UnresolvedSubject.new("media", "The Room", media_type="movie")
+    enriched = subject.enrich(title_or_name=None, year=2003)
+    assert enriched.title_or_name == "The Room"
+    assert enriched.hints == {"media_type": "movie", "year": 2003}
+
+
 def test_with_failed_attempt_increments_counter_and_preserves_hints():
     subject = UnresolvedSubject.new("media", "The Room", media_type="movie")
     failed_once = subject.with_failed_attempt()

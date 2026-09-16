@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -64,6 +64,8 @@ media_title_status_signal = namespace["media_title_status_signal"]
 retained_media_status_repair = namespace["retained_media_status_repair"]
 media_status_display_title = namespace["media_status_display_title"]
 plex_query_from_speech = namespace["plex_query_from_speech"]
+guess_media_title = namespace["guess_media_title"]
+fresh_title_restatement = namespace["fresh_title_restatement"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -834,6 +836,63 @@ def test_preflight_plan_still_routes_a_real_title_to_plex_search():
     assert plan and plan[0][0] != "plex_library_counts"
     plan2 = preflight_plan("which library is interstellar in")
     assert ("plex_search", {"query": plex_query_from_speech("which library is interstellar in")}) in plan2
+
+
+def test_status_shaped_compound_sentences_are_not_acquisition_goals():
+    """Root cause #2, live production bug: a compound status question that
+    ALSO contains acquisition-flavored words ("request", "get", "put") --
+    "What's the status of the movie The Room did I request it or get it
+    put on my plex server" -- was misclassified as a fresh acquisition goal
+    and sent to media_plan_goal with the entire raw sentence as the literal
+    title. media_status_question() must outrank acquisition language here.
+    Tested generically with several status-shaped phrasings, not just the
+    one live sentence."""
+    status_shaped = [
+        "What's the status of the movie The Room did I request it or get it put on my plex server",
+        "Did I ever request Interstellar",
+        "Is Whiplash on my server or not",
+        "What happened when I asked for Dune",
+    ]
+    for text in status_shaped:
+        assert media_status_question(text), text
+        assert not media_goal_request(text), text
+
+
+def test_status_shaped_sentences_do_not_regress_real_acquisition_requests():
+    """Negative control: broadening media_status_question's word lists must
+    not turn genuine acquisition requests into status questions."""
+    for text in (
+        "Can you request the movie The Room?",
+        "I want to request the movie Interstellar.",
+        "Get me Dumb and Dumber from 1994.",
+        "Can you add Dumb and Dumber from 1994?",
+    ):
+        assert not media_status_question(text), text
+        assert media_goal_request(text), text
+
+
+def test_fresh_title_restatement_recognizes_real_new_titles():
+    """Root cause #1: a full, clean restatement of a title -- even with a
+    leading correction clause or trailing creator hint -- must be
+    recognized as a real title, generically, not per-phrase."""
+    assert fresh_title_restatement("Can you give me the movie The Room by Tommy Wiseau?") == "The Room by Tommy Wiseau"
+    assert fresh_title_restatement("I want to add a movie called The Room.") == "The Room"
+    assert fresh_title_restatement("No, that's not what I mean. I want to add a movie called The Room.") == "The Room"
+    assert fresh_title_restatement("The Room, Tommy Wiseau.") == "The Room, Tommy Wiseau"
+    assert fresh_title_restatement("room.") == "room"
+    assert fresh_title_restatement("Interstellar") == "Interstellar"
+
+
+def test_fresh_title_restatement_rejects_bare_refinements():
+    """Negative control: a bare year/type-only refinement has no title
+    content of its own and must not be treated as a fresh title -- these
+    stay on enrichment_reply_hint's existing merge-only path."""
+    assert fresh_title_restatement("2003.") is None
+    assert fresh_title_restatement("the movie") is None
+    assert fresh_title_restatement("the 2003 one") is None
+    assert fresh_title_restatement("It's a movie from 2003.") is None
+    assert fresh_title_restatement("I mean the one from 2003.") is None
+    assert fresh_title_restatement("Can you request the movie?") is None
 
 
 if __name__ == "__main__":
