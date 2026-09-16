@@ -1555,7 +1555,16 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
         return "media"
     # Infrastructure terms are deliberately checked before visual language such as
     # "see".  "What containers can you see?" is a Docker question, not a camera query.
-    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu)\b", lowered):
+    # "cache"/"space"/"free"/"terabytes"/"gigabytes" match the same
+    # storage-vocabulary preflight_plan's own get_storage_status branch uses
+    # -- without them here, an explicit new storage question ("what's using
+    # up space in the cache?") was not recognized as domain="server", so
+    # retained_media_status_repair's domain-exclusion guard (which only
+    # skips {"web_research","weather","camera","server"}) never fired, and
+    # the question was silently answered as a media-workflow status repair
+    # instead. Real bug found by
+    # test_storage_topic_switch_and_return_to_media_subject.
+    if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server|storage|disk|uptime|ram|cpu|cache|terabytes|gigabytes)\b", lowered) or re.search(r"\bspace\b.{0,20}\b(?:cache|disk|drive|storage|left|free)\b|\b(?:free|left)\b.{0,20}\bspace\b", lowered):
         return "server"
     if re.search(r"\b(weather|forecast|temperature|rain|snow|cold|hot|warm)\b", lowered):
         return "weather"
@@ -1904,7 +1913,15 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if re.search(r"\b(travis|utopia|album|artist|music|import|quarantine|processed|my eyes)\b", t):
         return [("investigate_media_pipeline", {"entity_type": "auto", "query": investigation_query_from_speech(text)})]
     plan = []
-    if re.search(r"\b(storage|stores?|space|room|free|disk|cache|terabytes|gigabytes)\b", t): plan.append(("get_storage_status", {}))
+    # "room" was previously a bare alternative here (intended for "how much
+    # room do I have left" as a storage synonym), but as a standalone word it
+    # collides with any movie/show whose title happens to be or contain
+    # "Room" (e.g. "The Room", "Room (2015)") -- a real production bug found
+    # by test_storage_topic_switch_and_return_to_media_subject, where "a
+    # movie called The Room" triggered get_storage_status purely because of
+    # the word "Room". Only match "room" in an actual storage-shaped phrase.
+    if re.search(r"\b(storage|stores?|space|free|disk|cache|terabytes|gigabytes)\b", t) or re.search(r"\broom\s+(?:left|on|for)\b|\b(?:more|enough|extra)\s+room\b", t):
+        plan.append(("get_storage_status", {}))
     if re.search(r"\b(gpu|vram|3070|1660|graphics|video card)\b", t): plan.append(("get_gpu_status", {}))
     if re.search(r"\b(container|containers|docker|service|services|server health)\b", t): plan.append(("list_containers", {}))
     if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t): plan.append(("plex_library_counts" if re.search(r"\bhow many|counts?|libraries\b", t) else "plex_search", {"query": plex_query_from_speech(text)} if not re.search(r"\bhow many|counts?|libraries\b", t) else {}))

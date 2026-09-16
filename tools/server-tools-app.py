@@ -1696,12 +1696,21 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     mode = "permanent" if re.search(r"\b(?:permanent(?:ly)?|keep)\b", lowered) else "standard"
     kind = media_type
     if not kind:
-        if re.search(r"\b(album|music|song|artist|record|release)\b|\bby\s+[^.]+", lowered):
-            kind = "album"
-        elif re.search(r"\b(anime|series|show|season|episode|kai)\b", lowered):
+        # An explicit movie/tv/anime classifier word must outrank the
+        # generic "by PERSON" album heuristic below -- "The Room by Tommy
+        # Wiseau" has no movie/film word, but neither should a bare "by X"
+        # override an ALREADY-explicit movie/show word elsewhere in the
+        # phrase (e.g. "the movie by that director"). Checking movie/tv/anime
+        # keywords first, and only falling back to "by X" as an album signal
+        # when nothing else classifies, treats a person name as an identity
+        # HINT rather than something that silently redefines the request's
+        # media type.
+        if re.search(r"\b(anime|series|show|season|episode|kai)\b", lowered):
             kind = "anime" if "anime" in lowered else "tv"
         elif re.search(r"\b(movie|film|hobbit)\b", lowered):
             kind = "movie"
+        elif re.search(r"\b(album|music|song|artist|record|release)\b|\bby\s+[^.]+", lowered):
+            kind = "album"
         elif re.search(r"\b(?:from|in)\s+(?:19|20)\d{2}\b", lowered):
             # A year-qualified untyped media request is safely movie-shaped;
             # album/series language has already claimed those branches above.
@@ -1747,7 +1756,15 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title = episode_match.group(2).strip(" .?!")
     title = re.sub(r"\s+and\s+keep(?:\s+it)?\s+permanently\s*$", "", title, flags=re.I).strip(" .?!")
     if kind in {"movie", "tv", "anime"}:
-        title = re.sub(r"\b(?:the|original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
+        # "the" must only be stripped as REQUEST FRAMING ("the movie X", "the
+        # whole series") -- stripping it as a bare standalone word destroyed
+        # a real leading article that is part of the actual title itself
+        # (e.g. "the movie The Room" -> "Room", silently searching for the
+        # wrong film). Only remove "the" when immediately followed by one of
+        # the classifier/scope words below; a "the" anywhere else in the
+        # string (including a title's own leading article) is left alone.
+        title = re.sub(r"\bthe\s+(?=(?:original|animated|version|movie|film|series|show|whole|entire)\b)", "", title, flags=re.I)
+        title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     return {"raw_goal": text, "media_type": kind, "title_query": title, "artist_query": artist,
