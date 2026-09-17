@@ -78,6 +78,28 @@ def test_storage_status_array_and_named_disk(monkeypatch):
     assert missing["found"] is False
 
 
+def test_disks_listing_excludes_virtual_devices_from_fullest_ranking(monkeypatch):
+    # Real production bug found live: "Which disk is fullest?" answered
+    # "The Log disk is fullest at 97.4%" -- true but deeply misleading. Log
+    # is a 128MB tmpfs-backed syslog partition, not a physical disk a user
+    # cares about, and is EXPECTED to run near full. Virtual devices (role
+    # "log"/"docker_vdisk"/"unknown") must never win a fullest-disk ranking
+    # or clutter a real disk-capacity listing.
+    _install_fake_mcp(monkeypatch, {
+        "list_disks": [
+            {"name": "disk1", "role": "data", "status": "DISK_OK", "size_bytes": 1000, "used_bytes": 400},
+            {"name": "cache", "role": "cache", "status": "DISK_OK", "size_bytes": 500, "used_bytes": 300},
+            {"name": "flash", "role": "unknown", "status": "DISK_OK", "size_bytes": 100, "used_bytes": 95},
+            {"name": "Docker vDisk", "role": "docker_vdisk", "status": "DISK_OK", "size_bytes": 200, "used_bytes": 190},
+            {"name": "Log", "role": "log", "status": "DISK_OK", "size_bytes": 128, "used_bytes": 124},
+        ],
+    })
+    result = asyncio.run(module.unraid_storage_status({"target": "disks"}))
+    names = [d["name"] for d in result["disks"]]
+    assert names == ["disk1", "cache"]
+    assert "Log" not in names and "flash" not in names and "Docker vDisk" not in names
+
+
 def test_disk_health_flags_only_real_problems_not_virtual_devices(monkeypatch):
     # Real finding from live inspection: get_health_status reported
     # "warning_disks: 8" while every actual physical disk showed DISK_OK /
@@ -106,6 +128,30 @@ def test_container_status_found_and_not_found(monkeypatch):
 
     empty = asyncio.run(module.unraid_container_status({"container": ""}))
     assert "error" in empty
+
+
+def test_container_status_reports_memory_in_megabytes_below_one_gigabyte(monkeypatch):
+    # Real production bug found live: "How much memory is Home-AI using?"
+    # answered "about 0.13 gigabytes" -- correct but an unnatural spoken
+    # unit. The upstream MCP's own memory_display field is always formatted
+    # in GB regardless of magnitude; reformat from the raw byte fields
+    # ourselves, choosing MB below 1 GB.
+    _install_fake_mcp(monkeypatch, {
+        "get_container_info": {"name": "Home-AI-Assistant", "state": "running", "status": "Up",
+                                "memory_usage_bytes": 147443712, "memory_limit_bytes": 67346886656,
+                                "memory_display": "0.14 GB / 62.72 GB"},
+    })
+    info = asyncio.run(module.unraid_container_status({"container": "Home-AI-Assistant"}))
+    assert info["memory_display"] == "141 MB / 62.72 GB"
+
+    # A container using more than a gigabyte still reports GB.
+    _install_fake_mcp(monkeypatch, {
+        "get_container_info": {"name": "Plex-Media-Server", "state": "running", "status": "Up",
+                                "memory_usage_bytes": 3_350_000_000, "memory_limit_bytes": 67346886656,
+                                "memory_display": "3.12 GB / 62.72 GB"},
+    })
+    info = asyncio.run(module.unraid_container_status({"container": "Plex-Media-Server"}))
+    assert info["memory_display"] == "3.12 GB / 62.72 GB"
 
 
 def test_container_status_falls_back_to_fuzzy_name_match(monkeypatch):

@@ -307,6 +307,28 @@ async def unraid_mcp_call(tool_name: str, arguments: dict[str, Any] | None = Non
             return text
 
 
+# Real production bug found live: "How much memory is Home-AI using?"
+# answered "about 0.13 gigabytes" -- correct but an unnatural unit choice
+# for a live spoken answer. The upstream MCP's own "memory_display" field
+# is always formatted in GB regardless of magnitude ("0.14 GB / 62.72 GB"),
+# and Home-AI's tools were relaying that string verbatim. Reformat from the
+# raw byte fields ourselves, choosing MB below 1 GB, the same way a person
+# would say it.
+def _format_memory_display(usage_bytes: float | None, limit_bytes: float | None) -> str | None:
+    if usage_bytes is None or limit_bytes is None:
+        return None
+    def human(n: float) -> str:
+        # Binary (1024-based) units, matching the upstream MCP's own GB
+        # figure (e.g. 67346886656 bytes -> "62.72 GB") -- a decimal (1e9)
+        # divisor would silently disagree with every GB figure already
+        # shown elsewhere for the same host.
+        gib = n / (1024 ** 3)
+        if gib < 1:
+            return f"{n / (1024 ** 2):.0f} MB"
+        return f"{gib:.2f} GB"
+    return f"{human(usage_bytes)} / {human(limit_bytes)}"
+
+
 def parse_text_or_json_payload(text: str) -> Any:
     """Parse JSON when present, otherwise return a bounded plain-text body."""
     body = text.strip()
@@ -2065,6 +2087,15 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         before = title
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", title, flags=re.I)
+        # Real production bug found live: "Search Sonarr for the show
+        # Breaking Bad" only had "the show" stripped, leaving "Search Sonarr
+        # for Breaking Bad" as the literal query sent to Sonarr's own
+        # lookup -- "search"/"sonarr"/"for" then diluted its fuzzy title
+        # match, returning unrelated results ("Search for the Truth", "Star
+        # Wars: The Bad Batch") ranked ahead of the real exact "Breaking
+        # Bad" match. "Search <service> for" is request framing, not part
+        # of any real title.
+        title = re.sub(r"^\s*search\s+(?:sonarr|radarr|lidarr|plex)?\s*for\s+", "", title, flags=re.I)
         if title == before:
             break
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
@@ -3521,6 +3552,19 @@ async def home_activate_scene(args: dict[str, Any]) -> dict[str, Any]:
 # than guessed at here.
 # ---------------------------------------------------------------------------
 
+# Real production bug found live: "Which disk is fullest?" answered "The
+# Log disk is fullest at 97.4%" -- true but deeply misleading. "Log" is a
+# 128MB tmpfs-backed syslog partition (list_disks role "log"), not a
+# physical storage disk a user cares about; it is EXPECTED to run near
+# full and rotates automatically. Same virtual-device class already
+# excluded from health flagging in unraid_disk_health's own comment
+# ("Docker vDisk, Log, flash boot device never report a real SMART
+# status"). A "which disk is fullest"/"list disks" capacity question means
+# real, physical, user-fillable storage -- exclude these by role so they
+# cannot win a fullest-disk ranking or clutter a disk listing.
+_VIRTUAL_DISK_ROLES = {"unknown", "docker_vdisk", "log"}
+
+
 async def unraid_storage_status(args: dict[str, Any]) -> dict[str, Any]:
     target = str(args.get("target") or "array").strip().casefold()
     if target in {"array", ""}:
@@ -3537,7 +3581,8 @@ async def unraid_storage_status(args: dict[str, Any]) -> dict[str, Any]:
             {"name": d.get("name"), "role": d.get("role"), "status": d.get("status"),
              "used_bytes": d.get("used_bytes"), "free_bytes": d.get("free_bytes"), "total_bytes": d.get("size_bytes"),
              "used_percent": round(100 * d["used_bytes"] / d["size_bytes"], 1) if d.get("size_bytes") else None}
-            for d in disks if d.get("size_bytes")
+            for d in disks
+            if d.get("size_bytes") and str(d.get("role", "")).casefold() not in _VIRTUAL_DISK_ROLES
         ]}
     match = next((d for d in disks if str(d.get("name", "")).casefold() == target), None)
     if not match:
@@ -3609,7 +3654,8 @@ async def unraid_container_status(args: dict[str, Any]) -> dict[str, Any]:
     return {"found": True, "name": info.get("name"), "state": info.get("state"), "status": info.get("status"),
             "image": info.get("image"), "network_mode": info.get("network_mode"), "ip_address": info.get("ip_address"),
             "ports": info.get("port_mappings") or info.get("ports"), "cpu_percent": info.get("cpu_percent"),
-            "memory_display": info.get("memory_display"), "memory_percent": info.get("memory_percent")}
+            "memory_display": _format_memory_display(info.get("memory_usage_bytes"), info.get("memory_limit_bytes")) or info.get("memory_display"),
+            "memory_percent": info.get("memory_percent")}
 
 
 async def unraid_container_metrics(args: dict[str, Any]) -> dict[str, Any]:
@@ -3623,7 +3669,8 @@ async def unraid_container_metrics(args: dict[str, Any]) -> dict[str, Any]:
     unhealthy = [c.get("name") for c in containers if "unhealthy" in str(c.get("status", "")).casefold()]
     return {"sort_by": "memory" if sort_by == "memory" else "cpu", "running_count": len(containers),
             "unhealthy_containers": unhealthy,
-            "top": [{"name": c.get("name"), "cpu_percent": c.get("cpu_percent"), "memory_display": c.get("memory_display"),
+            "top": [{"name": c.get("name"), "cpu_percent": c.get("cpu_percent"),
+                     "memory_display": _format_memory_display(c.get("memory_usage_bytes"), c.get("memory_limit_bytes")) or c.get("memory_display"),
                      "memory_percent": c.get("memory_percent"), "network_mode": c.get("network_mode")} for c in ranked]}
 
 

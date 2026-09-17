@@ -1041,7 +1041,20 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
     if dynamic_fact_question(user_text) and not any(item.get("status") == "ok" for item in results):
         return unavailable_live_answer(user_text)
     if any(item.get("tool") in {"investigate_downloads", "investigate_media_pipeline"} for item in results):
-        dynamic_words = ("failed", "failure", "expired", "certificate", "ssl", "quarantined", "completed", "downloading", "successfully", "stalled", "missing")
+        # Real production bug found live: "Is my Sonarr queue empty right
+        # now?" -- a perfectly accurate, non-fabricated answer ("24 items,
+        # but none appear to be actively downloading right now", since
+        # every item's status was literally "completed") was rejected
+        # purely because the generic topical word "downloading" never
+        # appears verbatim in Sonarr's own status vocabulary
+        # ("completed"/"paused"/"queued"). "downloading" describes the
+        # general subject of this whole investigation (its own tool name
+        # is "investigate_downloads") and is essentially guaranteed to
+        # appear in any reasonable synthesis about a download queue --
+        # unlike the remaining words below, which are specific technical
+        # claims a model could plausibly fabricate, "downloading" is not a
+        # reliable fabrication signal and was removed.
+        dynamic_words = ("failed", "failure", "expired", "certificate", "ssl", "quarantined", "completed", "successfully", "stalled", "missing")
         unsupported = [word for word in dynamic_words if re.search(rf"\b{word}\b", answer.casefold()) and word not in evidence]
         numeric_claims = re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", answer)
         if unsupported or any(number not in evidence for number in numeric_claims):
@@ -2380,7 +2393,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("unraid_disk_health", {})]
     if re.search(r"\bcontainers?\b", t) and re.search(r"\b(unhealthy|most ram|most cpu|most memory)\b", t):
         return [("unraid_container_metrics", {})]
-    if re.search(r"\b(server|system)\b", t) and re.search(r"\b(status|health|healthy|wrong|ok\b|okay)\b", t):
+    if re.search(r"\b(server|system)\b", t) and re.search(r"\b(status|health|healthy|wrong|ok\b|okay|overview|summary)\b", t):
         return [("unraid_system_health", {})]
     # "Is Plex running?"/"How long has Plex been running?"/"How much memory
     # is Home-AI using?" all name a real container but never say the literal

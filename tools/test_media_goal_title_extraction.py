@@ -51,6 +51,20 @@ def test_leading_article_survives_various_phrasings():
         assert _media_goal_parts(goal, None)["title_query"] == expected, goal
 
 
+def test_search_service_for_scaffolding_is_stripped_from_the_title_query():
+    # Real production bug found live: "Search Sonarr for the show Breaking
+    # Bad" only had "the show" stripped by the classifier-word cleanup,
+    # leaving "Search Sonarr for Breaking Bad" as the literal query sent to
+    # Sonarr's own lookup -- "search"/"sonarr"/"for" then diluted its fuzzy
+    # title match, returning unrelated results ("Search for the Truth",
+    # "Star Wars: The Bad Batch") ranked ahead of the real exact "Breaking
+    # Bad" match. "Search <service> for" is request framing, never part of
+    # a real title.
+    assert _media_goal_parts("Search Sonarr for the show Breaking Bad", None)["title_query"] == "Breaking Bad"
+    assert _media_goal_parts("Search Radarr for the movie Inception", None)["title_query"] == "Inception"
+    assert _media_goal_parts("Search Lidarr for Rodeo by Travis Scott", None)["title_query"] == "Rodeo"
+
+
 def test_similarly_named_titles_are_never_conflated_by_normalization():
     """Spec item #5: "The Room", "Room", "A Room", "Room 104", "The
     Roommate", "Room (2015)" must never collapse into the same normalized

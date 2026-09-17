@@ -842,6 +842,15 @@ def test_unraid_storage_and_health_questions_resolve_deterministically():
     assert preflight_plan("Are any containers unhealthy?") == [("unraid_container_metrics", {})]
     assert preflight_plan("Give me a quick server status.") == [("unraid_system_health", {})]
     assert preflight_plan("Is anything wrong with the server?") == [("unraid_system_health", {})]
+    # Real production bug found live: "Give me a quick server overview."
+    # scored get_server_overview (15.47) and unraid_system_health (12.97)
+    # too close together for high_confidence_auto_dispatch's 5.0-margin
+    # threshold, leaving the choice to Qwen -- which then ignored BOTH
+    # sensible candidates and called media_plan_goal instead, resolving to
+    # unrelated cartoon titles ("Quick Draw McGraw"). "overview"/"summary"
+    # are the same request shape as "status"/"health" for this deterministic
+    # route -- must not depend on Qwen's tool choice at all.
+    assert preflight_plan("Give me a quick server overview.") == [("unraid_system_health", {})]
     # A true storage-BREAKDOWN question (what's consuming the space) is a
     # different shape unraid_storage_status cannot answer (see
     # capability-gap.md) and must fall through to the existing tested path,
@@ -923,6 +932,26 @@ def test_investigate_downloads_request_is_not_swallowed_by_generic_service_catch
     # broad multi-service correlation tool.
     assert preflight_plan("Investigate my downloads across all services.") == [("investigate_downloads", {})]
     assert preflight_plan("Any active Soulseek downloads?") == []
+
+
+def test_sonarr_queue_answer_is_not_rejected_for_the_generic_word_downloading():
+    # Real production bug found live: "Is my Sonarr queue empty right now?"
+    # -- a perfectly accurate answer, since every queue item's status was
+    # literally "completed" -- was rejected by the unsupported-claim guard
+    # purely because the generic topical word "downloading" never appears
+    # verbatim in Sonarr's own status vocabulary. "downloading" describes
+    # the whole investigation's own subject (investigate_downloads) and is
+    # not a reliable fabrication signal like the other dynamic_words.
+    results = [{"tool": "investigate_downloads", "status": "ok", "result": {
+        "investigation": "downloads", "sources_checked": ["sonarr"],
+        "sources": {"sonarr": {"service": "sonarr", "total": 24, "items": [
+            {"title": "x", "status": "completed", "sizeleft": 0, "protocol": "torrent"}]}},
+    }}]
+    answer = "Your Sonarr queue currently has 24 items, but none appear to be actively downloading right now."
+    assert evidence_supported_answer(answer, "Is my Sonarr queue empty right now?", results) == answer
+    # A genuinely unsupported specific technical claim must still be rejected.
+    fabricated = "Your Sonarr queue has a certificate error and 3 quarantined items."
+    assert evidence_supported_answer(fabricated, "Is my Sonarr queue empty right now?", results) != fabricated
 
 
 def test_frigate_stats_request_outranks_the_recent_events_catch_all():
