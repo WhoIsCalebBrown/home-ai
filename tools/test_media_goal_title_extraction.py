@@ -76,6 +76,19 @@ def test_naive_user_request_phrasings_strip_cleanly_to_a_bare_title():
     assert _media_goal_parts("Am I able to watch Arcane?", None)["title_query"] == "Arcane"
 
 
+def test_status_question_framing_strips_cleanly_for_the_identification_fallback():
+    # Real production bug found live: "What's the status of Arcane?" never
+    # resolved an identity at all -- media_status's live-identification
+    # fallback (for a title never formally requested through Home-AI)
+    # calls THIS SAME parser to identify the title, and it had no pattern
+    # for a status-question frame, so the literal string "What's the
+    # status of Arcane" was sent to Sonarr's own lookup and found nothing.
+    # This parser now backs status questions as well as acquisition
+    # requests.
+    assert _media_goal_parts("What's the status of Arcane?", None)["title_query"] == "Arcane"
+    assert _media_goal_parts("What is going on with Silo?", None)["title_query"] == "Silo"
+
+
 def test_ampersand_and_and_are_treated_as_the_same_connecting_word():
     # Real production bug found live: "I want to watch Deadpool and
     # Wolverine" failed to resolve as an exact match against Radarr's own

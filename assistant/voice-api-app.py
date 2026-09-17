@@ -2017,6 +2017,19 @@ def media_status_display_title(result: dict, user_text: str) -> str:
     # never built to cover, in either word order ("I already request X" or
     # bare "X ... ever requested").
     query = re.sub(r"^\s*(?:i|we)\s+(?:already\s+)?(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\s+", "", query, flags=re.I)
+    # Real production bug found live: "What's the status of Arcane?" (after
+    # the leading "what's" strip above leaves "the status of Arcane")
+    # displayed as "I don't have a tracked request for the yet." -- the
+    # generic status-word truncation below removes everything from
+    # "status" TO THE END OF THE STRING, assuming the status word comes
+    # last ("the movie X doing" -> strip " doing" -> keep "the movie X"),
+    # but "status OF X" has the status word in the MIDDLE with the title
+    # AFTER it, so it stripped " status of Arcane" entirely and kept only
+    # "the". Extract the real subject from "status of X" before that
+    # generic truncation ever runs.
+    status_of = re.search(r"^\s*(?:the\s+)?status\s+of\s+(?:the\s+|my\s+|our\s+)?(.+?)\s*$", query, flags=re.I)
+    if status_of:
+        query = status_of.group(1)
     query = re.sub(r"\s+(?:doing|going|ready|found|find|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|in\s+plex|import(?:ed)?|there\s+yet|status|progress|watch|pipeline)\b.*$", "", query, flags=re.I)
     query = re.sub(r"\s+(?:already|yet)\s*$", "", query, flags=re.I)
     query = re.sub(r"\s+ever\s+requested\s*$", "", query, flags=re.I)

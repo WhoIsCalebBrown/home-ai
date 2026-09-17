@@ -1432,6 +1432,21 @@ def test_status_of_bare_title_is_recognized_with_no_media_noun_or_referent():
     assert preflight_plan("What's the status of Arcane?") == [("media_status", {"query": "What's the status of Arcane?"})]
 
 
+def test_status_display_title_extracts_the_real_subject_not_a_stray_article():
+    # Same root-cause bug class as media_title_status_signal above, found
+    # in a SEPARATE function: after "media_status" now actually gets
+    # called for "What's the status of Arcane?" (see the fix above), a
+    # genuinely-not-found result displayed "I don't have a tracked
+    # request for the yet." -- media_status_display_title's own generic
+    # status-word truncation removes everything from "status" TO THE END
+    # of the string, again assuming the status word comes last, again
+    # discarding "of Arcane" and keeping only "the".
+    assert media_status_display_title({}, "What's the status of Arcane?") == "Arcane"
+    assert media_status_display_title({}, "What is the status of my Silo request?") == "Silo request"
+    # Existing regressions this fix must not disturb.
+    assert media_status_display_title({}, "Did I already request Interstellar?") == "Interstellar"
+
+
 def test_descriptive_media_clue_excludes_imperative_verb_plus_service_name():
     """Regression: a bare two-capitalized-word shape alone is not enough
     signal for a person mention -- "Restart Lidarr" must not be mistaken

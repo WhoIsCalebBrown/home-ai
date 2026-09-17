@@ -2096,6 +2096,17 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         # class as "can you"/"want", just with the "I" pronoun and "watch"
         # verb.
         title = re.sub(r"^\s*(?:can\s+i\s+watch|am\s+i\s+able\s+to\s+watch)\s+", "", title, flags=re.I)
+        # Real production bug found live: "What's the status of Arcane?"
+        # never resolved because media_status's live-identification
+        # fallback (added for a title never formally requested through
+        # Home-AI) calls this SAME parser to identify the title, and it had
+        # no pattern for a status-question frame at all -- the literal
+        # string "What's the status of Arcane" was sent to Sonarr's own
+        # lookup, which found nothing. This parser now backs status
+        # questions as well as acquisition requests, so status-question
+        # framing needs stripping here too, the same as request framing.
+        title = re.sub(r"^\s*(?:what(?:'s|\s+is)|how(?:'s|\s+is))\s+(?:the\s+)?status\s+of\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*what(?:'s|\s+is)\s+going\s+on\s+with\s+", "", title, flags=re.I)
         # Real production bug found live: "I want to watch Deadpool and
         # Wolverine" only had "I want" stripped (the request-verb regex
         # above requires the verb be directly followed by the title, not an
