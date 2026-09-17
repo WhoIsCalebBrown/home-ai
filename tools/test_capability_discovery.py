@@ -359,9 +359,13 @@ def test_enabled_executor_revalidates_provider_before_using_stale_active_state(m
     module._save_media_workflows([{
         "workflow_id": args["workflow_id"], "media_type": "movie", "mode": "standard",
         "canonical_identity": plan["canonical_identity"], "current_state": "SEARCHING",
-        "plan_version_hash": record["plan_version_hash"], "confirmation_id": record["confirmation_id"],
-        "confirmation_status": "PENDING",
-    }])
+            "plan_version_hash": record["plan_version_hash"], "confirmation_id": record["confirmation_id"],
+            "confirmation_status": "PENDING",
+            "pending_confirmations": [{
+                key: record.get(key)
+                for key in ("confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at", "status")
+            }],
+        }])
     args["confirmation_context"] = record
     monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {
         "matched": True, "rows": [{"state": "Wanted", "tmdb_id": 8467, "type": "movie"}]

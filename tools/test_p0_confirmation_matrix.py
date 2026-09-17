@@ -113,8 +113,9 @@ async def test_matrix_b_identical_prompts_confirm_only_b(harness):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
-    "cross_session", "tamper_plan", "tamper_args", "consumed", "expired",
-    "cancelled", "legacy", "missing_identity", "forged_identity",
+    "cross_session", "tamper_plan", "tamper_args", "tamper_args_rehashed",
+    "expiry_extended", "consumed", "expired", "cancelled", "legacy",
+    "legacy_singleton", "missing_identity", "forged_identity",
 ])
 async def test_matrix_negative_cases_never_execute(harness, case):
     mod, calls = harness
@@ -129,6 +130,11 @@ async def test_matrix_negative_cases_never_execute(harness, case):
         current["canonical_external_id"] = 999
     elif case == "tamper_args":
         current["canonical_title"] = "Other Movie"
+    elif case == "tamper_args_rehashed":
+        current["season_scope"] = [2]
+        binding["arguments_hash"] = mod._standard_binding_hash(current)
+    elif case == "expiry_extended":
+        binding["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     elif case == "consumed" or case == "cancelled":
         binding["status"] = "CONSUMED" if case == "consumed" else "CANCELLED"
     elif case == "expired":
@@ -136,6 +142,11 @@ async def test_matrix_negative_cases_never_execute(harness, case):
     elif case == "legacy":
         current["session_id"] = "legacy:old-client"
         binding["session_id"] = "legacy:old-client"
+    elif case == "legacy_singleton":
+        rows = mod._media_workflows()
+        workflow = next(row for row in rows if row["workflow_id"] == plan["workflow_id"])
+        workflow.pop("pending_confirmations", None)
+        mod._save_media_workflows(rows)
     elif case == "missing_identity":
         current["session_id"] = ""
     current["confirmation_context"] = binding
@@ -158,6 +169,68 @@ async def test_matrix_replay_and_concurrent_approvals_at_most_once(harness):
     row = next(r for r in mod._media_workflows() if r["workflow_id"] == plan["workflow_id"])
     assert row["confirmation_status"] in {"CONSUMED", "SUBMITTING"}
     assert row["qa_execution_count"] == 1
+    statuses = [item.get("status") for item in row["pending_confirmations"]]
+    assert statuses.count("CONSUMED") == 1
+
+
+@pytest.mark.asyncio
+async def test_matrix_interleaved_confirmations_cannot_restore_stale_pending_state(harness):
+    mod, calls = harness
+    plan_a = await _plan(mod, "openwebui:user:chat-a")
+    plan_b = await _plan(mod, "openwebui:user:chat-b")
+    args_a = _args(plan_a, "openwebui:user:chat-a")
+    args_b = _args(plan_b, "openwebui:user:chat-b")
+
+    result_a, result_b, replay_b = await asyncio.gather(
+        mod.media_standard_request(args_a),
+        mod.media_standard_request(args_b),
+        mod.media_standard_request(args_b),
+    )
+
+    assert sum(item.get("executor") == "in_process_fake" for item in (result_a, result_b, replay_b)) == 2
+    assert not calls
+    row = next(r for r in mod._media_workflows() if r["workflow_id"] == plan_a["workflow_id"])
+    statuses = {item["confirmation_id"]: item["status"] for item in row["pending_confirmations"]}
+    assert statuses[plan_a["confirmation_record"]["confirmation_id"]] == "CONSUMED"
+    assert statuses[plan_b["confirmation_record"]["confirmation_id"]] == "CONSUMED"
+    assert row["qa_execution_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_matrix_planning_during_approval_cannot_be_lost(harness, monkeypatch):
+    mod, calls = harness
+    plan_a = await _plan(mod, "openwebui:user:chat-a")
+    args_a = _args(plan_a, "openwebui:user:chat-a")
+    approval_paused = asyncio.Event()
+    release_approval = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def controlled_sleep(_delay):
+        approval_paused.set()
+        await release_approval.wait()
+
+    monkeypatch.setattr(mod.asyncio, "sleep", controlled_sleep)
+    approval_task = asyncio.create_task(mod.media_standard_request(args_a))
+    await approval_paused.wait()
+    plan_b_task = asyncio.create_task(_plan(mod, "openwebui:user:chat-b"))
+    await real_sleep(0)
+    assert not plan_b_task.done(), "planner must wait for the workflow-store claim"
+
+    release_approval.set()
+    result_a = await approval_task
+    plan_b = await plan_b_task
+    result_b = await mod.media_standard_request(_args(plan_b, "openwebui:user:chat-b"))
+
+    assert result_a.get("executor") == "in_process_fake"
+    assert result_b.get("executor") == "in_process_fake"
+    assert not calls
+    row = next(r for r in mod._media_workflows() if r["workflow_id"] == plan_a["workflow_id"])
+    statuses = {item["confirmation_id"]: item["status"] for item in row["pending_confirmations"]}
+    # A's consumed record may be pruned when the later plan compacts the
+    # bounded pending list, but it must never be resurrected as PENDING.
+    assert statuses.get(plan_a["confirmation_record"]["confirmation_id"]) != "PENDING"
+    assert statuses[plan_b["confirmation_record"]["confirmation_id"]] == "CONSUMED"
+    assert row["qa_execution_count"] == 2
 
 
 @pytest.mark.asyncio

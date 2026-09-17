@@ -57,6 +57,9 @@ replacement value is printed.
   limited to the server-side appdata/rollback scope; those artifacts were not
   erased because they are rollback and incident evidence.
 
-Future verification must use the bounded credential verifier and QA harness;
-it must not print container environments or provider configuration values.
-
+Future verification must use bounded status-only checks and the QA harness;
+it must not print container environments, authorization headers, provider
+configuration values, or secret-file contents. The closure procedure used
+only the old/new HTTP status codes, in-memory equality checks, and occurrence
+counts from explicitly scoped active log/config paths. No standalone
+credential-diagnostic artifact is installed on the server.
