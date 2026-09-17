@@ -82,10 +82,47 @@ def test_media_diagnosis_outranks_broad_download_in_media_context():
     assert module.discover_capabilities("what is downloading", 8)[0]["metadata"]["canonical_name"] == "investigate_downloads"
 
 
+def test_manager_admin_queries_rank_their_own_dedicated_tool_first():
+    # These tools previously had no CAPABILITY_METADATA entry at all, so a
+    # natural admin question scored near zero against them and lost to a
+    # richly-aliased but wrong tool (usually media_plan_goal), which then
+    # fuzzy-matched the whole sentence as a Plex title and returned nonsense.
+    assert names("Any Sonarr health issues?")[:1] == ["sonarr_health"]
+    assert names("Any Radarr health issues?")[:1] == ["radarr_health"]
+    assert names("Search Radarr for the movie Inception.")[:1] == ["radarr_search_movie"]
+    assert names("Search Lidarr for the artist Radiohead.")[:1] == ["lidarr_search_artist"]
+    assert names("How many movies and shows do I have in Plex?")[:1] == ["plex_library_counts"]
+    assert names("What is the Torbox status?")[:1] == ["torbox_status"]
+    assert names("What is the Overseerr status?")[:1] == ["overseerr_status"]
+    assert names("Any active Soulseek downloads?")[:1] == ["slskd_downloads"]
+    assert names("Any missing episodes in Sonarr?")[:1] == ["sonarr_missing_episodes"]
+    assert names("Is my Sonarr queue empty right now?")[:1] == ["sonarr_queue"]
+    assert names("What is the current GPU usage?")[:1] == ["get_gpu_status"]
+    assert names("Show me the logs for the Home-AI-Tools container.")[:1] == ["get_container_logs"]
+
+
+def test_plex_presence_question_ranks_library_lookup_not_acquisition():
+    # "Do I have X in Plex" is a read-only presence check; it previously lost
+    # to media_plan_goal (which starts an acquisition workflow) because
+    # media_plan_goal had richer aliases/examples than any Plex read tool.
+    assert names("Do I have Dumb and Dumber in Plex?")[:1] == ["plex_library_lookup"]
+
+
 def test_calculator_and_units_are_deterministic():
     import asyncio
     assert asyncio.run(module.calculator({"expression": "17.5 * 438 / 100"}))["value"] == 76.65
     assert round(asyncio.run(module.unit_convert({"value": 5, "from_unit": "GB", "to_unit": "MB"}))["result"]) == 5000
+
+
+def test_unit_convert_accepts_natural_language_unit_names():
+    # A model naturally says "gigabytes"/"megabytes", not the internal
+    # abbreviated codes; a real production request with these exact
+    # arguments used to raise ValueError("unsupported unit pair").
+    import asyncio
+    result = asyncio.run(module.unit_convert({"value": 5, "from_unit": "gigabytes", "to_unit": "megabytes"}))
+    assert round(result["result"]) == 5000
+    result = asyncio.run(module.unit_convert({"value": 1, "from_unit": "Terabyte", "to_unit": "Gigabytes"}))
+    assert round(result["result"]) == 1000
 
 
 def test_discovery_is_bounded():

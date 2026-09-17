@@ -579,8 +579,31 @@ async def calculator(args: dict[str, Any]) -> dict[str, Any]:
     return {"expression": expression, "value": _safe_calculate(expression), "deterministic": True}
 
 
+_UNIT_ALIASES = {
+    "byte": "b", "bytes": "b",
+    "kilobyte": "kb", "kilobytes": "kb",
+    "megabyte": "mb", "megabytes": "mb",
+    "gigabyte": "gb", "gigabytes": "gb",
+    "terabyte": "tb", "terabytes": "tb",
+    "kibibyte": "kib", "kibibytes": "kib",
+    "mebibyte": "mib", "mebibytes": "mib",
+    "gibibyte": "gib", "gibibytes": "gib",
+    "tebibyte": "tib", "tebibytes": "tib",
+    "degc": "celsius", "degf": "fahrenheit",
+}
+
+
+def _normalize_unit(raw: str) -> str:
+    # A model naturally says "gigabytes"/"megabytes", not the abbreviated
+    # codes below -- normalize the common natural-language spellings instead
+    # of requiring the caller to already know the internal short codes.
+    unit = raw.strip().casefold().rstrip(".")
+    return _UNIT_ALIASES.get(unit, unit)
+
+
 async def unit_convert(args: dict[str, Any]) -> dict[str, Any]:
-    value, source, target = float(args["value"]), args["from_unit"].casefold(), args["to_unit"].casefold()
+    value = float(args["value"])
+    source, target = _normalize_unit(args["from_unit"]), _normalize_unit(args["to_unit"])
     factors = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
                "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
     if source in factors and target in factors:
@@ -3530,6 +3553,51 @@ GROUP_SERVICES = {
 }
 
 CAPABILITY_METADATA = {
+    # The tools below existed with no CAPABILITY_METADATA entry at all,
+    # meaning discover_capabilities() had only their bare name/description to
+    # score against -- an entire category of natural, unambiguous admin
+    # questions ("any Sonarr health issues?", "search Radarr for Inception",
+    # "what's the Torbox status?") either failed to retrieve the right tool
+    # at all or lost to a more richly-aliased tool like media_plan_goal.
+    "sonarr_search_series": {"aliases": ["sonarr", "search sonarr", "tv series search"], "examples": ["search Sonarr for a series", "look up this show in Sonarr"], "group": "sonarr", "freshness": "current"},
+    "sonarr_queue": {"aliases": ["sonarr queue", "sonarr downloads", "tv download queue"], "examples": ["is my Sonarr queue empty", "what is Sonarr currently downloading"], "group": "sonarr", "freshness": "current"},
+    "sonarr_health": {"aliases": ["sonarr", "sonarr health", "tv service health"], "examples": ["any Sonarr health issues", "is Sonarr healthy"], "group": "sonarr", "freshness": "current"},
+    "sonarr_missing_episodes": {"aliases": ["sonarr missing", "missing episodes", "wanted episodes"], "examples": ["any missing episodes in Sonarr", "what episodes is Sonarr missing"], "group": "sonarr", "freshness": "current"},
+    "radarr_search_movie": {"aliases": ["radarr", "search radarr", "movie search"], "examples": ["search Radarr for a movie", "look up this movie in Radarr"], "group": "radarr", "freshness": "current"},
+    "radarr_queue": {"aliases": ["radarr queue", "radarr downloads", "movie download queue"], "examples": ["is my Radarr queue empty", "what is Radarr currently downloading"], "group": "radarr", "freshness": "current"},
+    "radarr_health": {"aliases": ["radarr", "radarr health", "movie service health"], "examples": ["any Radarr health issues", "is Radarr healthy"], "group": "radarr", "freshness": "current"},
+    "radarr_missing_movies": {"aliases": ["radarr missing", "missing movies", "wanted movies"], "examples": ["any missing movies in Radarr", "what movies is Radarr missing"], "group": "radarr", "freshness": "current"},
+    "lidarr_search_artist": {"aliases": ["lidarr", "search lidarr", "artist search"], "examples": ["search Lidarr for an artist", "look up this artist in Lidarr"], "group": "lidarr", "freshness": "current"},
+    "lidarr_search_album": {"aliases": ["lidarr album", "search album", "album search"], "examples": ["search Lidarr for an album"], "group": "lidarr", "freshness": "current"},
+    "lidarr_queue": {"aliases": ["lidarr queue", "lidarr downloads", "music download queue"], "examples": ["is my Lidarr queue empty", "what is Lidarr currently downloading"], "group": "lidarr", "freshness": "current"},
+    "lidarr_import_status": {"aliases": ["lidarr import", "album import status"], "examples": ["did that Lidarr album import"], "group": "lidarr", "freshness": "current"},
+    "lidarr_artist_status": {"aliases": ["lidarr artist status", "album and track counts"], "examples": ["how many albums does Lidarr have for this artist"], "group": "lidarr", "freshness": "current"},
+    "lidarr_missing_tracks": {"aliases": ["lidarr missing", "missing tracks", "wanted tracks"], "examples": ["any missing tracks in Lidarr", "what tracks is Lidarr missing"], "group": "lidarr", "freshness": "current"},
+    "torbox_status": {"aliases": ["torbox", "torbox status"], "examples": ["what is the Torbox status", "is Torbox working"], "group": "downloads", "freshness": "current"},
+    "overseerr_status": {"aliases": ["overseerr", "overseerr status"], "examples": ["what is the Overseerr status", "is Overseerr up"], "group": "media_pipeline", "freshness": "current"},
+    "overseerr_recent_requests": {"aliases": ["overseerr requests", "recent overseerr requests"], "examples": ["what has been requested on Overseerr recently"], "group": "media_pipeline", "freshness": "current"},
+    "slskd_downloads": {"aliases": ["soulseek", "slskd", "soulseek downloads"], "examples": ["any active Soulseek downloads", "what is Soulseek downloading"], "group": "downloads", "freshness": "current"},
+    "slskd_search_status": {"aliases": ["soulseek search", "slskd search status"], "examples": ["what is the current Soulseek search status"], "group": "downloads", "freshness": "current"},
+    "qbittorrent_summary": {"aliases": ["qbittorrent", "torrent speeds", "torrent downloads"], "examples": ["what is currently downloading in qBittorrent", "how fast are my torrents going"], "group": "downloads", "freshness": "current"},
+    "qbittorrent_list": {"aliases": ["qbittorrent list", "torrent list"], "examples": ["list my qBittorrent downloads"], "group": "downloads", "freshness": "current"},
+    "qbittorrent_get": {"aliases": ["qbittorrent item", "one torrent"], "examples": ["what is the status of this torrent"], "group": "downloads", "freshness": "current"},
+    "music_enricher_status": {"aliases": ["music enricher", "music enrichment status"], "examples": ["what is the Music Enricher status"], "group": "media_pipeline", "freshness": "current"},
+    "music_enricher_quarantine": {"aliases": ["music enricher quarantine", "quarantined tracks"], "examples": ["what is in the Music Enricher quarantine"], "group": "media_pipeline", "freshness": "current"},
+    "beets_status": {"aliases": ["beets", "beets library counts"], "examples": ["what is the Beets status", "how many tracks are in Beets"], "group": "media_pipeline", "freshness": "current"},
+    "beets_recent_imports": {"aliases": ["beets imports", "recent beets imports"], "examples": ["what did Beets import recently"], "group": "media_pipeline", "freshness": "current"},
+    "plex_library_counts": {"aliases": ["how many movies", "how many shows", "library counts", "plex counts"], "examples": ["how many movies and shows do I have in Plex", "how big is my Plex library"], "group": "plex", "freshness": "current"},
+    "plex_current_sessions": {"aliases": ["plex sessions", "now playing", "who is watching"], "examples": ["is anything playing on Plex right now", "what is currently streaming"], "group": "plex", "freshness": "current"},
+    "plex_search": {"aliases": ["plex search", "is it playing", "plex playback search"], "examples": ["is anything playing right now"], "group": "plex", "freshness": "current"},
+    "plex_artist_library": {"aliases": ["plex music library", "albums and tracks", "artist discography"], "examples": ["which albums and tracks does Plex Music have for this artist"], "group": "plex", "freshness": "current"},
+    "get_gpu_status": {"aliases": ["gpu", "vram", "graphics card usage"], "examples": ["what is the current GPU usage", "how much VRAM is being used"], "group": "server", "freshness": "current"},
+    "get_container_logs": {"aliases": ["container logs", "docker logs"], "examples": ["show me the logs for this container"], "group": "server", "freshness": "current"},
+    "get_container_status": {"aliases": ["container status", "docker container status"], "examples": ["what is the status of this container"], "group": "server", "freshness": "current"},
+    "restart_container": {"aliases": ["restart container", "reboot container", "docker restart"], "examples": ["restart this container"], "group": "server", "freshness": "current"},
+    "netdata_system_summary": {"aliases": ["netdata", "host monitoring"], "examples": ["what does Netdata say about the host"], "group": "server", "freshness": "current"},
+    "get_server_overview": {"aliases": ["server overview", "uptime", "host summary"], "examples": ["give me a server overview", "how long has the server been up"], "group": "server", "freshness": "current"},
+    "frigate_status": {"aliases": ["frigate status", "is frigate up"], "examples": ["is Frigate up and running", "check Frigate reachability"], "group": "frigate", "freshness": "current"},
+    "media_policy_status": {"aliases": ["media policy", "quality profiles"], "examples": ["what are the current media policies"], "group": "media", "freshness": "current"},
+    "media_storage_status": {"aliases": ["media storage", "library storage contracts"], "examples": ["what is the media storage status"], "group": "media", "freshness": "current"},
     "home_find_device": {"aliases": ["find light", "find outlet", "smart home devices", "home devices"], "examples": ["find the office lights", "what home devices are available"], "group": "home", "freshness": "current"},
     "home_get_state": {"aliases": ["home state", "light state", "outlet state", "what is on"], "examples": ["is anything still on downstairs"], "group": "home", "freshness": "current"},
     "home_get_area_state": {"aliases": ["area state", "room state", "what is on in"], "examples": ["what is on downstairs"], "group": "home", "freshness": "current"},
@@ -3549,7 +3617,7 @@ CAPABILITY_METADATA = {
     "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
     "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
     "plex_recently_added": {"aliases": ["recently added", "last added", "newest in plex"], "examples": ["what was the last thing added to Plex"], "freshness": "current"},
-    "plex_library_lookup": {"aliases": ["do i have", "is it in plex", "plex availability", "find in Plex", "look for it in Plex"], "examples": ["do I already have this movie", "find a movie in Plex"], "group": "plex", "freshness": "current"},
+    "plex_library_lookup": {"aliases": ["do i have", "do you have", "is it in plex", "plex availability", "find in Plex", "look for it in Plex", "is this movie in my library"], "examples": ["do I already have this movie", "find a movie in Plex", "do you have this movie in Plex"], "group": "plex", "freshness": "current"},
     "media_plan_goal": {"aliases": ["get media", "add movie", "request album", "put it in plex", "media goal"], "examples": ["get Rodeo by Travis Scott", "get the original animated Hobbit movie"], "group": "media", "freshness": "current"},
     "media_get_workflow": {"aliases": ["how is this request doing", "is this request downloading", "did this request import", "media progress"], "examples": ["how is Rodeo doing"], "group": "media", "freshness": "current", "requires_referent": True},
     "media_status": {"aliases": ["media status", "how is it doing", "is it ready", "did it find it", "what is taking so long"], "examples": ["is Dumb and Dumber ready"], "group": "media", "freshness": "current", "requires_referent": True},

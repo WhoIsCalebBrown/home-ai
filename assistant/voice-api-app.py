@@ -349,6 +349,24 @@ def complete_speakable_sentence(text: str) -> bool:
     return not bool(re.search(r"\d\.\s*$", text))
 
 
+def collapse_repeated_sentences(text: str) -> str:
+    """Drop an immediately-adjacent, exact-duplicate sentence.
+
+    Real production replies from a deterministic reader synthesis (e.g. for
+    list_containers) occasionally repeated the same sentence back-to-back
+    verbatim ("You've got 50 containers running. You've got 50 containers
+    running."). Only an exact, adjacent duplicate is collapsed -- never a
+    later, non-adjacent repeat, which could be intentional emphasis.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    deduped: list[str] = []
+    for sentence in sentences:
+        if deduped and sentence.strip().casefold() == deduped[-1].strip().casefold():
+            continue
+        deduped.append(sentence)
+    return " ".join(deduped)
+
+
 @app.on_event("startup")
 async def initialize_speech_frontend() -> None:
     global speech_normalizer, pronunciation_entries, normalization_init_seconds
@@ -985,12 +1003,24 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
         if any((item.get("result") or {}).get("results") for item in successful):
             return "I found current web results, but I couldn't synthesize a reliable summary from them yet."
         return "I searched the web, but I couldn't find reliable current results."
+    non_web_ok = [item for item in results if item.get("tool") != "web_search" and item.get("status") == "ok"]
+    if non_web_ok and re.search(r"\b(?:don't|do not|doesn't|does not|cannot|can't)\s+have\s+access\b|\bno\s+access\s+to\b", answer, re.I):
+        # The underlying tool call actually succeeded (e.g. a list read that
+        # legitimately came back empty) -- the model just misdescribed a
+        # successful, empty result as a permissions/connectivity failure.
+        return "That check succeeded, but it came back empty -- there's nothing there to report right now."
     if re.search(r"current server information|current server status", answer, re.I) and resolved_domain != "server":
         if any(item.get("status") == "ok" for item in results):
             if resolved_domain == "web_research":
                 return "I found current news results for that question, but the synthesis was inconclusive."
             if resolved_domain == "media":
                 return "I found live media results for the requested Lidarr and Plex check, but the synthesis was inconclusive."
+            # A real, successful tool call (e.g. investigate_downloads with
+            # actual queue data) is not a live-tool outage just because this
+            # domain isn't one of the two special-cased above -- claiming
+            # "unavailable" here was flatly false; the model just failed to
+            # synthesize the data it was actually given.
+            return "I found live results for that, but couldn't synthesize a reliable summary from them yet."
         return unavailable_live_answer(user_text)
     if visual_question(user_text) and (resolved_domain is None or resolved_domain == "camera") and not any(
         isinstance(item.get("result"), dict) and item.get("result", {}).get("vision_ready")
@@ -1355,7 +1385,7 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
 
 
 async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str | None = None, origin: str = "assistant") -> None:
-    text = repair_decimal_spacing(text)
+    text = collapse_repeated_sentences(repair_decimal_spacing(text))
     if client_id:
         record_assistant_response(client_id, text, request_id=request_id, origin=origin)
     await ws.send_json({"type": "text", "text": text, "request_id": request_id})
@@ -3745,7 +3775,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             or media_goal_request(user_text)
             or current_external_question(user_text)
         )
-        top_score = float((candidates[0].get("metadata") or {}).get("score", 0) or 0) if candidates else 0.0
+        # candidates already holds the flattened per-tool metadata dicts (see
+        # discover_tools), so indexing a nested "metadata" key here always
+        # misses and silently floors every unanchored turn's score to 0 --
+        # that wrongly emptied the tool list for strong, unambiguous matches
+        # like "Look up Alan Turing on Wikipedia" (real top score ~12).
+        top_score = float((candidates[0] or {}).get("score", 0) or 0) if candidates else 0.0
         if not anchored_turn and top_score < 5.0:
             tools = []
             context["tool_selection_status"] = "UNANCHORED_NO_TOOL"

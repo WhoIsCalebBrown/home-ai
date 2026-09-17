@@ -115,8 +115,11 @@ def retrieval_confidence(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Return a bounded confidence summary for audit and clarification logic."""
     if not candidates:
         return {"status": "NO_CANDIDATES", "top": None, "margin": None}
-    top = candidates[0].get("metadata", {})
-    second = candidates[1].get("metadata", {}) if len(candidates) > 1 else {}
+    # candidates is already the flattened per-tool metadata list (discover_tools
+    # extracts item["metadata"] before this is ever called) -- indexing into a
+    # nested "metadata" key here always misses and silently reads a zero score.
+    top = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else {}
     top_score = float(top.get("score", 0) or 0)
     second_score = float(second.get("score", 0) or 0)
     return {

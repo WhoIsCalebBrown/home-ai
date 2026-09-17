@@ -36,9 +36,12 @@ def test_explicit_new_turn_is_not_treated_as_referential():
 
 
 def test_retrieval_confidence_is_bounded_and_auditable():
+    # candidates is the already-flattened per-tool metadata list discover_tools
+    # produces (it extracts item["metadata"] before this is ever called) -- a
+    # nested "metadata" key here would silently floor every score to 0.
     result = retrieval_confidence([
-        {"metadata": {"canonical_name": "web_search", "score": 8}},
-        {"metadata": {"canonical_name": "weather_forecast", "score": 2}},
+        {"canonical_name": "web_search", "score": 8},
+        {"canonical_name": "weather_forecast", "score": 2},
     ])
     assert result["top"] == "web_search"
     assert result["margin"] == 6

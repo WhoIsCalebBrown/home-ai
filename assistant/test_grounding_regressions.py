@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries", "collapse_repeated_sentences"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -44,6 +44,7 @@ rephrase_intent = namespace["rephrase_intent"]
 repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
 complete_speakable_sentence = namespace["complete_speakable_sentence"]
+collapse_repeated_sentences = namespace["collapse_repeated_sentences"]
 direct_structured_answer = namespace["direct_structured_answer"]
 media_plan_response = namespace["media_plan_response"]
 is_confirmation = namespace["is_confirmation"]
@@ -779,6 +780,40 @@ def test_server_fallback_cannot_leak_into_news_synthesis():
     answer = evidence_supported_answer("I couldn't verify that current server information because the required live tool result was unavailable.", "Anything interesting with AI specifically?", result, "web_research")
     assert "server" not in answer.lower()
     assert "news results" in answer.lower()
+
+
+def test_real_downloads_evidence_is_not_reported_as_an_outage():
+    # investigate_downloads succeeded with real data, but the model's own
+    # synthesis happened to echo the generic "current server information"
+    # refusal phrase; a real production reply then falsely claimed the live
+    # tool result was unavailable even though it plainly was not.
+    result = [{"tool": "investigate_downloads", "status": "ok", "result": {"sources": {"qbittorrent": {"torrent_count": 269}}}}]
+    answer = evidence_supported_answer(
+        "I couldn't verify that current server information because the required live tool result was unavailable.",
+        "What's currently downloading in qBittorrent?", result, "downloads",
+    )
+    assert "unavailable" not in answer.lower()
+    assert "found live results" in answer.lower()
+
+
+def test_collapse_repeated_sentences_drops_only_adjacent_exact_duplicates():
+    # A real production reply repeated the same sentence back-to-back
+    # verbatim; collapse that, but never touch a later, non-adjacent repeat
+    # or two merely-similar sentences.
+    assert collapse_repeated_sentences(
+        "You've got 50 containers running. You've got 50 containers running."
+    ) == "You've got 50 containers running."
+    assert collapse_repeated_sentences("Nothing is playing on Plex right now.") == "Nothing is playing on Plex right now."
+    assert collapse_repeated_sentences(
+        "It's 22 degrees. It's going to rain later. It's 22 degrees."
+    ) == "It's 22 degrees. It's going to rain later. It's 22 degrees."
+
+
+def test_empty_but_successful_list_read_is_not_reported_as_no_access():
+    result = [{"tool": "list_items", "status": "ok", "result": {"list": "grocery", "items": [], "count": 0}}]
+    answer = evidence_supported_answer("I don't have access to your grocery list right now.", "What's on my grocery list?", result, None)
+    assert "no access" not in answer.lower() and "don't have access" not in answer.lower()
+    assert "empty" in answer.lower()
 
 
 def test_repeat_is_deterministic_and_does_not_mean_refresh():
