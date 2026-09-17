@@ -533,15 +533,26 @@ def test_referential_media_operations_preserve_subject_while_source_changes():
     assert preflight_plan("Can you look it up on the internet?", context) == [
         ("web_search", {"query": "Cast Away"})
     ]
+    assert referential_web_query("Search online for more details.", context) == "Cast Away"
+    assert preflight_plan("Search online for more details.", context) == [
+        ("web_search", {"query": "Cast Away"})
+    ]
 
 
 def test_collective_library_inventory_is_read_only_while_acquisition_stays_canonical():
     assert collective_library_query("What Galactic Saga stuff do I have?") == "Galactic Saga"
     assert preflight_plan("What Galactic Saga stuff do I have?") == [
-        ("plex_search", {"query": "Galactic Saga"})
+        ("plex_library_lookup", {"query": "Galactic Saga"})
     ]
     acquisition = preflight_plan("Get Galactic Saga.")
     assert acquisition == [("media_plan_goal", {"goal": "Get Galactic Saga."})]
+    assert collective_library_query("What Star Trek content do I have?") == "Star Trek"
+    assert preflight_plan("What Radiohead music do I have?") == [
+        ("plex_library_lookup", {"query": "Radiohead"})
+    ]
+    assert preflight_plan("Do I have all the Avengers movies?") == [
+        ("plex_library_lookup", {"query": "Avengers"})
+    ]
 
 
 def test_operation_for_plan_uses_existing_media_vocabulary_and_bounded_scopes():
@@ -1669,6 +1680,8 @@ def test_p0_the_room_confirmation_prompt_is_a_media_goal_without_title_allowlist
     assert preflight_plan("Get The Room.") == [("media_plan_goal", {"goal": "Get The Room."})]
     assert preflight_plan("Request the Matrix!") == [("media_plan_goal", {"goal": "Request the Matrix!"})]
     assert preflight_plan("Get the lights.") != [("media_plan_goal", {"goal": "Get the lights."})]
+    assert preflight_plan("Get Crash.") == [("media_plan_goal", {"goal": "Get Crash."})]
+    assert preflight_plan("Get Avengers.") == [("media_plan_goal", {"goal": "Get Avengers."})]
 
 
 def test_bug_b_do_that_and_it_are_interchangeable_confirmation_replies():

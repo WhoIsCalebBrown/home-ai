@@ -65,6 +65,16 @@ def test_search_service_for_scaffolding_is_stripped_from_the_title_query():
     assert _media_goal_parts("Search Lidarr for Rodeo by Travis Scott", None)["title_query"] == "Rodeo"
 
 
+def test_descriptive_question_and_infinitive_request_frames_are_not_title_text():
+    assert _media_goal_parts(
+        "What's that movie where Matt Damon grows potatoes on Mars?", None
+    )["title_query"] == "where Matt Damon grows potatoes on Mars"
+    assert _media_goal_parts(
+        "I want to add the movie about a linguist communicating with aliens.", None
+    )["title_query"] == "about a linguist communicating with aliens"
+    assert _media_goal_parts("Name of the Rose", None)["title_query"] == "Name of the Rose"
+
+
 def test_naive_user_request_phrasings_strip_cleanly_to_a_bare_title():
     # Real production bugs found in a live naive-user sweep: several
     # extremely common, zero-jargon ways to ask for or ask about media

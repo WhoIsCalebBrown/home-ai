@@ -52,6 +52,18 @@ def app(tmp_path):
     return _load_app(tmp_path)
 
 
+@pytest.mark.asyncio
+async def test_person_only_memory_prompt_requests_more_clues_without_catalog_guess(app, monkeypatch):
+    async def unexpected_call(_args):
+        raise AssertionError("a person-only clue must not bind the first fuzzy catalog result")
+
+    monkeypatch.setattr(app, "radarr_search", unexpected_call)
+    plan = await app.media_plan_goal({"goal": "I'm trying to remember a Jordan Example movie."})
+    assert plan["current_state"] == "NEEDS_MORE_CLUES"
+    assert plan["canonical_identity"] is None
+    assert plan["confirmation_required"] is False
+
+
 # --- Root cause #1: real multi-candidate tie-breaking must surface candidates
 
 # Deliberately no candidate titled exactly "Avengers" -- that would hit the

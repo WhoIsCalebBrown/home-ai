@@ -2203,6 +2203,7 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         # returns the correct show as the #1 result.
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+i\s+(?:get|give|grab|find|add|request|want|watch)(?:\s+me)?\s+", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want|download|snag)(?:\s+me)?\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*to\s+(?:get|give|grab|find|add|request|download|snag)\s+", "", title, flags=re.I)
         # "Queue up X" is the same acquisition framing as "get me X", just
         # phrased as a verb + particle.
         title = re.sub(r"^\s*queue\s+up\s+", "", title, flags=re.I)
@@ -2247,6 +2248,12 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         # Bad" match. "Search <service> for" is request framing, not part
         # of any real title.
         title = re.sub(r"^\s*search\s+(?:sonarr|radarr|lidarr|plex)?\s*for\s+", "", title, flags=re.I)
+        title = re.sub(
+            r"^\s*(?:what(?:'s|\s+is)|which)\s+(?:the\s+name\s+of\s+)?(?:that|the)?\s*",
+            "",
+            title,
+            flags=re.I,
+        )
         if title == before:
             break
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
@@ -2519,7 +2526,8 @@ def _plot_description_hint(text: str) -> bool:
     if len(words) < 7:
         return False
     return bool(re.search(
-        r"\b(?:about|where|in which|set in|takes place|who)\b",
+        r"\b(?:about|where|in which|set in|takes place|who)\b|"
+        r"\b(?:he|she|they|it)\b.{0,40}\b(?:does|is|was|has|goes|lives|works|travels|grows|fishes)\b",
         text,
         re.I,
     ))
@@ -2577,6 +2585,16 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
         plan["current_state"] = "NO_TITLE_GIVEN"
         plan["ambiguous"] = False
         plan["message"] = "I didn't catch a specific title -- what would you like me to look for?"
+        return plan
+    person_only_description = bool(
+        _person_mention_hint(parts["raw_goal"], parts.get("artist_query"))
+        and not _plot_description_hint(parts["raw_goal"])
+        and re.search(r"\b(?:trying\s+to\s+remember|remember|which|what(?:'s|\s+is))\b", parts["raw_goal"], re.I)
+    )
+    if person_only_description:
+        plan["current_state"] = "NEEDS_MORE_CLUES"
+        plan["ambiguous"] = False
+        plan["message"] = "I need one more clue, such as part of the plot, the year, or another cast member."
         return plan
     matches: list[dict[str, Any]] = []
     if kind == "album":

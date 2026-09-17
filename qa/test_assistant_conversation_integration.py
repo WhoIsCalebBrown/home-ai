@@ -286,18 +286,19 @@ class FakeToolsBackend:
             # is no fixture to provide here because there is nothing to
             # fake: the real tool does not exist.
             return {"tool": name, "status": "error", "result": {"error": "That tool is not enabled."}}
-        if name == "plex_search":
+        if name in {"plex_search", "plex_library_lookup"}:
             query = str(arguments.get("query", ""))
             matches = []
             for entry in self.library.values():
                 candidate = entry["identity"]
                 if query.casefold() in str(candidate.get("title") or "").casefold():
-                    matches.append({**candidate, "library_title": "Movies" if candidate.get("media_type") == "movie" else "TV Shows"})
+                    library_name = "Movies" if candidate.get("media_type") == "movie" else "TV Shows"
+                    matches.append({**candidate, "library_title": library_name, "library": library_name})
             if not matches:
                 found = self._find_identity(query)
                 if isinstance(found, dict):
                     matches = [found]
-            return {"tool": name, "status": "ok", "result": {"matched": bool(matches), "matches": matches, "library_title": "Movies"}}
+            return {"tool": name, "status": "ok", "result": {"matched": bool(matches), "available": bool(matches), "matches": matches, "library_title": "Movies"}}
         if name == "media_status" or name == "plex_match_canonical_media":
             workflow_id_arg = str(arguments.get("workflow_id") or "").strip()
             title = arguments.get("title") or arguments.get("query") or ""

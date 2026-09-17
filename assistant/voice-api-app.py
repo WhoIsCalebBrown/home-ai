@@ -1365,6 +1365,43 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             if isinstance(items, int):
                 labels.append(f"{name}: {items}")
         return "Plex library counts: " + "; ".join(labels) + "." if labels else "I couldn't read usable Plex library counts."
+    if tool == "plex_library_lookup":
+        matches = [match for match in result.get("matches", []) if isinstance(match, dict)]
+        collective_query = collective_library_query(user_text)
+        completeness = bool(re.fullmatch(
+            r"\s*do\s+(?:i|we)\s+have\s+all\s+(?:the\s+)?(.+?)\s+(?:movies?|films?|shows?|series)\s*[?!.,]*\s*",
+            user_text,
+            re.I,
+        ))
+        if not matches:
+            if completeness:
+                return "I couldn't find matching entries in Plex, and I can't verify franchise completeness from that alone."
+            return "I couldn't find matching entries in Plex."
+        if collective_query or completeness:
+            grouped: dict[str, list[str]] = {}
+            for match in matches[:20]:
+                group = str(match.get("library") or match.get("media_type") or "Plex")
+                title = str(match.get("title") or "").strip()
+                year = match.get("year")
+                if title:
+                    grouped.setdefault(group, []).append(f"{title} ({year})" if year not in (None, "") else title)
+            evidence = "; ".join(f"{group}: {', '.join(titles)}" for group, titles in grouped.items())
+            if completeness:
+                return f"In Plex, I found {evidence}. I can't verify that this is the complete franchise set without an authoritative expected-title list."
+            return f"In Plex, I found {evidence}."
+        labels = []
+        for match in matches[:12]:
+            title = str(match.get("title") or "").strip()
+            parent = str(match.get("parent_title") or "").strip()
+            media_type = str(match.get("media_type") or "item")
+            label = title
+            if parent and parent.casefold() != title.casefold():
+                label = f"{title} — {parent}"
+            if label:
+                labels.append(f"{label} ({media_type})")
+        is_music = any(str(match.get("media_type") or "").casefold() in {"artist", "album", "track"} for match in matches)
+        prefix = "In Plex Music, I found: " if is_music else "In Plex, I found: "
+        return prefix + "; ".join(labels) + "." if labels else "I couldn't find usable matching Plex entries."
     if tool == "plex_search" and re.fullmatch(
         r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+"
         r"(?:stuff|content|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have"
@@ -1616,7 +1653,7 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
         return None
     item = items[-1]
     result = item.get("result") if isinstance(item.get("result"), dict) else {}
-    if result.get("current_state") == "NO_TITLE_GIVEN":
+    if result.get("current_state") in {"NO_TITLE_GIVEN", "NEEDS_MORE_CLUES"}:
         return result.get("message") or "I didn't catch a specific title -- what would you like me to look for?"
     if item.get("status") != "ok":
         reason = str(result.get("error_code") or result.get("reason") or result.get("error") or result.get("status") or "").upper()
@@ -2171,10 +2208,16 @@ def enforce_retained_media_identity(expected: dict, tool_result: dict) -> dict:
 def collective_library_query(text: str) -> str | None:
     """Extract a broad media family query without treating it as acquisition."""
     match = re.fullmatch(
-        r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+(?:stuff|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?plex)?\s*[?!.,]*\s*",
+        r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+(?:stuff|content|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?plex)?\s*[?!.,]*\s*",
         text,
         re.I,
     )
+    if not match:
+        match = re.fullmatch(
+            r"\s*what\s+(.+?)\s+music\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?(?:plex\s+)?library)?\s*[?!.,]*\s*",
+            text,
+            re.I,
+        )
     if not match:
         return None
     query = re.sub(r"\s+", " ", match.group(1)).strip(" .?!")
@@ -2186,14 +2229,38 @@ def collective_library_query(text: str) -> str | None:
 
 def referential_web_query(text: str, context: dict | None = None) -> str | None:
     """Resolve an explicit web request's pronoun from canonical session state."""
-    if not explicit_web_search_request(text) or not has_referential_language(text):
+    if not explicit_web_search_request(text):
         return None
     context = context or {}
+    generic_refinement = bool(re.fullmatch(
+        r"\s*(?:can\s+you\s+)?(?:look|search|check)\s+(?:it\s+)?(?:up\s+)?(?:on\s+)?(?:the\s+)?(?:internet|web|online)"
+        r"(?:\s+for\s+(?:more\s+)?details)?\s*[?!.,]*\s*|"
+        r"\s*(?:can\s+you\s+)?(?:search|look)\s+(?:online|the\s+web|the\s+internet)\s+for\s+(?:more\s+)?details\s*[?!.,]*\s*",
+        text,
+        re.I,
+    ))
+    if not has_referential_language(text) and not generic_refinement:
+        return None
     identity = context.get("canonical_identity")
     if isinstance(identity, dict) and identity.get("title"):
         return str(identity["title"])
     referent = context.get("latest_resolved_referent")
     return str(referent) if referent else None
+
+
+def music_library_lookup_query(text: str) -> str | None:
+    """Extract a bounded artist/album query for a read-only Plex Music check."""
+    patterns = (
+        r"\s*what\s+(.+?)\s+music\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?(?:plex\s+)?library)?\s*[?!.,]*\s*",
+        r"\s*(?:is|do\s+(?:i|we)\s+have)\s+(?:the\s+)?(?:album|record)\s+(.+?)\s+(?:in|on)\s+(?:my\s+)?(?:plex\s+)?library\s*[?!.,]*\s*",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text, re.I)
+        if match:
+            query = match.group(1).strip(" .?!")
+            if query and query.casefold() not in {"music", "anything", "something", "it", "that"}:
+                return query
+    return None
 
 
 def storage_state_followup(text: str, context: dict | None = None) -> bool:
@@ -2897,7 +2964,21 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # not match this shape and continues through canonical resolution.
     collective_query = collective_library_query(text)
     if collective_query:
-        return [("plex_search", {"query": collective_query})]
+        return [("plex_library_lookup", {"query": collective_query})]
+    completeness_match = re.fullmatch(
+        r"\s*do\s+(?:i|we)\s+have\s+all\s+(?:the\s+)?(.+?)\s+(movies?|films?|shows?|series)\s*[?!.,]*\s*",
+        text,
+        re.I,
+    )
+    if completeness_match:
+        return [("plex_library_lookup", {"query": completeness_match.group(1).strip()})]
+    # Some lightweight unit tests execute a deliberately selected AST slice
+    # of this module. Keep the optional helper lookup tolerant in that harness
+    # while the full application always provides it.
+    music_query_fn = globals().get("music_library_lookup_query")
+    music_query = music_query_fn(text) if callable(music_query_fn) else None
+    if music_query:
+        return [("plex_library_lookup", {"query": music_query, "library": "Music"})]
     # A bare "Is it running?" can safely remain a storage question only
     # when the preceding capacity turn named the storage target.  This keeps
     # it from degenerating into a container-status invocation without a name.
@@ -3213,7 +3294,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         # were added to the exclusion set above; a single-word floor adds
         # a second, independent safety margin against the next word this
         # exclusion list has not yet anticipated).
-        if len(remaining) >= 2 and not re.search(r"\b(?:list|grocery|shopping|todo|to-do|task|reminder|calendar|coffee|alarm|timer|note)\b", t):
+        direct_title_request = bool(re.match(r"\s*(?:please\s+)?(?:get|grab|add|request)\b", text, re.I))
+        if ((len(remaining) >= 2 or (len(remaining) == 1 and direct_title_request))
+                and not re.search(r"\b(?:list|grocery|shopping|todo|to-do|task|reminder|calendar|coffee|alarm|timer|note|weather|forecast|container|service|server|camera|event|light|lights|lamp|outlet|switch|plug|socket|thermostat)\b", t)):
             return [("media_plan_goal", {"goal": text})]
     # A descriptive identity question ("What's that Tom Hanks movie where
     # he's stuck on an island with a volleyball?", "What's that Brad Pitt
@@ -3614,6 +3697,18 @@ def enrichment_reply_hint(text: str, subject: "UnresolvedSubject | None") -> dic
     if media_type is not None:
         hints["media_type"] = media_type
     return hints
+
+
+def descriptive_clue_followup(text: str, subject: "UnresolvedSubject | None") -> bool:
+    """Recognize a short plot/location clue that refines an unresolved item."""
+    if subject is None or len(re.findall(r"[a-z0-9']+", text.casefold())) > 16:
+        return False
+    if re.search(r"\b(?:yes|yeah|no|cancel|approve|confirm|get|request|add|weather|camera|container|storage)\b", text, re.I):
+        return False
+    return bool(
+        re.search(r"\b(?:he|she|they|it)\b", text, re.I)
+        or re.search(r"\b(?:takes place|set|happens)\s+(?:in|on|near|around)\b", text, re.I)
+    )
 
 
 def guess_media_title(text: str) -> str:
@@ -4403,20 +4498,24 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     unresolved_subject = unresolved_subject_from_dict(conversation_context.get(client_id, {}).get("latest_unresolved_subject"))
     if unresolved_subject is not None:
         enrichment_hint = enrichment_reply_hint(user_text, unresolved_subject)
+        clue_followup = descriptive_clue_followup(user_text, unresolved_subject)
         # A fresh, title-shaped restatement ("Can you give me the movie The
         # Room by Tommy Wiseau?", "I want to add a movie called The Room.")
         # must REPLACE the stale title, not merely add a year/type hint on
         # top of it -- real production bug: the old, already-wrong title
         # was silently kept and the new title text discarded entirely.
-        fresh_title = fresh_title_restatement(user_text)
+        fresh_title = None if clue_followup else fresh_title_restatement(user_text)
         # A genuinely different explicit domain outranks the pending
         # unresolved subject, same precedent as offers/disambiguation --
         # "media" itself is not competing (a media-type-word enrichment
         # reply is media-flavored language by construction).
         enrichment_domain = explicit_domain(user_text)
         has_competing_domain = enrichment_domain is not None and enrichment_domain != "media"
-        if (enrichment_hint or fresh_title) and not has_competing_domain:
-            enriched = unresolved_subject.enrich(title_or_name=fresh_title, **(enrichment_hint or {}))
+        if (enrichment_hint or fresh_title or clue_followup) and not has_competing_domain:
+            enriched_title = fresh_title
+            if clue_followup:
+                enriched_title = f"{unresolved_subject.title_or_name}. {user_text.strip()}"
+            enriched = unresolved_subject.enrich(title_or_name=enriched_title, **(enrichment_hint or {}))
             enriched_goal = enriched.resolution_goal_text()
             result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
