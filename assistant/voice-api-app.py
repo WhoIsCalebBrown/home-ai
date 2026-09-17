@@ -3508,10 +3508,10 @@ def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result
     tool answered it. This is the fix for the gap where a web_search result
     never fed back into conversation_context: without this, "do I have it?"
     after "can you find X online?" had no referent to resolve "it" against.
-    Never overwrites an established canonical_identity with a bare string;
-    only ever supplements latest_resolved_referent, which downstream
-    referent resolution already treats as lower-priority than
-    canonical_identity (see discovery_context() in semantic_routing.py).
+    Never overwrites an established canonical_identity with a bare string.
+    When the tool itself returned a canonical identity, retain that complete
+    authoritative record too; it is the only safe source for a follow-up such
+    as "What year did it come out?".
     """
     argument_key = _REFERENT_ARGUMENT_KEYS.get(tool_name)
     if not argument_key:
@@ -3530,7 +3530,28 @@ def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result
         return
     context = dict(conversation_context.get(client_id, {}))
     context["latest_resolved_referent"] = subject
+    identity = payload.get("canonical_identity") if isinstance(payload, dict) else None
+    if isinstance(identity, dict) and identity.get("title"):
+        context["canonical_identity"] = identity
     conversation_context[client_id] = context
+
+
+def canonical_media_year_answer(context: dict, text: str) -> str | None:
+    """Answer a narrow release-year follow-up from an established identity.
+
+    This is deliberately not a general media-information router: it only
+    accepts an explicit release-year question and only uses the year carried
+    by a canonical result from the immediately retained session state.
+    """
+    if not re.search(r"\b(?:what|which)\s+year\b.*\b(?:come\s+out|released|release)\b|\bwhen\s+(?:did|was)\b.*\b(?:come\s+out|released)\b", text, re.I):
+        return None
+    identity = context.get("canonical_identity")
+    if not isinstance(identity, dict):
+        return None
+    title, year = identity.get("title"), identity.get("year")
+    if not title or year is None or str(year).strip() == "":
+        return None
+    return f"{title} came out in {year}."
 
 
 _DISAMBIGUATION_TTL_SECONDS = 90
@@ -4412,6 +4433,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         llm_user_text = routing_aliases(user_text)
         messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": llm_user_text}]
         context = turn_context(client_id, user_text)
+        known_year = canonical_media_year_answer(context, user_text)
+        if known_year:
+            await emit_answer(ws, request_id, known_year, client_id=client_id, origin="canonical_media_year")
+            history.append({"role": "assistant", "content": known_year})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         contextual = contextual_entity_resolution(user_text, context)
         context["canonical_entities"] = contextual["entities"]
         context["entity_confidence"] = contextual["confidence"]

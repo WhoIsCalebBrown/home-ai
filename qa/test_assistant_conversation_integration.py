@@ -2124,6 +2124,26 @@ async def test_knowledge_to_availability_handoff(session):
 
 
 @pytest.mark.asyncio
+async def test_descriptive_identity_year_followup_uses_canonical_session_fact(session):
+    """Production-shaped regression: an identified title's year is not a
+    workflow-status question and must not cause another media tool call."""
+    session.backend.seed_person("tom hanks", "Cast Away")
+    session.backend.seed_library("Cast Away", media_type="movie", state="ABSENT", tmdb_id="8358", year="2000")
+
+    await session.turn("What's that Tom Hanks movie where he's stuck on an island with a volleyball?")
+    identity = session.app.conversation_context[session.client_id].get("canonical_identity") or {}
+    assert identity.get("title") == "Cast Away"
+    assert str(identity.get("year")) == "2000"
+
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("What year did it come out?")
+    calls_this_turn = [name for name, _ in session.backend.call_log[calls_before:]]
+    assert reply == "Cast Away came out in 2000."
+    assert "media_status" not in calls_this_turn
+    assert not calls_this_turn
+
+
+@pytest.mark.asyncio
 async def test_knowledge_to_request_handoff(session):
     """Item 13: descriptive discovery resolves identity; "Add it." then
     proceeds through normal media planning and stops at strict
