@@ -1567,6 +1567,7 @@ def test_p0_cache_wording_variants_use_authoritative_unraid_capacity():
         "How much cache space is free?", "What percent full is cache?",
         "Give me cache storage status.", "How used is the cache drive?",
         "How many GB are free on cache?", "Check cache disk space.",
+        "Check cache fullness.",
     )
     for text in variants:
         assert preflight_plan(text) == [("unraid_storage_status", {"target": "cache"})], text
