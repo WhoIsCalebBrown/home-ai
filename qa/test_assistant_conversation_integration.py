@@ -363,6 +363,8 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": {"name": arguments.get("name"), "lines": "\x02\x00\x00\x00\x00\x00\x00%INFO:     Started server process [1]\n"}}
         if name == "investigate_downloads":
             return {"tool": name, "status": "ok", "result": {"investigation": "downloads", "sources_checked": ["qbittorrent"], "sources": {"qbittorrent": {"torrent_count": 269, "active_count": 0}}}}
+        if name == "unraid_container_status":
+            return {"tool": name, "status": "ok", "result": {"container": arguments.get("container"), "state": "running", "uptime_seconds": 921550, "memory_usage_bytes": 512_000_000}}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
 
 
@@ -2163,6 +2165,23 @@ async def test_container_logs_result_is_not_silently_dropped_before_synthesis(se
 
 
 @pytest.mark.asyncio
+async def test_named_container_status_result_is_not_silently_dropped_before_synthesis(session):
+    # Fourth instance of the same allowlist-completeness bug: "Is Plex
+    # running?" resolves to "media" domain (explicit_domain's bare "plex"
+    # keyword) and preflight_plan correctly routes it to
+    # unraid_container_status -- but "media" domain's _DOMAIN_TOOL_PREFIXES
+    # tuple did not include "unraid_container_status", so the real,
+    # successful result was silently dropped before synthesis, producing a
+    # false "I couldn't verify the current media pipeline" answer even
+    # though the container status call plainly succeeded.
+    reply = await session.turn(
+        "Is Plex running?",
+        final_text="Yes, Plex is running and has been up for about 10 days.",
+    )
+    assert reply == "Yes, Plex is running and has been up for about 10 days."
+
+
+@pytest.mark.asyncio
 async def test_investigate_downloads_result_is_not_silently_dropped_before_synthesis(session):
     # Same root cause as the logs bug above: "investigate_downloads" was
     # missing from BOTH the "server" and "media" domain tuples in
@@ -2192,7 +2211,11 @@ def test_every_domain_relevant_tool_has_a_matching_prefix(app):
         "media": ["overseerr_status", "overseerr_recent_requests", "investigate_downloads",
                   "investigate_plex_missing", "investigate_media_pipeline", "plex_library_counts",
                   "sonarr_health", "radarr_health", "lidarr_health", "torbox_status", "slskd_downloads",
-                  "qbittorrent_summary", "beets_status", "music_enricher_status"],
+                  "qbittorrent_summary", "beets_status", "music_enricher_status",
+                  # "Is Plex running?" resolves to "media" domain (explicit_domain's
+                  # bare "plex" keyword) but is answered by unraid_container_status --
+                  # fourth instance of this exact bug class, found live.
+                  "unraid_container_status"],
         "web_research": ["web_search", "web_fetch", "wikipedia_search"],
         "weather": ["weather_forecast"],
         "camera": ["frigate_stats", "frigate_recent_activity", "frigate_recent_events"],

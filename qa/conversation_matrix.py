@@ -24,6 +24,7 @@ def load_router():
         "social_acknowledgement", "retained_media_status_repair", "DOMAIN_ENTITIES", "ARTIST_ALIASES",
         "_descriptive_media_clue", "web_search_query_from_text",
         "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING",
+        "CONTAINER_DISPLAY_NAMES",
     }
     body = []
     for node in tree.body:

@@ -2338,6 +2338,25 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("unraid_container_metrics", {})]
     if re.search(r"\b(server|system)\b", t) and re.search(r"\b(status|health|healthy|wrong|ok\b|okay)\b", t):
         return [("unraid_system_health", {})]
+    # "Is Plex running?"/"How long has Plex been running?"/"How much memory
+    # is Home-AI using?" all name a real container but never say the literal
+    # word "container" (unlike the get_container_status pattern below), so
+    # they were falling through to media/web routing instead ("Plex" is a
+    # media-identity word, "Home-AI" trips explicit_domain's bare "ai"
+    # keyword via the hyphen-bounded substring -- confirmed live: this exact
+    # question was routed to explicit_web_search_request's catch-all further
+    # down in this function because that check ran first). Bounded to the
+    # known CONTAINER_DISPLAY_NAMES set (never an arbitrary word) so this
+    # cannot turn an unrelated "is the door open" or "is the light on" into
+    # a container lookup. Must run this early -- before the web-search and
+    # acquisition-verb catch-alls further down -- or it never fires at all.
+    # A phrasing that explicitly says "container" is left to the
+    # get_container_status status_match route further down (already tested,
+    # extracts the container's own casing rather than the display-name map).
+    container_word = next((name for name in CONTAINER_DISPLAY_NAMES if re.search(rf"\b{re.escape(name)}\b", t.replace(" ", "-")) or re.search(rf"\b{re.escape(name.replace('-', ' '))}\b", t)), None)
+    if (container_word and not re.search(r"\bcontainer\b", t)
+            and re.search(r"\brunning\b|\buptime\b|\bbeen\s+up\b|\bis\s+(?:it\s+)?up\b|\bup\s+and\s+running\b|how much (?:memory|ram|cpu) (?:is|does)", t)):
+        return [("unraid_container_status", {"container": CONTAINER_DISPLAY_NAMES[container_word]})]
     # Library recency questions contain the verb "add" but are read-only
     # Plex queries, not acquisition goals. Resolve them before the broad
     # acquisition-language matcher.
@@ -2600,18 +2619,6 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if status_match and re.search(r"\bstatus\b|\brunning\b|\bhealthy\b|\bup\b", t):
         container_name = next(g for g in status_match.groups() if g)
         return [("get_container_status", {"name": container_name})]
-    # "Is Plex running?"/"How long has Plex been running?"/"How much memory
-    # is Home-AI using?" all name a real container but never say the literal
-    # word "container" (unlike the pattern above), so they were falling
-    # through to media/web routing instead ("Plex" is a media-identity word,
-    # "Home-AI" happened to trip current_external_question's bare "ai"
-    # keyword via the hyphen-bounded substring). Bounded to the known
-    # CONTAINER_DISPLAY_NAMES set (never an arbitrary word) so this cannot
-    # turn an unrelated "is the door open" or "is the light on" into a
-    # container lookup.
-    container_word = next((name for name in CONTAINER_DISPLAY_NAMES if re.search(rf"\b{re.escape(name)}\b", t.replace(" ", "-")) or re.search(rf"\b{re.escape(name.replace('-', ' '))}\b", t)), None)
-    if container_word and re.search(r"\brunning\b|\buptime\b|\bbeen\s+up\b|\bis\s+(?:it\s+)?up\b|\bup\s+and\s+running\b|how much (?:memory|ram|cpu) (?:is|does)", t):
-        return [("unraid_container_status", {"container": CONTAINER_DISPLAY_NAMES[container_word]})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
@@ -3067,10 +3074,15 @@ _DOMAIN_TOOL_PREFIXES = {
     # explicit_domain's "container" keyword) and "investigate_downloads"/
     # "overseerr_status" (both land under "media" via a sonarr/qbittorrent/
     # download keyword, or a stray discovery_subject making the domain
-    # default to "media") were all missing.
+    # default to "media") were all missing. Third instance, found in the
+    # live Unraid acceptance sweep: "Is Plex running?" resolves to "media"
+    # domain (explicit_domain's bare "plex" keyword) but preflight_plan's
+    # container-uptime route correctly answers it with
+    # "unraid_container_status" -- a real, successful, media-relevant
+    # result silently dropped for the exact same reason.
     "media": ("media_", "plex_", "lidarr_", "radarr_", "sonarr_", "slskd_", "qbittorrent_",
               "torbox_", "music_", "beets_", "overseerr_", "investigate_media", "investigate_downloads",
-              "investigate_plex_missing", "web_search", "web_fetch"),
+              "investigate_plex_missing", "web_search", "web_fetch", "unraid_container_status"),
     "weather": ("weather",),
     "camera": ("frigate",),
     "cameras": ("frigate",),
