@@ -13,6 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import yaml
@@ -46,6 +47,9 @@ LLM_CONTEXT = int(os.getenv("LLM_CONTEXT", "4096"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 TOOLS_URL = os.getenv("TOOLS_URL", "http://server-tools:8090")
 TOOLS_CONTRACT_VERSION = os.getenv("TOOLS_CONTRACT_VERSION", "1.0")
+TOOLS_SERVICE_TOKEN = os.getenv("TOOLS_SERVICE_TOKEN", "")
+TOOLS_SERVICE_TOKEN_FILE = os.getenv("TOOLS_SERVICE_TOKEN_FILE", "")
+TOOLS_SERVICE_TOKEN_HEADER = "X-Home-AI-Tools-Token"
 SAMPLES_DIR = Path(os.getenv("TTS_SAMPLES_DIR", "/app/tts-tests/kokoro-comparison")).resolve()
 COMPARISON_DIR = Path(os.getenv("TTS_COMPARISON_DIR", "/app/tts-tests/chatterbox-comparison")).resolve()
 PRONUNCIATION_LEXICON = Path(os.getenv("PRONUNCIATION_LEXICON", "/app/pronunciation/approved-pronunciation-lexicon.yaml")).resolve()
@@ -66,6 +70,27 @@ def _openai_compat_key() -> str:
         except OSError:
             return ""
     return OPENAI_COMPAT_API_KEY.strip()
+
+
+def _tools_service_token() -> str:
+    """Read the private Assistant->Tools credential without exposing it.
+
+    This key never crosses an OpenAI-compatible request boundary or enters a
+    model message.  A missing key intentionally makes the Tools dependency
+    unavailable rather than retrying it anonymously.
+    """
+    if TOOLS_SERVICE_TOKEN_FILE:
+        try:
+            with open(TOOLS_SERVICE_TOKEN_FILE, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+    return TOOLS_SERVICE_TOKEN.strip()
+
+
+def _tools_service_headers() -> dict[str, str]:
+    token = _tools_service_token()
+    return {TOOLS_SERVICE_TOKEN_HEADER: token} if token else {}
 sessions: dict[str, list[dict[str, str]]] = {}
 active: dict[str, asyncio.Task] = {}
 pending: dict[str, dict] = {}
@@ -227,6 +252,7 @@ pronunciation_entries: dict[str, str] = {}
 normalization_init_seconds: float | None = None
 tools_backend_status: dict[str, object] = {"ok": False, "status": "NOT_CHECKED", "url": TOOLS_URL}
 tts_suppressed = contextvars.ContextVar("tts_suppressed", default=False)
+turn_trace_context = contextvars.ContextVar("turn_trace_context", default={})
 # Open WebUI receives a display response that may include the server-generated
 # tool trace. Keep the corresponding speech-only response separately so its
 # TTS request does not parse UI/diagnostic markup.
@@ -255,7 +281,7 @@ async def check_tools_backend() -> None:
     global tools_backend_status
     try:
         async with httpx.AsyncClient(timeout=3) as http:
-            health = await http.get(f"{TOOLS_URL}/health")
+            health = await http.get(f"{TOOLS_URL}/health", headers=_tools_service_headers())
             health.raise_for_status()
             payload = health.json()
             count = int(payload.get("tools", 0))
@@ -782,7 +808,7 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
             retrieval_context = discovery_context(context, user_text)
             params = {} if not user_text.strip() else {"query": query, "max_results": 5, "context_json": json.dumps(retrieval_context, separators=(",", ":"))}
             started = time.perf_counter()
-            response = await http.get(f"{TOOLS_URL}{endpoint}", params=params)
+            response = await http.get(f"{TOOLS_URL}{endpoint}", params=params, headers=_tools_service_headers())
             response.raise_for_status()
             payload = response.json()
             if str(payload.get("contract_version", "")) != TOOLS_CONTRACT_VERSION:
@@ -798,6 +824,10 @@ async def discover_tools(user_text: str, context: dict) -> tuple[list[dict], lis
 
 def discovery_audit(entry: dict) -> None:
     try:
+        entry = dict(entry)
+        arguments = entry.pop("arguments", None)
+        if isinstance(arguments, dict):
+            entry["argument_keys"] = sorted(str(key) for key in arguments)
         path = Path(DISCOVERY_AUDIT_LOG)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -1151,6 +1181,40 @@ def grounded_event_timing_answer(result: dict) -> str | None:
 
 def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | None:
     """Answer narrow, high-confidence single-source reads without a second LLM pass."""
+    # These adapters return authoritative, compact operational facts.  Keeping
+    # their successful result on the deterministic path is a correctness
+    # boundary: a prose model must not be allowed to round, omit, or alter
+    # capacity/telemetry numbers while rephrasing them.  Conversely, an
+    # adapter-level failure is not evidence of a successful operation even if
+    # the HTTP transport completed successfully.
+    authoritative_tools = {
+        "unraid_storage_status", "unraid_system_health", "get_gpu_status",
+        "plex_library_counts", "unraid_container_status", "get_container_status",
+    }
+    operation_failure = next((
+        item for item in live_results
+        if item.get("tool") in authoritative_tools
+        and (
+            item.get("operation_ok") is False
+            or item.get("status") not in {None, "ok"}
+            or (isinstance(item.get("result"), dict) and item["result"].get("error"))
+        )
+    ), None)
+    if operation_failure:
+        failed_tool = operation_failure.get("tool")
+        failure_result = operation_failure.get("result") if isinstance(operation_failure.get("result"), dict) else {}
+        if failed_tool == "get_gpu_status":
+            return "I can't read GPU telemetry right now."
+        if failed_tool in {"unraid_container_status", "get_container_status"}:
+            if operation_failure.get("status") == "invalid_arguments" or not failure_result.get("container") and not failure_result.get("name"):
+                return "I need a container name before I can check its status."
+            return "I couldn't read that container's status right now."
+        if failed_tool == "unraid_storage_status":
+            return "I couldn't read the current storage capacity right now."
+        if failed_tool == "unraid_system_health":
+            return "I couldn't read the current server health right now."
+        if failed_tool == "plex_library_counts":
+            return "I couldn't read the current Plex library counts right now."
     home_failure = next((item for item in live_results if item.get("tool") == "home_control" and item.get("status") != "ok"), None)
     if home_failure:
         detail = home_failure.get("result", {}).get("error") if isinstance(home_failure.get("result"), dict) else None
@@ -1165,6 +1229,124 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
     item = successful[0]
     tool = item.get("tool")
     result = item["result"]
+    if tool == "unraid_storage_status":
+        if result.get("found") is False:
+            target = result.get("target") or "that storage target"
+            return f"I couldn't find {target}."
+        if result.get("error"):
+            return "I couldn't read the current storage capacity right now."
+
+        def capacity(value):
+            if not isinstance(value, (int, float)):
+                return None
+            gb = value / 1_000_000_000
+            return f"{gb:.1f}".rstrip("0").rstrip(".") + " GB"
+
+        # A disk-list response is intentionally rendered as a bounded list;
+        # it has no single capacity fact to infer from.
+        if result.get("target") == "disks":
+            disks = [disk for disk in result.get("disks", []) if isinstance(disk, dict)]
+            if not disks:
+                return "I couldn't find any storage disks to report."
+            labels = []
+            for disk in disks[:12]:
+                name = disk.get("name") or "unnamed disk"
+                used = disk.get("used_percent")
+                free = capacity(disk.get("free_bytes"))
+                if isinstance(used, (int, float)) and free:
+                    labels.append(f"{name}: {used:g}% used, {free} free")
+                elif isinstance(used, (int, float)):
+                    labels.append(f"{name}: {used:g}% used")
+            return "; ".join(labels) + "." if labels else "I couldn't read usable disk capacity details."
+        used_percent = result.get("used_percent")
+        used = capacity(result.get("used_bytes"))
+        free = capacity(result.get("free_bytes"))
+        target = str(result.get("name") or result.get("target") or "storage").capitalize()
+        facts = []
+        if isinstance(used_percent, (int, float)):
+            facts.append(f"{used_percent:g}% full")
+        if used:
+            facts.append(f"{used} used")
+        if free:
+            facts.append(f"{free} free")
+        if not facts:
+            return "I couldn't read usable storage capacity details."
+        if isinstance(used_percent, (int, float)) and len(facts) > 1:
+            return f"Your {target} is {facts[0]}: " + " and ".join(facts[1:]) + "."
+        return f"Your {target} is " + " and ".join(facts) + "."
+    if tool == "unraid_system_health":
+        facts = []
+        if result.get("array_state") is not None:
+            facts.append(f"array {str(result['array_state']).lower()}")
+        if result.get("parity_valid") is not None:
+            facts.append("parity valid" if result["parity_valid"] else "parity needs attention")
+        if isinstance(result.get("array_used_percent"), (int, float)):
+            facts.append(f"array {result['array_used_percent']:g}% used")
+        if isinstance(result.get("cpu_usage_percent"), (int, float)):
+            facts.append(f"CPU {result['cpu_usage_percent']:g}%")
+        if isinstance(result.get("cpu_temp_celsius"), (int, float)):
+            facts.append(f"CPU {result['cpu_temp_celsius']:g}°C")
+        if isinstance(result.get("ram_usage_percent"), (int, float)):
+            facts.append(f"RAM {result['ram_usage_percent']:g}%")
+        if isinstance(result.get("uptime_seconds"), (int, float)):
+            uptime = int(result["uptime_seconds"])
+            days, remainder = divmod(uptime, 86_400)
+            hours, minutes = remainder // 3_600, (remainder % 3_600) // 60
+            if days:
+                facts.append(f"uptime {days}d {hours}h")
+            elif hours:
+                facts.append(f"uptime {hours}h {minutes}m")
+            else:
+                facts.append(f"uptime {minutes}m")
+        if result.get("running_containers") is not None and result.get("total_containers") is not None:
+            facts.append(f"{result['running_containers']}/{result['total_containers']} containers running")
+        alerts = result.get("firing_alerts")
+        if isinstance(alerts, list):
+            facts.append("no firing alerts" if not alerts else "firing alerts: " + ", ".join(str(alert) for alert in alerts[:5]))
+        return "Server health: " + "; ".join(facts) + "." if facts else "I couldn't read usable server health details."
+    if tool == "get_gpu_status":
+        gpus = [gpu for gpu in result.get("gpus", []) if isinstance(gpu, dict)]
+        if not gpus:
+            return "I can't read GPU telemetry right now."
+        labels = []
+        for gpu in gpus:
+            model = gpu.get("model") or "GPU"
+            facts = []
+            if gpu.get("vram_used_mib") is not None and gpu.get("vram_total_mib") is not None:
+                facts.append(f"{gpu['vram_used_mib']} MiB of {gpu['vram_total_mib']} MiB VRAM")
+            if gpu.get("utilization_percent") is not None:
+                facts.append(f"{gpu['utilization_percent']}% utilization")
+            if gpu.get("temperature_c") is not None:
+                facts.append(f"{gpu['temperature_c']}°C")
+            labels.append(f"{model}: " + ", ".join(facts) if facts else str(model))
+        return "; ".join(labels) + "."
+    if tool == "plex_library_counts":
+        libraries = [library for library in result.get("libraries", []) if isinstance(library, dict)]
+        if not libraries:
+            return "I couldn't find any Plex library counts to report."
+        labels = []
+        for library in libraries:
+            name = library.get("library") or library.get("type") or "library"
+            items = library.get("items")
+            if isinstance(items, int):
+                labels.append(f"{name}: {items}")
+        return "Plex library counts: " + "; ".join(labels) + "." if labels else "I couldn't read usable Plex library counts."
+    if tool in {"unraid_container_status", "get_container_status"}:
+        if result.get("found") is False:
+            name = result.get("name") or result.get("container") or "that container"
+            return f"I couldn't find a container named {name}."
+        name = result.get("name") or result.get("container") or "That container"
+        state = result.get("state") or result.get("status")
+        if state is None:
+            return f"I couldn't read the current status for {name}."
+        details = [str(state)]
+        if result.get("status") and result.get("status") != state:
+            details.append(str(result["status"]))
+        if result.get("cpu_percent") is not None:
+            details.append(f"CPU {result['cpu_percent']:g}%")
+        if result.get("memory_display"):
+            details.append(f"memory {result['memory_display']}")
+        return f"{name} is " + ", ".join(details) + "."
     if tool in {"home_find_device", "home_get_state", "home_get_area_state"}:
         if result.get("status") == "ambiguous":
             candidates = result.get("candidates") or []
@@ -1486,22 +1668,39 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
             arguments = {**arguments, "location": None}
     discovery_audit({"event": "tool_call", "client_id": client_id, "request_id": request_id, "tool": name, "arguments": {k: v for k, v in arguments.items() if not any(secret in k.casefold() for secret in ("key", "token", "password", "secret"))}})
     try:
+        tool_call_id = "tool-" + uuid.uuid4().hex
+        correlation = turn_trace_context.get()
+        trace_id = str(correlation.get("trace_id") or request_id)
+        turn_id = str(correlation.get("turn_id") or request_id)
         async with httpx.AsyncClient(timeout=15) as http:
             response = await http.post(f"{TOOLS_URL}/invoke", json={
                 "name": name, "arguments": arguments, "client_id": client_id,
-                "session_id": request_id, "confirmed": confirmed, "action_id": action_id})
+                "session_id": client_id, "confirmed": confirmed, "action_id": action_id,
+                "trace_id": trace_id, "turn_id": turn_id, "tool_call_id": tool_call_id},
+                headers=_tools_service_headers())
             if response.status_code == 404:
-                return {"tool": name, "status": "error", "result": {"error": "That tool is not enabled."}}
+                return {"tool": name, "status": "error", "transport_ok": True, "operation_ok": False,
+                        "tool_call_id": tool_call_id, "result": {"error": "That tool is not enabled.", "evidence_available": False}}
             response.raise_for_status()
             payload = response.json()
             result = payload.get("result") if isinstance(payload, dict) else {}
             # Keep image evidence in the in-process result so evidence_message()
             # can attach it to Ollama's multimodal request. The audit record only
             # stores keys and provenance, never the image bytes themselves.
-            discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id, "tool": name, "status": payload.get("status"), "duration_ms": round((time.perf_counter() - started) * 1000, 2), "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [], "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
+            discovery_audit({"event": "tool_result", "client_id": client_id, "request_id": request_id,
+                             "trace_id": payload.get("trace_id") or trace_id, "turn_id": payload.get("turn_id") or turn_id,
+                             "tool_call_id": payload.get("tool_call_id") or tool_call_id, "tool": name,
+                             "status": payload.get("status"), "transport_ok": payload.get("transport_ok", True),
+                             "operation_ok": payload.get("operation_ok", payload.get("status") == "ok"),
+                             "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                             "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [],
+                             "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
             return payload
     except Exception as exc:
-        return {"tool": name, "status": "error", "result": {"error": "Tool service unavailable", "detail": type(exc).__name__, "duration_ms": round((time.perf_counter() - started) * 1000, 2)}}
+        return {"tool": name, "status": "error", "transport_ok": False, "operation_ok": False,
+                "tool_call_id": locals().get("tool_call_id"),
+                "result": {"error": "Tool service unavailable", "detail": type(exc).__name__, "evidence_available": False,
+                           "duration_ms": round((time.perf_counter() - started) * 1000, 2)}}
 
 
 ARTIST_ALIASES = {"travis": "Travis Scott", "travis scott": "Travis Scott"}
@@ -3015,13 +3214,16 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     if not arguments.get("workflow_id") or not arguments.get("canonical_external_id"):
         return
     arguments["confirmation_context"] = record
-    arguments["session_id"] = request_id
+    # The planner and executor bind authorization to the conversation, not a
+    # single transport turn. This is the same isolated Open WebUI session key
+    # used for every in-memory state map and forwarded in the Tools envelope.
+    arguments["session_id"] = client_id
     pending[client_id] = {
         "name": "media_standard_request" if record.get("operation", "").startswith("cli_debrid.") else "media_execute_goal",
         "arguments": arguments,
         "action_id": record.get("confirmation_id") or str(uuid.uuid4()),
         "conversation_id": client_id,
-        "session_id": request_id,
+        "session_id": client_id,
         "expires": time.time() + 120,
         "workflow_id": record.get("workflow_id"),
         "canonical_external_id": record.get("canonical_external_id"),
@@ -3824,7 +4026,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if (enrichment_hint or fresh_title) and not has_competing_domain:
             enriched = unresolved_subject.enrich(title_or_name=fresh_title, **(enrichment_hint or {}))
             enriched_goal = enriched.resolution_goal_text()
-            result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": request_id}, client_id, request_id)
+            result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_enriched = [result]
             if plan_result.get("canonical_identity"):
@@ -3880,7 +4082,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             context_cleared = dict(conversation_context.get(client_id, {}))
             context_cleared.pop("pending_title_clarification", None)
             conversation_context[client_id] = context_cleared
-            result = await invoke_tool("media_plan_goal", {"goal": candidate_title, "session_id": request_id}, client_id, request_id)
+            result = await invoke_tool("media_plan_goal", {"goal": candidate_title, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_clarified = [result]
             if plan_result.get("canonical_identity"):
@@ -3941,7 +4143,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             media_type = resolved.get("media_type")
             type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
             disambiguated_goal = f"{disambiguation.get('original_goal', '')} {title} {year or ''} {type_word}".strip()
-            result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": request_id}, client_id, request_id)
+            result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": client_id}, client_id, request_id)
             live_results_resolved = [result]
             resolved_text = media_plan_response(user_text, live_results_resolved)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
@@ -4294,7 +4496,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         for name, planned_args in planned:
             args = planned_args
             if name == "media_plan_goal" and isinstance(args, dict):
-                args = {**args, "session_id": request_id}
+                args = {**args, "session_id": client_id}
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             planned_result = await invoke_tool(name, args, client_id, request_id)
@@ -4444,7 +4646,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     "arguments": requested,
                     "action_id": result.get("action_id") or str(uuid.uuid4()),
                     "conversation_id": client_id,
-                    "session_id": request_id,
+                    "session_id": client_id,
                     "expires": time.time() + 60,
                 }
                 target = requested.get("name", "the container")
@@ -4608,7 +4810,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                         messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(compact_research_result("web_fetch", fetched.get("result", {}) if isinstance(fetched.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                         fetch_limit -= 1
                 if result.get("status") == "confirmation_required":
-                    pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": request_id, "expires": time.time() + 60}
+                    pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": client_id, "expires": time.time() + 60}
                     messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                 else:
                     messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
@@ -4878,24 +5080,51 @@ def _require_openai_auth(request: Request) -> None:
 
 
 def _openai_session_id(request: Request, body: dict) -> str:
+    """Return an isolated, opaque session key for an OpenAI-compatible turn.
+
+    Open WebUI v0.11.3 forwards its authenticated user UUID and chat UUID as
+    ``X-OpenWebUI-User-Id`` and ``X-OpenWebUI-Chat-Id`` when
+    ``ENABLE_FORWARD_USER_INFO_HEADERS=true``.  Those headers are the normal
+    production identity contract.  In particular, do not derive an identity
+    from message content: two new chats can quite legitimately start with the
+    same prompt.
+
+    A non-Open-WebUI OpenAI client may provide explicit metadata or an owned
+    ``X-Home-AI-Session-Id``.  A caller that provides neither is deliberately
+    treated as a one-turn legacy session.  The generated UUID avoids state
+    sharing; it is returned in ``X-Home-AI-Session`` so an owned legacy client
+    can opt into continuation by returning it on its next turn.
+    """
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
-    user = str(metadata.get("user_id") or body.get("user") or request.headers.get("x-openwebui-user-id") or "default")
-    chat = str(metadata.get("chat_id") or body.get("chat_id") or request.headers.get("x-openwebui-chat-id") or "").strip()
-    if not chat:
-        # OpenAI-compatible callers are stateless by protocol.  Open WebUI
-        # normally sends the complete message list, so use the first user
-        # turn as a deterministic fallback conversation key when it does not
-        # forward its chat UUID.  A forwarded chat_id always wins.
-        messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-        first = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"), {})
-        content = first.get("content", "") if isinstance(first, dict) else ""
-        if isinstance(content, list):
-            content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-        import hashlib
-        chat = "derived-" + hashlib.sha256(str(content).encode("utf-8")).hexdigest()[:24]
-    safe_user = re.sub(r"[^A-Za-z0-9_.:-]", "_", user)[:80] or "default"
-    safe_chat = re.sub(r"[^A-Za-z0-9_.:-]", "_", chat)[:120]
-    return f"webui:{safe_user}:{safe_chat}"
+    header_user = str(request.headers.get("x-openwebui-user-id") or "").strip()
+    header_chat = str(request.headers.get("x-openwebui-chat-id") or "").strip()
+    metadata_user = str(metadata.get("user_id") or "").strip()
+    metadata_chat = str(metadata.get("chat_id") or body.get("chat_id") or "").strip()
+    user = header_user or metadata_user
+    chat = header_chat or metadata_chat
+    if user and chat:
+        # Percent-encoding is lossless and keeps component boundaries
+        # unambiguous. Replacing punctuation with '_' caused distinct
+        # metadata callers to collide; ':' also made the tuple ambiguous.
+        safe_user = quote(user, safe="-._~") or "anonymous"
+        safe_chat = quote(chat, safe="-._~")
+        return f"openwebui:{safe_user}:{safe_chat}"
+
+    # This is intentionally an explicit, client-supplied continuation token,
+    # never a function of the prompt.  Bound it before using it as an in-memory
+    # map key or forwarding it to Home-AI-Tools.
+    legacy = str(
+        request.headers.get("x-home-ai-session-id")
+        or metadata.get("session_id")
+        or body.get("session_id")
+        or ""
+    ).strip()
+    if not legacy:
+        legacy = uuid.uuid4().hex
+    if legacy.startswith("legacy:"):
+        legacy = legacy.removeprefix("legacy:")
+    safe_legacy = quote(legacy, safe="-._~") or uuid.uuid4().hex
+    return f"legacy:{safe_legacy}"
 
 
 def _latest_user_message(body: dict) -> str:
@@ -4956,12 +5185,29 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
         if not answer:
             raise HTTPException(502, detail="Home-AI produced no assistant response")
         return answer, client_id, []
-    request_id = f"{client_id}-{time.time_ns()}"
+    request_id = "req-" + uuid.uuid4().hex
+    turn_id = "turn-" + uuid.uuid4().hex
+    trace_id = "trace-" + uuid.uuid4().hex
+    correlation = {
+        "frontend": "openwebui" if client_id.startswith("openwebui:") else "openai-compatible",
+        "frontend_user_id": str(request.headers.get("x-openwebui-user-id") or "")[:80],
+        "frontend_chat_id": str(request.headers.get("x-openwebui-chat-id") or "")[:120],
+        "home_ai_session_id": client_id,
+        "request_id": request_id,
+        "turn_id": turn_id,
+        "trace_id": trace_id,
+    }
+    # Correlation events contain opaque IDs only: never prompts, bearer
+    # tokens, authorization headers, or tool payloads.
+    setattr(request, "_home_ai_correlation", correlation)
+    discovery_audit({"event": "openai_turn_start", **correlation})
     sink = _OpenAIResponseSocket()
     token = tts_suppressed.set(True)
+    trace_token = turn_trace_context.set(correlation)
     try:
         await respond(sink, client_id, request_id, user_text)
     finally:
+        turn_trace_context.reset(trace_token)
         tts_suppressed.reset(token)
     # Each individual emit_answer() call already collapses an internal
     # adjacent duplicate, but respond() can emit more than one text message
@@ -4977,6 +5223,10 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     trace = next((item.get("tools", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
     if not answer:
         raise HTTPException(502, detail="Home-AI produced no assistant response")
+    discovery_audit({"event": "openai_turn_complete", **correlation,
+                     "tool_count": len(trace), "tool_statuses": [
+                         {"tool": item.get("tool"), "status": item.get("status")} for item in trace
+                     ]})
     return answer, client_id, trace
 
 
@@ -4987,7 +5237,7 @@ def openai_tool_trace_footer(trace: list[dict]) -> str:
     rows = []
     for item in trace:
         tool = str(item.get("tool") or "unknown")
-        status = str(item.get("status") or "unknown")
+        status = str(item.get("status") or "unknown").replace("_", " ")
         rows.append(f"- `{tool}` — {status}")
     # Keep this as ordinary Markdown because Open WebUI may display raw HTML
     # rather than sanitizing it into a hidden DOM region. The speech endpoint
@@ -5047,6 +5297,13 @@ async def openai_chat_completions(request: Request):
     answer = display_answer
     completion_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
+    correlation = getattr(request, "_home_ai_correlation", {})
+    response_headers = {
+        "X-Home-AI-Session": session_id,
+        "X-Home-AI-Request": str(correlation.get("request_id") or ""),
+        "X-Home-AI-Turn": str(correlation.get("turn_id") or ""),
+        "X-Home-AI-Trace": str(correlation.get("trace_id") or ""),
+    }
     if body.get("stream"):
         async def events():
             chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
@@ -5056,10 +5313,13 @@ async def openai_chat_completions(request: Request):
                      "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Home-AI-Session": session_id})
-    return {"id": completion_id, "object": "chat.completion", "created": created, "model": OPENAI_COMPAT_MODEL,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", **response_headers})
+    return JSONResponse(
+        content={"id": completion_id, "object": "chat.completion", "created": created, "model": OPENAI_COMPAT_MODEL,
+                 "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+        headers=response_headers,
+    )
 
 
 @app.post("/v1/audio/transcriptions")

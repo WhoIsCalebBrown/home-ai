@@ -26,4 +26,5 @@
   <Config Name="TTS model" Target="AUDIO_TTS_MODEL" Default="tts-1" Mode="" Description="Compatibility model name translated by Home-AI." Type="Variable" Display="advanced" Required="true" Mask="false">tts-1</Config>
   <Config Name="TTS voice" Target="AUDIO_TTS_VOICE" Default="alloy" Mode="" Description="Voice name accepted by the compatibility facade." Type="Variable" Display="advanced" Required="true" Mask="false">alloy</Config>
   <Config Name="Disable Ollama integration" Target="ENABLE_OLLAMA_API" Default="false" Mode="" Description="Keep Open WebUI from becoming a second agent/provider." Type="Variable" Display="advanced" Required="true" Mask="false">false</Config>
+  <Config Name="Forward authenticated session identity" Target="ENABLE_FORWARD_USER_INFO_HEADERS" Default="true" Mode="" Description="Forward Open WebUI's authenticated user ID and chat ID to the private Home-AI provider so conversation state is isolated per user and chat." Type="Variable" Display="advanced" Required="true" Mask="false">true</Config>
 </Container>

@@ -7,6 +7,17 @@ from pathlib import Path
 import httpx
 
 
+class _Request:
+    def __init__(self, token: str):
+        self.headers = {"X-Home-AI-Tools-Token": token}
+
+
+def _invoke(module, request):
+    module.TOOLS_SERVICE_TOKEN_FILE = ""
+    module.TOOLS_SERVICE_TOKEN = "qa-tools-token"
+    return module.invoke(_Request("qa-tools-token"), request)
+
+
 def _load_tools():
     path = Path(__file__).parents[1] / "tools" / "server-tools-app.py"
     spec = importlib.util.spec_from_file_location("home_ai_tools_failure_contract", path)
@@ -28,7 +39,7 @@ def test_timeout_is_structured_and_contains_no_evidence(tmp_path):
         await asyncio.sleep(13)
 
     _install(module, slow)
-    result = asyncio.run(module.invoke(module.Invoke(name="qa_failure_probe")))
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_failure_probe")))
     assert result["status"] == "timeout"
     assert result["result"]["error_code"] == "TIMEOUT"
     assert result["result"]["evidence_available"] is False
@@ -44,7 +55,7 @@ def test_http_500_is_backend_unavailable_not_success(tmp_path):
         raise httpx.HTTPStatusError("qa", request=request, response=response)
 
     _install(module, failing)
-    result = asyncio.run(module.invoke(module.Invoke(name="qa_failure_probe")))
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_failure_probe")))
     assert result["status"] == "unavailable"
     assert result["result"]["error_code"] == "BACKEND_UNAVAILABLE"
     assert result["result"]["http_status"] == 500
@@ -59,7 +70,7 @@ def test_malformed_success_payload_is_invalid_tool_result(tmp_path):
         return ["not", "a", "mapping"]
 
     _install(module, malformed)
-    result = asyncio.run(module.invoke(module.Invoke(name="qa_failure_probe")))
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_failure_probe")))
     assert result["status"] == "error"
     assert result["result"]["error_code"] == "INVALID_TOOL_RESULT"
     assert result["result"]["evidence_available"] is False

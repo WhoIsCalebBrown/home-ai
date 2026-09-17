@@ -1,7 +1,7 @@
 """Contract tests for the additive OpenAI-compatible Home-AI facade."""
 
-import hashlib
 from pathlib import Path
+from urllib.parse import quote
 
 
 SOURCE = Path(__file__).with_name("voice-api-app.py")
@@ -29,10 +29,11 @@ def _load_helpers():
     selected = [
         node for node in tree.body
         if isinstance(node, ast.Import)
-        and any(alias.name == "re" for alias in node.names)
+        and any(alias.name in {"re", "uuid"} for alias in node.names)
     ]
     selected += [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names) or is_needed_assignment(node)]
     namespace["Request"] = object
+    namespace["quote"] = quote
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
     return module
 
@@ -57,16 +58,45 @@ def test_latest_user_message_ignores_frontend_system_and_assistant_messages():
 def test_explicit_chat_id_maps_to_isolated_home_ai_session():
     module = _load_helpers()
     session = module._openai_session_id(Request(), {"metadata": {"user_id": "u1", "chat_id": "chat-a"}})
-    assert session == "webui:u1:chat-a"
-    assert session != "webui:u1:chat-b"
+    assert session == "openwebui:u1:chat-a"
+    assert session != "openwebui:u1:chat-b"
 
 
-def test_stateless_provider_fallback_derives_stable_chat_key_from_first_user_turn():
+def test_same_chat_id_isolated_between_openwebui_users():
+    """A frontend chat id is only unique within its owning user account."""
     module = _load_helpers()
-    body = {"messages": [{"role": "user", "content": "What's the weather?"}]}
-    actual = module._openai_session_id(Request(), body)
-    expected = "webui:default:derived-" + hashlib.sha256(b"What's the weather?").hexdigest()[:24]
-    assert actual == expected
+    user_a = module._openai_session_id(
+        Request(), {"metadata": {"user_id": "user-a", "chat_id": "shared-looking-id"}}
+    )
+    user_b = module._openai_session_id(
+        Request(), {"metadata": {"user_id": "user-b", "chat_id": "shared-looking-id"}}
+    )
+    assert user_a == "openwebui:user-a:shared-looking-id"
+    assert user_b == "openwebui:user-b:shared-looking-id"
+    assert user_a != user_b
+
+
+def test_deployed_openwebui_headers_are_the_primary_identity_contract():
+    module = _load_helpers()
+    request = Request({"x-openwebui-user-id": "owui-user", "x-openwebui-chat-id": "owui-chat"})
+    assert module._openai_session_id(request, {"metadata": {"user_id": "wrong-user", "chat_id": "wrong-chat"}}) == "openwebui:owui-user:owui-chat"
+
+
+def test_identical_first_prompts_without_identity_never_share_state():
+    """Legacy callers are bounded to one turn rather than prompt-derived."""
+    module = _load_helpers()
+    body = {"messages": [{"role": "user", "content": "What's that Tom Hanks movie where he's on an island with a volleyball?"}]}
+    first = module._openai_session_id(Request(), body)
+    second = module._openai_session_id(Request(), body)
+    assert first.startswith("legacy:")
+    assert second.startswith("legacy:")
+    assert first != second
+
+
+def test_legacy_client_can_continue_only_with_its_explicit_session_token():
+    module = _load_helpers()
+    request = Request({"x-home-ai-session-id": "client-generated-session-123"})
+    assert module._openai_session_id(request, {"messages": []}) == "legacy:client-generated-session-123"
 
 
 def test_session_key_sanitizes_untrusted_identifiers():
@@ -74,7 +104,13 @@ def test_session_key_sanitizes_untrusted_identifiers():
     actual = module._openai_session_id(
         Request(), {"metadata": {"user_id": "u/one", "chat_id": "../../other"}}
     )
-    assert actual == "webui:u_one:.._.._other"
+    assert actual == "openwebui:u%2Fone:..%2F..%2Fother"
+
+
+def test_legacy_response_token_can_be_echoed_without_double_prefix():
+    module = _load_helpers()
+    request = Request({"x-home-ai-session-id": "legacy:client-generated-session-123"})
+    assert module._openai_session_id(request, {"messages": []}) == "legacy:client-generated-session-123"
 
 
 # --- OpenWebUI internal housekeeping detection (real production bug: these ---

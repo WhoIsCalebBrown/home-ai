@@ -333,8 +333,8 @@ def test_cli_debrid_standard_request_accepts_bound_standard_mode():
 
 
 def test_pending_confirmation_is_invalidated_when_live_provider_already_has_item():
-    workflow = {"confirmation_status": "PENDING"}
-    module._invalidate_confirmation(workflow, "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
+    workflow = {"confirmation_id": "confirm-a", "confirmation_status": "PENDING"}
+    module._invalidate_confirmation(workflow, "confirm-a", "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
     assert workflow["confirmation_status"] == "INVALIDATED"
     assert workflow["confirmation_invalidated_reason"] == "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS"
 

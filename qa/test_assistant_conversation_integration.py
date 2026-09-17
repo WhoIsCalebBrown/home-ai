@@ -369,7 +369,10 @@ class FakeToolsBackend:
         if name == "investigate_downloads":
             return {"tool": name, "status": "ok", "result": {"investigation": "downloads", "sources_checked": ["qbittorrent"], "sources": {"qbittorrent": {"torrent_count": 269, "active_count": 0}}}}
         if name == "unraid_container_status":
-            return {"tool": name, "status": "ok", "result": {"container": arguments.get("container"), "state": "running", "uptime_seconds": 921550, "memory_usage_bytes": 512_000_000}}
+            return {"tool": name, "status": "ok", "result": {
+                "name": arguments.get("container"), "state": "running",
+                "memory_display": "512 MB", "cpu_percent": 2.5,
+            }}
         if name == "unraid_storage_status":
             return {"tool": name, "status": "ok", "result": {"target": arguments.get("target"), "used_percent": 57.0, "free_bytes": 212_000_000_000}}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
@@ -522,7 +525,7 @@ def session(app, backend):
             self.backend = backend
             self.app = app
 
-        async def turn(self, user_text: str, ollama_script: list[dict] | None = None, final_text: str = "") -> str:
+        async def turn_for(self, turn_client_id: str, user_text: str, ollama_script: list[dict] | None = None, final_text: str = "") -> str:
             """Run one respond() turn with the fakes wired in, return the
             final spoken/text answer for convenience.
 
@@ -538,9 +541,12 @@ def session(app, backend):
             app.httpx = httpx_fake
             self.last_stream_payload = None
             before = len(ws.sent)
-            await app.respond(ws, client_id, request_id, user_text)
+            await app.respond(ws, turn_client_id, request_id, user_text)
             self.last_stream_payload = httpx_fake.last_stream_payload
             return "\n".join(m["text"] for m in ws.sent[before:] if m.get("type") == "text")
+
+        async def turn(self, user_text: str, ollama_script: list[dict] | None = None, final_text: str = "") -> str:
+            return await self.turn_for(self.client_id, user_text, ollama_script, final_text)
 
     return Driver()
 
@@ -1191,6 +1197,34 @@ async def test_concurrent_sessions_do_not_leak_subjects_or_offers(app, backend):
     assert len(backend.submitted_writes) == 1
     assert backend.submitted_writes[0]["arguments"]["confirmation_context"]["title"] == "Dune"
     assert client_b in app.pending, "confirming session A must never consume or clear session B's pending confirmation"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_and_offer_in_one_openwebui_chat_are_invisible_to_another(session):
+    """A bare confirmation in chat B must never observe or consume chat A.
+
+    The IDs use the exact Open WebUI session-key shape produced by the
+    compatibility facade.  This exercises the real ``respond`` lookup path,
+    rather than merely asserting that two Python dict keys differ.
+    """
+    chat_a = "openwebui:user-a:chat-a"
+    chat_b = "openwebui:user-a:chat-b"
+    staged_confirmation = {"name": "media_standard_request", "action_id": "only-a", "expires": time.time() + 60}
+    staged_offer = session.app.PendingOffer.create(
+        session_id=chat_a, subject_ref="subject-a", operation="media_plan_goal"
+    )
+    session.app.pending[chat_a] = staged_confirmation
+    session.app.pending_offers[chat_a] = {"offer": staged_offer, "arguments": {"goal": "The Room"}, "description": "A only"}
+    session.app.conversation_context[chat_a] = {"latest_resolved_referent": "The Room", "operation": "media_request"}
+    session.app.sessions[chat_a] = [{"role": "user", "content": "Get The Room."}]
+
+    await session.turn_for(chat_b, "Yes.", final_text="I need an active request in this chat first.")
+
+    assert session.app.pending[chat_a] is staged_confirmation
+    assert session.app.pending_offers[chat_a]["offer"] is staged_offer
+    assert chat_b not in session.app.pending
+    assert chat_b not in session.app.pending_offers
+    assert session.backend.submitted_writes == []
 
 
 # --- Failure injection: Plex unavailable during an accepted offer (#15) --
@@ -2239,7 +2273,7 @@ async def test_named_container_status_result_is_not_silently_dropped_before_synt
         "Is Plex running?",
         final_text="Yes, Plex is running and has been up for about 10 days.",
     )
-    assert reply == "Yes, Plex is running and has been up for about 10 days."
+    assert reply == "Plex is running, CPU 2.5%, memory 512 MB."
 
 
 @pytest.mark.asyncio
@@ -2262,7 +2296,7 @@ async def test_storage_followup_naming_a_container_continues_the_server_topic_en
         "What about Plex?",
         final_text="Plex is running and using about 512 megabytes of memory.",
     )
-    assert reply == "Plex is running and using about 512 megabytes of memory."
+    assert reply == "Plex is running, CPU 2.5%, memory 512 MB."
 
 
 @pytest.mark.asyncio
@@ -2277,7 +2311,7 @@ async def test_home_ai_container_memory_result_is_not_silently_dropped_before_sy
         "How much memory is Home-AI using?",
         final_text="Home-AI-Assistant is using about 512 megabytes of memory.",
     )
-    assert reply == "Home-AI-Assistant is using about 512 megabytes of memory."
+    assert reply == "Home-AI-Assistant is running, CPU 2.5%, memory 512 MB."
 
 
 @pytest.mark.asyncio

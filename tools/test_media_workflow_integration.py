@@ -202,6 +202,43 @@ async def test_repeated_status_observation_does_not_duplicate_transition_events(
 
 
 @pytest.mark.asyncio
+async def test_same_title_plans_keep_each_chat_confirmation_isolated_without_a_write(app, monkeypatch):
+    """Global acquisition dedupe must not become global authorization state."""
+    module, _events = app
+    plan_a = await module.media_plan_goal({
+        "goal": "get Dune 2021", "media_type": "movie", "session_id": "openwebui:user:chat-a",
+    })
+    plan_b = await module.media_plan_goal({
+        "goal": "get Dune 2021", "media_type": "movie", "session_id": "openwebui:user:chat-b",
+    })
+    assert plan_a["workflow_id"] == plan_b["workflow_id"]
+    assert plan_a["confirmation_record"]["confirmation_id"] != plan_b["confirmation_record"]["confirmation_id"]
+
+    workflow = next(row for row in module._media_workflows() if row["workflow_id"] == plan_a["workflow_id"])
+    pending = {item["confirmation_id"]: item for item in workflow["pending_confirmations"]}
+    assert pending[plan_a["confirmation_record"]["confirmation_id"]]["session_id"] == "openwebui:user:chat-a"
+    assert pending[plan_b["confirmation_record"]["confirmation_id"]]["session_id"] == "openwebui:user:chat-b"
+
+    # Positive live evidence turns execution into a read-only no-op after all
+    # confirmation/session/hash validation. Reaching no_op proves Chat B's
+    # planning did not invalidate Chat A; no HTTP write boundary is reached.
+    monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence",
+                        lambda _payload: {"matched": True, "rows": [{"state": "queued"}]})
+    result = await module.media_standard_request({
+        "workflow_id": plan_a["workflow_id"], "media_type": "movie",
+        "canonical_external_id": 438631,
+        "confirmation_context": plan_a["confirmation_record"],
+        "session_id": "openwebui:user:chat-a",
+    })
+    assert result["status"] == "no_op"
+    assert result["write_executed"] is False
+    workflow = next(row for row in module._media_workflows() if row["workflow_id"] == plan_a["workflow_id"])
+    statuses = {item["confirmation_id"]: item["status"] for item in workflow["pending_confirmations"]}
+    assert statuses[plan_a["confirmation_record"]["confirmation_id"]] == "INVALIDATED"
+    assert statuses[plan_b["confirmation_record"]["confirmation_id"]] == "PENDING"
+
+
+@pytest.mark.asyncio
 async def test_status_check_finds_a_real_confirmed_request_by_natural_phrasing(app, monkeypatch):
     """Real bug found investigating a recurring user pain point ("after
     successfully requesting a movie, asking about its status later says it

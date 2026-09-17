@@ -4,6 +4,7 @@ import base64
 import difflib
 import contextvars
 import html
+import hmac
 import hashlib
 import ipaddress
 import json
@@ -25,7 +26,7 @@ from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # Several test harnesses load this file directly via
@@ -46,6 +47,15 @@ from workflow_events import log_event_safe
 
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
 TOOL_CONTRACT_VERSION = "1.0"
+
+# This is a service-to-service credential, not an end-user or model credential.
+# Home-AI Assistant reads the same private file and is the only supported caller
+# of the typed capability API.  Keep the default fail-closed: a Tools service
+# with no configured credential must not silently become an unauthenticated
+# privileged adapter merely because a deployment variable was omitted.
+TOOLS_SERVICE_TOKEN = os.getenv("TOOLS_SERVICE_TOKEN", "")
+TOOLS_SERVICE_TOKEN_FILE = os.getenv("TOOLS_SERVICE_TOKEN_FILE", "")
+TOOLS_SERVICE_TOKEN_HEADER = "X-Home-AI-Tools-Token"
 
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
 UNRAID_MCP_URL = os.getenv("UNRAID_MCP_URL", f"{TOWER}:8043/mcp").rstrip("/")
@@ -138,6 +148,31 @@ MUSIC_ENRICHER_DB = Path("/config/music-enricher/state.sqlite3")
 AUDIT_CONTEXT: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar("audit_context", default={})
 
 
+def tools_service_token() -> str:
+    """Return the private Assistant->Tools credential without logging it."""
+    if TOOLS_SERVICE_TOKEN_FILE:
+        try:
+            return Path(TOOLS_SERVICE_TOKEN_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return TOOLS_SERVICE_TOKEN.strip()
+
+
+async def require_tools_service_auth(request: Request) -> None:
+    """Protect capability discovery and invocation from peer-container calls.
+
+    `/health` remains an intentionally minimal unauthenticated liveness probe;
+    authenticated callers receive contract/registry details.  A constant-time
+    comparison avoids turning this private boundary into a token oracle.
+    """
+    expected = tools_service_token()
+    if not expected:
+        raise HTTPException(status_code=503, detail="tools service authentication is not configured")
+    supplied = request.headers.get(TOOLS_SERVICE_TOKEN_HEADER, "")
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="tools service authentication required")
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -223,6 +258,13 @@ def audit_result(value: Any, limit: int = 1200) -> Any:
 
 
 def audit(entry: dict[str, Any]) -> None:
+    entry = dict(entry)
+    arguments = entry.pop("arguments", None)
+    if isinstance(arguments, dict):
+        entry["argument_keys"] = sorted(str(key) for key in arguments)
+    result_summary = entry.pop("result_summary", None)
+    if isinstance(result_summary, dict):
+        entry["result_keys"] = sorted(str(key) for key in result_summary)
     AUDIT.parent.mkdir(parents=True, exist_ok=True)
     with AUDIT.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"timestamp": now(), **entry}, default=str) + "\n")
@@ -484,7 +526,11 @@ async def gpu_status(_: dict[str, Any]) -> dict[str, Any]:
             gpus.append({"model": name, "uuid": uid, "vram_used_mib": int(float(mem)), "vram_total_mib": int(float(total)), "utilization_percent": int(float(util)), "temperature_c": int(float(temp)), "power_w": float(power)})
         return {"gpus": gpus}
     except Exception as exc:
-        return {"error": "GPU telemetry unavailable", "detail": type(exc).__name__}
+        # Adapter failures are operation failures even though the HTTP handler
+        # itself completed.  The common /invoke contract converts this to an
+        # explicit unavailable status rather than showing the tool as "ok".
+        return {"error": "GPU telemetry unavailable", "error_code": "GPU_TELEMETRY_UNAVAILABLE",
+                "detail": type(exc).__name__, "evidence_available": False}
 
 
 async def list_containers(args: dict[str, Any]) -> dict[str, Any]:
@@ -2789,9 +2835,19 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
                            else f"{plan['writes_required'][0].get('owner')}.media_execute_goal"),
                 arguments=confirmation_arguments,
         )
+        pending_confirmations = [
+            item for item in workflow.get("pending_confirmations", [])
+            if isinstance(item, dict) and item.get("status") == "PENDING"
+            and item.get("confirmation_id") != plan["confirmation_record"]["confirmation_id"]
+        ][-19:]
+        pending_confirmations.append({
+            key: plan["confirmation_record"].get(key)
+            for key in ("confirmation_id", "session_id", "plan_version_hash", "expires_at", "status")
+        })
         workflow.update({"plan_version_hash": plan["confirmation_record"]["plan_version_hash"],
                          "confirmation_id": plan["confirmation_record"]["confirmation_id"],
-                         "confirmation_status": "PENDING"})
+                         "confirmation_status": "PENDING",
+                         "pending_confirmations": pending_confirmations})
         _save_media_workflows(rows)
         log_event_safe(workflow_id=workflow["workflow_id"], event_type="PLAN_CREATED",
                         canonical_subject_id=_subject_key, source_service="tools")
@@ -3174,12 +3230,49 @@ def _save_workflow_update(rows: list[dict[str, Any]], row: dict[str, Any]) -> No
     _save_media_workflows(rows)
 
 
-def _invalidate_confirmation(workflow: dict[str, Any], reason: str) -> None:
-    """Retire a pending approval when live revalidation proves no write is needed."""
-    if workflow.get("confirmation_status") == "PENDING":
+def _invalidate_confirmation(workflow: dict[str, Any], confirmation_id: str, reason: str) -> None:
+    """Retire only the invoking chat's approval after a proven no-op."""
+    for item in workflow.get("pending_confirmations", []):
+        if (isinstance(item, dict) and item.get("confirmation_id") == confirmation_id
+                and item.get("status") == "PENDING"):
+            item.update({"status": "INVALIDATED", "reason": reason, "updated_at": now()})
+    if workflow.get("confirmation_id") == confirmation_id and workflow.get("confirmation_status") == "PENDING":
         workflow.update({"confirmation_status": "INVALIDATED",
                          "confirmation_invalidated_reason": reason,
                          "confirmation_invalidated_at": now()})
+
+
+def _workflow_confirmation(workflow: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any] | None:
+    """Return one session-bound authorization without coupling it to dedupe state.
+
+    A media workflow is globally idempotent by canonical title, while an
+    approval belongs to one frontend conversation. Multiple chats may plan
+    the same title; neither may replace or consume the other's authorization.
+    The legacy singleton fields remain a bounded rollout fallback for records
+    created by the previous deployed image.
+    """
+    confirmation_id = binding.get("confirmation_id")
+    match = next((item for item in workflow.get("pending_confirmations", [])
+                  if isinstance(item, dict) and item.get("confirmation_id") == confirmation_id), None)
+    if match:
+        return match
+    if confirmation_id == workflow.get("confirmation_id"):
+        return {
+            "confirmation_id": confirmation_id,
+            "session_id": binding.get("session_id"),
+            "plan_version_hash": workflow.get("plan_version_hash"),
+            "status": workflow.get("confirmation_status"),
+        }
+    return None
+
+
+def _set_workflow_confirmation_status(workflow: dict[str, Any], confirmation_id: str, status: str) -> None:
+    for item in workflow.get("pending_confirmations", []):
+        if isinstance(item, dict) and item.get("confirmation_id") == confirmation_id:
+            item.update({"status": status, "updated_at": now()})
+            break
+    if workflow.get("confirmation_id") == confirmation_id:
+        workflow["confirmation_status"] = status
 
 
 async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
@@ -3240,13 +3333,16 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     storage_policy = media_storage_policy_for(storage_kind)
     if not storage_policy or not storage_policy.get("standard"):
         return {"status": "rejected", "reason": "STANDARD_STORAGE_POLICY_MISSING", "write_executed": False}
-    if str(workflow.get("plan_version_hash")) != str(binding.get("plan_version_hash")):
+    authorization = _workflow_confirmation(workflow, binding)
+    if not authorization:
+        return {"status": "rejected", "reason": "CONFIRMATION_ID_MISMATCH", "write_executed": False}
+    if str(authorization.get("plan_version_hash")) != str(binding.get("plan_version_hash")):
         return {"status": "rejected", "reason": "PLAN_HASH_MISMATCH", "write_executed": False}
     if workflow.get("canonical_identity", {}).get("tmdb_id") != payload["mediaId"]:
         return {"status": "rejected", "reason": "CANONICAL_ID_MISMATCH", "write_executed": False}
-    if binding.get("confirmation_id") != workflow.get("confirmation_id"):
-        return {"status": "rejected", "reason": "CONFIRMATION_ID_MISMATCH", "write_executed": False}
-    if workflow.get("confirmation_status") != "PENDING":
+    if str(authorization.get("session_id")) != str(binding.get("session_id")):
+        return {"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID", "write_executed": False}
+    if authorization.get("status") != "PENDING":
         return {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}
     title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
     # Persisted lifecycle state is correlation/history, not proof of a live
@@ -3259,7 +3355,7 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                 "write_executed": False, "workflow_id": workflow_id,
                 "evidence": live_evidence}
     if live_evidence.get("matched"):
-        _invalidate_confirmation(workflow, "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
+        _invalidate_confirmation(workflow, str(binding["confirmation_id"]), "LIVE_CLIDEBRID_REQUEST_OR_COLLECTION_EXISTS")
         raw = [str(item.get("state") or "") for item in live_evidence.get("rows", [])]
         workflow.update({"current_state": raw[0] if raw else workflow.get("current_state"),
                          "canonical_state": "REQUESTED", "storage_class": "debrid"})
@@ -3280,24 +3376,25 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                                                       "title": title, "year": identity.get("year"),
                                                       "canonical_external_ids": canonical_ids, "library": standard_library})
         if permanent.get("matched") and standard.get("matched"):
-            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES")
+            _invalidate_confirmation(workflow, str(binding["confirmation_id"]), "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "both"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES", "write_executed": False, "workflow_id": workflow_id}
         if permanent.get("matched"):
-            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_PERMANENTLY")
+            _invalidate_confirmation(workflow, str(binding["confirmation_id"]), "ALREADY_AVAILABLE_PERMANENTLY")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "permanent_local"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_PERMANENTLY", "write_executed": False, "workflow_id": workflow_id}
         if standard.get("matched"):
-            _invalidate_confirmation(workflow, "ALREADY_AVAILABLE_STANDARD")
+            _invalidate_confirmation(workflow, str(binding["confirmation_id"]), "ALREADY_AVAILABLE_STANDARD")
             workflow.update({"current_state": "AVAILABLE_IN_PLEX", "canonical_state": "AVAILABLE", "storage_class": "debrid"})
             _save_workflow_update(rows, workflow)
             return {"status": "no_op", "reason": "ALREADY_AVAILABLE_STANDARD", "write_executed": False, "workflow_id": workflow_id}
 
     # Claim the confirmation before the network write. A replay sees this
     # state and cannot submit the same standard request twice.
-    workflow.update({"confirmation_status": "SUBMITTING", "canonical_state": "REQUESTED", "mode": "standard"})
+    _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "SUBMITTING")
+    workflow.update({"canonical_state": "REQUESTED", "mode": "standard"})
     _save_workflow_update(rows, workflow)
     _identity_for_events = workflow.get("canonical_identity") or {}
     _subject_key = str(_identity_for_events.get("tmdb_id") or _identity_for_events.get("tvdb_id")
@@ -3318,7 +3415,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
             response_body = response.json() if response.content else {}
             transport_success = True
         except Exception as exc:
-            workflow.update({"confirmation_status": "CONSUMED", "canonical_state": "FAILED_INGESTION",
+            _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
+            workflow.update({"canonical_state": "FAILED_INGESTION",
                              "current_state": "FAILED_INGESTION", "failure_reason": "BRIDGE_UNAVAILABLE",
                              "last_attempt": {"route": "cli_debrid_webhook", "transport_success": False,
                                                "ingestion_confirmed": False, "error": type(exc).__name__,
@@ -3335,7 +3433,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     # before exposing REQUESTED to the conversation state.
     evidence = _cli_debrid_exact_item_evidence(webhook_payload)
     if not evidence.get("matched"):
-        workflow.update({"confirmation_status": "CONSUMED", "current_state": "FAILED_INGESTION",
+        _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
+        workflow.update({"current_state": "FAILED_INGESTION",
                          "canonical_state": "FAILED_INGESTION", "storage_class": "unknown",
                          "failure_reason": _cli_debrid_failure_reason(evidence),
                          "standard_library": storage_policy["standard"]["library"],
@@ -3350,7 +3449,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
                 "submission_transport_success": transport_success, "ingestion_confirmed": False,
                 "reason": _cli_debrid_failure_reason(evidence), "workflow_id": workflow_id,
                 "request_shape": payload, "response": response_body}
-    workflow.update({"confirmation_status": "CONSUMED", "current_state": "REQUESTED", "canonical_state": "REQUESTED",
+    _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
+    workflow.update({"current_state": "REQUESTED", "canonical_state": "REQUESTED",
                      "storage_class": "debrid", "standard_library": storage_policy["standard"]["library"],
                      "cli_debrid_state": "Wanted", "submitted_at": now(), "request_shape": payload,
                      "request_response": response_body,
@@ -4162,6 +4262,9 @@ class Invoke(BaseModel):
     session_id: str = "unknown"
     confirmed: bool = False
     action_id: str | None = None
+    trace_id: str | None = None
+    turn_id: str | None = None
+    tool_call_id: str | None = None
 
 
 def public_schema(item):
@@ -4172,12 +4275,24 @@ def public_schema(item):
 
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "tools": len(REGISTRY), "service": "server-tools", "contract_version": TOOL_CONTRACT_VERSION}
+async def health(request: Request):
+    # Keep unauthenticated health checks suitable for liveness only.  The
+    # capability count/version are useful to the Assistant startup check but
+    # are not exposed to arbitrary containers on the shared Docker network.
+    try:
+        await require_tools_service_auth(request)
+        authenticated = True
+    except HTTPException:
+        authenticated = False
+    payload = {"ok": True, "service": "server-tools"}
+    if authenticated:
+        payload.update({"tools": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION})
+    return payload
 
 
 @app.get("/registry")
-async def registry(groups: str = ""):
+async def registry(request: Request, groups: str = ""):
+    await require_tools_service_auth(request)
     requested = {item.strip() for item in groups.split(",") if item.strip()}
     services = {service for group in requested for service in GROUP_SERVICES.get(group, set())}
     discoverable = _discoverable_registry()
@@ -4186,13 +4301,15 @@ async def registry(groups: str = ""):
 
 
 @app.get("/media/capabilities")
-async def media_capabilities():
+async def media_capabilities(request: Request):
+    await require_tools_service_auth(request)
     return {"capabilities": MEDIA_CAPABILITY_REGISTRY, "lifecycle_states": MEDIA_LIFECYCLE,
             "write_execution": "disabled_until_planner_validation"}
 
 
 @app.get("/discover")
-async def discover(query: str, max_results: int = 8, context_json: str = ""):
+async def discover(request: Request, query: str, max_results: int = 8, context_json: str = ""):
+    await require_tools_service_auth(request)
     started = time.perf_counter()
     try:
         context = json.loads(context_json) if context_json else {}
@@ -4203,23 +4320,126 @@ async def discover(query: str, max_results: int = 8, context_json: str = ""):
     return {"tools": results, "query": query, "latency_ms": round((time.perf_counter() - started) * 1000, 3), "total_enabled": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION}
 
 
+def _invalid_arguments(item: tuple, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the public schema before a handler can turn bad input into a
+    misleading handler/transport success.  This deliberately checks only the
+    bounded contract types and required fields; capability-specific semantic
+    validation remains with the owning adapter.
+    """
+    _, _, _, _, schema, _ = item
+    type_map = {"string": str, "integer": int, "number": (int, float), "boolean": bool,
+                "array": list, "object": dict}
+    missing = [name for name, rule in schema.items()
+               if rule.get("required") and (name not in arguments or arguments[name] is None or arguments[name] == "")]
+    if missing:
+        return {"code": "INVALID_ARGUMENTS", "message": f"Missing required argument: {missing[0]}", "fields": missing}
+    wrong_type = []
+    for name, value in arguments.items():
+        rule = schema.get(name)
+        if value is None or not rule or rule.get("type") not in type_map:
+            continue
+        expected = type_map[rule["type"]]
+        # bool is an int subclass, but it is never a valid numeric capability
+        # argument unless a schema explicitly says boolean.
+        if not isinstance(value, expected) or (rule["type"] in {"integer", "number"} and isinstance(value, bool)):
+            wrong_type.append(name)
+    if wrong_type:
+        return {"code": "INVALID_ARGUMENTS", "message": f"Invalid type for argument: {wrong_type[0]}", "fields": wrong_type}
+    return None
+
+
+def _operation_failure_from_result(result: Any) -> dict[str, Any] | None:
+    """Recognize an adapter-reported failure returned as structured data.
+
+    Some legacy adapters correctly return a fact-shaped error instead of
+    raising.  Treating that as `status=ok` made the UI and model believe the
+    operation succeeded.  This central compatibility bridge lets adapters be
+    migrated individually without lying in the common contract.
+    """
+    if not isinstance(result, dict):
+        return {"code": "INVALID_TOOL_RESULT", "message": "Tool returned a non-object result"}
+    if result.get("operation_ok") is False:
+        error = result.get("error")
+        if isinstance(error, dict):
+            return {"code": str(error.get("code") or "OPERATION_FAILED"),
+                    "message": str(error.get("message") or "Tool operation failed")}
+        return {"code": str(result.get("error_code") or "OPERATION_FAILED"),
+                "message": str(error or result.get("message") or "Tool operation failed")}
+    result_status = str(result.get("status") or "").casefold()
+    if result_status in {"rejected", "disabled", "unavailable", "failed", "failed_ingestion", "invalid_arguments"}:
+        reason = str(result.get("reason") or result.get("error") or result_status).strip()
+        return {"code": str(result.get("error_code") or reason or "OPERATION_FAILED").upper(),
+                "message": reason.replace("_", " ").lower(),
+                "operation_status": result_status}
+    if result.get("evidence_available") is False or result.get("error") or result.get("error_code"):
+        return {"code": str(result.get("error_code") or "OPERATION_FAILED"),
+                "message": str(result.get("error") or "Tool operation failed")}
+    return None
+
+
+def _operation_response(*, req: Invoke, service: str, permission: str, status: str,
+                        result: dict[str, Any], duration_ms: float, error: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Single response contract: HTTP delivery and backend operation are
+    separate facts.  `status` remains the legacy operation-status field for
+    existing Assistant callers, never a proxy for handler completion.
+    """
+    operation_ok = status == "ok"
+    payload: dict[str, Any] = {
+        "tool": req.name, "service": service, "permission": permission,
+        "status": status, "transport_ok": True, "operation_ok": operation_ok,
+        "result": result, "duration_ms": round(duration_ms, 2),
+        "trace_id": req.trace_id, "turn_id": req.turn_id, "tool_call_id": req.tool_call_id,
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
 @app.post("/invoke")
-async def invoke(req: Invoke):
+async def invoke(request: Request, req: Invoke):
+    await require_tools_service_auth(request)
     item = TOOLS.get(req.name)
     if not item:
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
+    invalid = _invalid_arguments(item, req.arguments)
+    if invalid:
+        result = {"error": invalid["message"], "error_code": invalid["code"],
+                  "evidence_available": False, "retryable": False}
+        audit({"client_id": req.client_id, "session_id": req.session_id, "trace_id": req.trace_id,
+               "turn_id": req.turn_id, "tool_call_id": req.tool_call_id, "tool": req.name,
+               "service": service, "permission": permission, "arguments": safe_args(req.arguments),
+               "status": "invalid_arguments", "operation_ok": False, "result_summary": audit_result(result)})
+        return _operation_response(req=req, service=service, permission=permission,
+                                   status="invalid_arguments", result=result, duration_ms=0, error=invalid)
     if permission in {"confirm", "destructive"} and not req.confirmed:
         action_id = str(uuid.uuid4())
-        audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": "confirmation_required", "action_id": action_id})
-        return {"tool": req.name, "service": service, "permission": permission, "status": "confirmation_required", "action_id": action_id, "result": {"message": "This action requires explicit confirmation before execution."}}
+        result = {"message": "This action requires explicit confirmation before execution.", "evidence_available": False}
+        audit({"client_id": req.client_id, "session_id": req.session_id, "trace_id": req.trace_id,
+               "turn_id": req.turn_id, "tool_call_id": req.tool_call_id, "tool": req.name,
+               "service": service, "permission": permission, "arguments": safe_args(req.arguments),
+               "status": "confirmation_required", "operation_ok": False, "action_id": action_id})
+        payload = _operation_response(req=req, service=service, permission=permission,
+                                      status="confirmation_required", result=result, duration_ms=0,
+                                      error={"code": "CONFIRMATION_REQUIRED", "message": result["message"]})
+        payload["action_id"] = action_id
+        return payload
     started = time.monotonic()
     status = "ok"
+    operation_error: dict[str, Any] | None = None
     result: Any
-    context_token = AUDIT_CONTEXT.set({"client_id": req.client_id, "session_id": req.session_id})
+    context_token = AUDIT_CONTEXT.set({
+        "client_id": req.client_id, "session_id": req.session_id,
+        "trace_id": req.trace_id, "turn_id": req.turn_id, "tool_call_id": req.tool_call_id,
+    })
     try:
         call_arguments = dict(req.arguments)
-        call_arguments.setdefault("session_id", req.session_id)
+        if req.name in {"media_plan_goal", "media_standard_request", "media_execute_goal"}:
+            # Session identity is trusted envelope metadata owned by the
+            # Assistant, never a model-selectable tool argument. Overwrite a
+            # supplied value so a generated call cannot stage or replay an
+            # authorization for another conversation.
+            call_arguments["session_id"] = req.session_id
         result = await asyncio.wait_for(fn(call_arguments), timeout=12)
     except asyncio.TimeoutError:
         status, result = "timeout", {"error": f"{service} tool timed out", "error_code": "TIMEOUT", "retryable": True, "evidence_available": False}
@@ -4230,7 +4450,25 @@ async def invoke(req: Invoke):
         status, result = "error", {"error": f"{service} tool failed", "error_code": "EXECUTION_FAILED", "detail": type(exc).__name__, "retryable": False, "evidence_available": False}
     finally:
         AUDIT_CONTEXT.reset(context_token)
-    if status == "ok" and not isinstance(result, dict):
-        status, result = "error", {"error": f"{service} tool returned an invalid result", "error_code": "INVALID_TOOL_RESULT", "retryable": False, "evidence_available": False}
-    audit({"client_id": req.client_id, "session_id": req.session_id, "tool": req.name, "service": service, "permission": permission, "arguments": safe_args(req.arguments), "status": status, "action_id": req.action_id, "duration_ms": round((time.monotonic() - started) * 1000), "result_summary": audit_result(result)})
-    return {"tool": req.name, "service": service, "permission": permission, "status": status, "result": result}
+    if status == "ok":
+        operation_error = _operation_failure_from_result(result)
+        if operation_error:
+            reported_status = operation_error.pop("operation_status", None)
+            status = (reported_status if reported_status in {"rejected", "disabled", "unavailable", "failed_ingestion", "invalid_arguments"}
+                      else "unavailable" if operation_error["code"] in {"BACKEND_UNAVAILABLE", "GPU_TELEMETRY_UNAVAILABLE", "TIMEOUT"}
+                      else "error")
+            result = ({**result, "evidence_available": False, "operation_ok": False}
+                      if isinstance(result, dict)
+                      else {"error": operation_error["message"], "error_code": operation_error["code"],
+                            "evidence_available": False, "operation_ok": False})
+    if status != "ok" and operation_error is None:
+        operation_error = {"code": str(result.get("error_code") or "OPERATION_FAILED"),
+                           "message": str(result.get("error") or "Tool operation failed")}
+    duration_ms = (time.monotonic() - started) * 1000
+    audit({"client_id": req.client_id, "session_id": req.session_id, "trace_id": req.trace_id,
+           "turn_id": req.turn_id, "tool_call_id": req.tool_call_id, "tool": req.name,
+           "service": service, "permission": permission, "arguments": safe_args(req.arguments),
+           "status": status, "operation_ok": status == "ok", "action_id": req.action_id,
+           "duration_ms": round(duration_ms), "result_summary": audit_result(result)})
+    return _operation_response(req=req, service=service, permission=permission,
+                               status=status, result=result, duration_ms=duration_ms, error=operation_error)
