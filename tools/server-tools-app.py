@@ -48,6 +48,7 @@ app = FastAPI(title="Local Server Tools", version="2026.09.13")
 TOOL_CONTRACT_VERSION = "1.0"
 
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
+UNRAID_MCP_URL = os.getenv("UNRAID_MCP_URL", f"{TOWER}:8043/mcp").rstrip("/")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 # cli_debrid is bound to localhost on the Unraid host.  Home-AI-Tools reaches
@@ -252,6 +253,58 @@ async def get_json(service: str, path: str, params: dict[str, Any] | None = None
         r = await client.get(base + path, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
+
+
+def _parse_mcp_sse_line(raw: str) -> dict[str, Any]:
+    """The Unraid Management Agent MCP responds with a single SSE-formatted
+    event even on a plain POST (no real streaming connection) -- extract the
+    one `data: {...}` line's JSON payload."""
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[len("data:"):].strip())
+    raise ValueError("no MCP data line in response")
+
+
+async def unraid_mcp_call(tool_name: str, arguments: dict[str, Any] | None = None, timeout: float = 6) -> Any:
+    """Call one read-only tool on the privileged Unraid Management Agent MCP
+    server and return its already-parsed JSON result.
+
+    The model never sees this function, this URL, or the raw 126-tool MCP
+    catalog directly -- only the small set of bounded Home-AI wrapper
+    functions below call it, each hard-coding its own tool_name. MCP requires
+    a session handshake (initialize -> notifications/initialized) before any
+    other call; a fresh session is created per call rather than cached, since
+    call volume here is low (occasional user questions, not a hot path) and
+    this avoids any class of stale/expired-session bug entirely.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        init = await client.post(UNRAID_MCP_URL, headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "home-ai-tools", "version": "1.0"}},
+        })
+        init.raise_for_status()
+        session_id = init.headers.get("Mcp-Session-Id")
+        if not session_id:
+            raise RuntimeError("Unraid MCP did not return a session id")
+        session_headers = {**headers, "Mcp-Session-Id": session_id}
+        await client.post(UNRAID_MCP_URL, headers=session_headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        call = await client.post(UNRAID_MCP_URL, headers=session_headers, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments or {}},
+        })
+        call.raise_for_status()
+        payload = _parse_mcp_sse_line(call.text)
+        if "error" in payload:
+            raise RuntimeError(str(payload["error"].get("message", payload["error"])))
+        content = (payload.get("result") or {}).get("content") or []
+        text = next((item.get("text") for item in content if item.get("type") == "text"), None)
+        if text is None:
+            raise RuntimeError("Unraid MCP tool call returned no text content")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
 
 
 def parse_text_or_json_payload(text: str) -> Any:
@@ -3444,6 +3497,127 @@ async def home_activate_scene(args: dict[str, Any]) -> dict[str, Any]:
                                                "name": (matches[0].get("attributes") or {}).get("friendly_name")}}
 
 
+# ---------------------------------------------------------------------------
+# Unraid Management Agent MCP -- bounded, read-only Home-AI adapters.
+#
+# The MCP server exposes 126 tools, many highly privileged (VM lifecycle,
+# array start/stop, system reboot/shutdown, fan/CPU control, an autonomous
+# remediation agent with its own approval flow). None of that is exposed to
+# Qwen or reachable from any Home-AI tool below: each function here hardcodes
+# exactly one (or two closely related) read-only MCP tool_name and returns a
+# small, purpose-shaped result -- the same "semantic tool -> deterministic
+# adapter -> privileged backend" pattern already used for Sonarr/Radarr/
+# Lidarr/Plex/etc. Qwen never sees unraid_mcp_call, the MCP URL, or any
+# session/credential material.
+#
+# Deliberately NOT implemented in this round: a true per-directory storage
+# breakdown ("what's using space inside appdata"). list_shares' used_bytes/
+# free_bytes reflect the underlying cache/array POOL a share lives on, not
+# that share's own actual consumption -- presenting those numbers as
+# per-share usage would be misleading. The MCP exposes no per-directory `du`-
+# equivalent; the only path to real numbers (a bounded Unraid User Script via
+# execute_user_script) is write-permission and needs an explicit, reviewed
+# script the user provisions, so it is deferred for explicit approval rather
+# than guessed at here.
+# ---------------------------------------------------------------------------
+
+async def unraid_storage_status(args: dict[str, Any]) -> dict[str, Any]:
+    target = str(args.get("target") or "array").strip().casefold()
+    if target in {"array", ""}:
+        status = await unraid_mcp_call("get_array_status")
+        return {"target": "array", "state": status.get("state"), "used_bytes": status.get("free_bytes") is not None and status.get("total_bytes", 0) - status.get("free_bytes", 0) or None,
+                "free_bytes": status.get("free_bytes"), "total_bytes": status.get("total_bytes"),
+                "used_percent": status.get("used_percent"), "parity_valid": status.get("parity_valid"),
+                "num_disks": status.get("num_disks")}
+    disks = await unraid_mcp_call("list_disks")
+    if not isinstance(disks, list):
+        return {"target": target, "error": "unexpected disk list shape"}
+    if target in {"disks", "all"}:
+        return {"target": "disks", "disks": [
+            {"name": d.get("name"), "role": d.get("role"), "status": d.get("status"),
+             "used_bytes": d.get("used_bytes"), "free_bytes": d.get("free_bytes"), "total_bytes": d.get("size_bytes"),
+             "used_percent": round(100 * d["used_bytes"] / d["size_bytes"], 1) if d.get("size_bytes") else None}
+            for d in disks if d.get("size_bytes")
+        ]}
+    match = next((d for d in disks if str(d.get("name", "")).casefold() == target), None)
+    if not match:
+        return {"target": target, "found": False}
+    size = match.get("size_bytes") or 0
+    return {"target": target, "found": True, "name": match.get("name"), "role": match.get("role"),
+            "status": match.get("status"), "used_bytes": match.get("used_bytes"), "free_bytes": match.get("free_bytes"),
+            "total_bytes": size, "used_percent": round(100 * match["used_bytes"] / size, 1) if size else None}
+
+
+async def unraid_disk_health(_: dict[str, Any]) -> dict[str, Any]:
+    array = await unraid_mcp_call("get_array_status")
+    disks = await unraid_mcp_call("list_disks", {"include_smart": False})
+    disk_summaries = []
+    if isinstance(disks, list):
+        for d in disks:
+            # Virtual/non-SMART devices (Docker vDisk, Log, flash boot device)
+            # never report a real SMART status; only flag genuine physical
+            # disks whose SMART check did not pass.
+            smart = d.get("smart_status")
+            disk_summaries.append({
+                "name": d.get("name"), "role": d.get("role"), "status": d.get("status"),
+                "temperature_celsius": d.get("temperature_celsius") or None,
+                "smart_status": smart, "smart_errors": d.get("smart_errors"),
+            })
+    concerning = [d for d in disk_summaries if d["status"] not in (None, "DISK_OK") or (d["smart_status"] not in (None, "", "PASSED", "UNKNOWN"))]
+    hottest = max((d for d in disk_summaries if d.get("temperature_celsius")), key=lambda d: d["temperature_celsius"], default=None)
+    return {"array_state": array.get("state"), "parity_valid": array.get("parity_valid"),
+            "disks": disk_summaries, "concerning_disks": concerning,
+            "hottest_disk": {"name": hottest["name"], "temperature_celsius": hottest["temperature_celsius"]} if hottest else None}
+
+
+async def unraid_container_status(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("container") or "").strip()
+    if not name:
+        return {"error": "a container name is required"}
+    try:
+        info = await unraid_mcp_call("get_container_info", {"container_id": name})
+    except RuntimeError as exc:
+        return {"found": False, "container": name, "error": str(exc)}
+    if not isinstance(info, dict) or not info:
+        return {"found": False, "container": name}
+    return {"found": True, "name": info.get("name"), "state": info.get("state"), "status": info.get("status"),
+            "image": info.get("image"), "network_mode": info.get("network_mode"), "ip_address": info.get("ip_address"),
+            "ports": info.get("port_mappings") or info.get("ports"), "cpu_percent": info.get("cpu_percent"),
+            "memory_display": info.get("memory_display"), "memory_percent": info.get("memory_percent")}
+
+
+async def unraid_container_metrics(args: dict[str, Any]) -> dict[str, Any]:
+    sort_by = str(args.get("sort_by") or "cpu").strip().casefold()
+    limit = max(1, min(int(args.get("limit") or 5), 20))
+    containers = await unraid_mcp_call("list_containers", {"state": "running"})
+    if not isinstance(containers, list):
+        return {"error": "unexpected container list shape"}
+    key = "memory_usage_bytes" if sort_by == "memory" else "cpu_percent"
+    ranked = sorted(containers, key=lambda c: c.get(key) or 0, reverse=True)[:limit]
+    unhealthy = [c.get("name") for c in containers if "unhealthy" in str(c.get("status", "")).casefold()]
+    return {"sort_by": "memory" if sort_by == "memory" else "cpu", "running_count": len(containers),
+            "unhealthy_containers": unhealthy,
+            "top": [{"name": c.get("name"), "cpu_percent": c.get("cpu_percent"), "memory_display": c.get("memory_display"),
+                     "memory_percent": c.get("memory_percent"), "network_mode": c.get("network_mode")} for c in ranked]}
+
+
+async def unraid_system_health(_: dict[str, Any]) -> dict[str, Any]:
+    health = await unraid_mcp_call("get_health_status")
+    firing = []
+    try:
+        firing_result = await unraid_mcp_call("get_firing_alerts", timeout=5)
+        if isinstance(firing_result, list):
+            firing = [a.get("name") or a.get("id") for a in firing_result]
+    except Exception:
+        pass  # Alerting may be unconfigured or slow; absence of alerts is not itself a failure,
+        # and the primary health summary above is still worth returning on its own.
+    return {"array_state": health.get("array_state"), "array_used_percent": health.get("array_used_percent"),
+            "parity_valid": health.get("parity_valid"), "cpu_usage_percent": health.get("cpu_usage"),
+            "cpu_temp_celsius": health.get("cpu_temp"), "ram_usage_percent": health.get("ram_usage"),
+            "uptime_seconds": health.get("uptime"), "running_containers": health.get("running_containers"),
+            "total_containers": health.get("total_containers"), "firing_alerts": firing}
+
+
 REGISTRY = [
     ("get_server_overview", "Current host, uptime, RAM/storage summary.", "read", "server", {}, server_overview),
     ("home_find_device", "Find allowed Home Assistant lights and switches by name or area.", "read", "home", {"query": {"type": "string", "required": True}}, home_find_device),
@@ -3520,6 +3694,15 @@ REGISTRY = [
     ("media_status", "Read live canonical media workflow status by workflow ID or one exact existing title query; never writes or retries. Ambiguous title matches fail closed.", "read", "media_planner", {"workflow_id": {"type": "string"}, "query": {"type": "string"}, "title": {"type": "string"}, "media_type": {"type": "string"}}, media_status),
     ("media_diagnose", "Explain the first proven blocking boundary for one canonical media workflow; read-only and never retries or writes.", "read", "media_planner", {"workflow_id": {"type": "string", "required": True}}, media_diagnose),
     ("media_standard_request", "Submit one confirmed, canonical movie or whole-season watch-first request to the private cli_debrid bridge. Disabled until standard media writes are explicitly enabled; never accepts torrents, URLs, scraper commands, or credentials.", "confirm", "media_planner", {"workflow_id": {"type": "string", "required": True}, "media_type": {"type": "string", "required": True}, "canonical_external_id": {"type": "integer", "required": True}, "canonical_title": {"type": "string"}, "season_scope": {"type": "array"}, "episode_scope": {"type": "array"}, "confirmation_context": {"type": "object", "required": True}}, media_standard_request),
+    ("unraid_storage_status", "Get Unraid storage capacity (used/free/total bytes and percent used) for the array, the cache pool, all disks, or one named disk. Read-only.", "read", "unraid", {"target": {"type": "string"}}, unraid_storage_status),
+    ("unraid_disk_health", "Get Unraid array and per-disk health: parity validity, SMART status/errors, temperature, and which disks (if any) are not OK. Read-only.", "read", "unraid", {}, unraid_disk_health),
+    ("unraid_container_status", "Get one named Docker container's live status, uptime, network, ports, CPU, and memory from the Unraid host. Read-only.", "read", "unraid", {"container": {"type": "string", "required": True}}, unraid_container_status),
+    # Note: no unraid_container_logs tool -- get_container_logs (docker.sock,
+    # already validated, lower latency) already covers log tails; adding an
+    # MCP-backed duplicate would only add discovery-ranking risk with no new
+    # capability.
+    ("unraid_container_metrics", "Rank running containers by CPU or RAM usage and list unhealthy ones.", "read", "unraid", {"sort_by": {"type": "string"}, "limit": {"type": "integer"}}, unraid_container_metrics),
+    ("unraid_system_health", "Get a quick Unraid host health summary: array state, parity validity, CPU/RAM usage and temperature, uptime, container counts, and any firing alerts. Read-only.", "read", "unraid", {}, unraid_system_health),
 ]
 TOOLS = {x[0]: x for x in REGISTRY}
 # Tools that perform a real write and already have their OWN dedicated,
@@ -3639,7 +3822,7 @@ CAPABILITY_METADATA = {
     "investigate_downloads": {"aliases": ["downloads", "queue", "stuck", "media pipeline", "current downloads"], "examples": ["what is downloading", "is anything stuck", "what is currently downloading"], "group": "downloads", "freshness": "current"},
     "investigate_media_pipeline": {"aliases": ["music pipeline", "missing media", "artist status"], "examples": ["what is going on with UTOPIA", "how is Travis Scott coming along"], "group": "media_pipeline", "freshness": "current"},
     "get_storage_status": {"aliases": ["disk space", "free space", "storage"], "examples": ["how much storage do I have left"], "freshness": "current"},
-    "list_containers": {"aliases": ["docker", "containers", "services"], "examples": ["how many containers are running"], "freshness": "current"},
+    "list_containers": {"aliases": ["docker", "containers", "services", "find containers", "stopped containers"], "examples": ["how many containers are running", "find containers that are stopped"], "freshness": "current"},
     "lidarr_health": {"aliases": ["lidarr", "lidar", "music service health"], "examples": ["what is the status of LIDAR"], "freshness": "current"},
     "weather_forecast": {"aliases": ["weather", "forecast", "temperature", "rain"], "examples": ["what is the weather today", "what about tomorrow"], "freshness": "current"},
     "plex_recently_added": {"aliases": ["recently added", "last added", "newest in plex"], "examples": ["what was the last thing added to Plex"], "freshness": "current"},
@@ -3652,6 +3835,16 @@ CAPABILITY_METADATA = {
     "unit_convert": {"aliases": ["convert", "gigabytes", "terabytes", "celsius", "fahrenheit"], "examples": ["convert 5 GB to MB"], "freshness": "deterministic"},
     "current_datetime": {"aliases": ["date", "time", "timezone", "today"], "examples": ["what time is it in Toronto"], "freshness": "current"},
     "wikipedia_search": {"aliases": ["wikipedia", "factual lookup", "encyclopedia"], "examples": ["look up this topic on Wikipedia"], "freshness": "reference"},
+    "unraid_storage_status": {"aliases": ["cache full", "array space", "disk space left", "how full", "storage capacity"], "examples": ["how full is the cache drive", "how much space is left on the array", "which disk is fullest"], "group": "unraid", "freshness": "current"},
+    "unraid_disk_health": {"aliases": ["array healthy", "disk health", "smart errors", "parity valid", "hottest drive"], "examples": ["is the array healthy", "are any disks having errors", "which drive is hottest"], "group": "unraid", "freshness": "current"},
+    # Deliberately narrow: get_container_status/list_containers already own
+    # plain "is it running"/"container status" phrasing (validated, lower
+    # latency, no extra MCP hop) -- this tool exists only for the resource/
+    # network facts those cannot provide (uptime detail, network_mode,
+    # ports, live CPU/memory), so its aliases name only that difference.
+    "unraid_container_status": {"aliases": ["how long has it been running", "container network", "container ports", "container memory usage"], "examples": ["how long has plex been running", "what network is home-ai-tools on", "how much memory is home-ai using"], "group": "unraid", "freshness": "current"},
+    "unraid_container_metrics": {"aliases": ["most ram", "most cpu", "unhealthy containers", "which container is using"], "examples": ["what's using the most ram", "what's using the most cpu", "which containers are unhealthy"], "group": "unraid", "freshness": "current"},
+    "unraid_system_health": {"aliases": ["server status", "server health", "is the server ok", "uptime"], "examples": ["give me a quick server status", "is anything wrong with the server", "how long has the server been up"], "group": "unraid", "freshness": "current"},
     "list_items": {"aliases": ["list", "grocery list", "packing list", "to do"], "examples": ["what's on my grocery list"], "group": "lists", "freshness": "current"},
     "add_list_items": {"aliases": ["add to list", "grocery list", "packing list"], "examples": ["put milk on my grocery list"], "group": "lists", "freshness": "current"},
     "remove_list_item": {"aliases": ["remove from list", "take off list"], "examples": ["remove milk from my grocery list"], "group": "lists", "freshness": "current"},

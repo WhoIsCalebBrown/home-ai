@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -44,6 +44,7 @@ rephrase_intent = namespace["rephrase_intent"]
 repair_decimal_spacing = namespace["repair_decimal_spacing"]
 round_weather_temperatures = namespace["round_weather_temperatures"]
 complete_speakable_sentence = namespace["complete_speakable_sentence"]
+high_confidence_auto_dispatch = namespace["high_confidence_auto_dispatch"]
 collapse_repeated_sentences = namespace["collapse_repeated_sentences"]
 direct_structured_answer = namespace["direct_structured_answer"]
 media_plan_response = namespace["media_plan_response"]
@@ -761,6 +762,62 @@ def test_yesterday_is_recognized_as_a_fresh_research_question_not_a_media_goal()
     assert preflight_plan(
         "can you give me an in depth review of what's gone on in the canadian news yesterday"
     ) == [("web_search", {"query": "canadian news yesterday"})]
+
+
+def test_high_confidence_auto_dispatch_bypasses_qwen_only_when_safe():
+    # Found by a full-catalog live validation sweep: Qwen sometimes ignores
+    # a correctly, decisively top-ranked candidate for introspective tools
+    # it has little training signal for -- "Give me a quick server
+    # overview" ranked get_server_overview #1 by a wide margin, yet Qwen
+    # called media_plan_goal instead. This generalizes the fix instead of
+    # writing a hand-written route for every such tool: it only fires for a
+    # dominant, read-only, zero-required-argument winner.
+    dominant_read_no_args = [
+        {"canonical_name": "get_server_overview", "score": 15.5, "read_write": "read"},
+        {"canonical_name": "get_container_logs", "score": 2.8, "read_write": "read"},
+    ]
+    schemas_no_args = [
+        {"name": "get_server_overview", "parameters": {"type": "object", "properties": {}, "required": []}},
+    ]
+    assert high_confidence_auto_dispatch(dominant_read_no_args, schemas_no_args) == [("get_server_overview", {})]
+
+    # A tool needing an argument (name/query) must never auto-dispatch --
+    # there is no safe way to guess that argument deterministically here.
+    dominant_needs_arg = [
+        {"canonical_name": "get_container_status", "score": 12.6, "read_write": "read"},
+        {"canonical_name": "get_container_logs", "score": 6.5, "read_write": "read"},
+    ]
+    schemas_needs_arg = [
+        {"name": "get_container_status", "parameters": {"type": "object", "properties": {"name": {}}, "required": ["name"]}},
+    ]
+    assert high_confidence_auto_dispatch(dominant_needs_arg, schemas_needs_arg) == []
+
+    # A write/confirm-permission tool must never auto-dispatch even if
+    # dominant and zero-arg.
+    dominant_write = [
+        {"canonical_name": "home_activate_scene", "score": 12.4, "read_write": "write_low"},
+        {"canonical_name": "media_plan_goal", "score": 6.6, "read_write": "read"},
+    ]
+    assert high_confidence_auto_dispatch(dominant_write, []) == []
+
+    # A merely-plausible (not dominant) top score must not auto-dispatch --
+    # this only fires when discovery is unambiguous.
+    close_scores = [
+        {"canonical_name": "plex_search", "score": 8.0, "read_write": "read"},
+        {"canonical_name": "plex_library_counts", "score": 7.0, "read_write": "read"},
+    ]
+    assert high_confidence_auto_dispatch(close_scores, [{"name": "plex_search", "parameters": {"required": []}}]) == []
+
+
+def test_named_container_status_question_resolves_deterministically():
+    # Same root cause and same fix shape as get_container_logs above:
+    # "What's the status of the Home-AI-Tools container?" ranked
+    # get_container_status #1 by a wide margin in discovery, yet Qwen
+    # called list_containers instead in a real live validation run.
+    assert preflight_plan("What's the status of the Home-AI-Tools container?") == [
+        ("get_container_status", {"name": "Home-AI-Tools"})
+    ]
+    assert preflight_plan("Is the Plex container running?") == [("get_container_status", {"name": "Plex"})]
 
 
 def test_container_logs_request_is_not_swallowed_by_generic_container_catch_all():

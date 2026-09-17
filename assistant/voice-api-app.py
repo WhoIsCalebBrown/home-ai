@@ -2226,6 +2226,45 @@ def _timezone_from_text(text: str) -> str | None:
     return None
 
 
+def high_confidence_auto_dispatch(candidates: list[dict], tool_schemas: list[dict]) -> list[tuple[str, dict]]:
+    """When capability discovery is overwhelmingly confident about a single,
+    zero-required-argument read tool, dispatch it deterministically instead
+    of asking Qwen to choose.
+
+    Proven repeatedly during a full-catalog live validation sweep: Qwen
+    sometimes ignores a correctly, decisively top-ranked candidate for
+    introspective/administrative tools it has little training signal for --
+    "Give me a quick server overview" ranked get_server_overview #1 by a
+    wide margin (15.5 vs 2.8), yet Qwen called media_plan_goal instead; the
+    same happened for get_container_status, home_activate_scene,
+    lidarr_artist_status, and plex_artist_library. Rather than add a
+    hand-written deterministic regex for every one of these (an unbounded,
+    ever-growing list), generalize the fix: when discovery is unambiguous
+    AND the winning tool needs no argument extraction (so there is no risk
+    of guessing a wrong argument) AND it is read-only, bypass Qwen's tool
+    CHOICE only -- it still receives the real result and writes the final
+    natural-language answer via the same stream_final path any other
+    deterministic plan uses. A tool requiring arguments, or a write/confirm
+    tool, or a merely-plausible (not dominant) top score never qualifies.
+    """
+    if not candidates:
+        return []
+    top = candidates[0]
+    if top.get("read_write") != "read":
+        return []
+    top_score = float(top.get("score", 0) or 0)
+    second_score = float((candidates[1] or {}).get("score", 0) or 0) if len(candidates) > 1 else 0.0
+    if not (top_score >= 10.0 and (top_score - second_score) >= 5.0):
+        return []
+    name = top.get("canonical_name")
+    schema = next((s for s in tool_schemas if s.get("name") == name), None)
+    if not schema:
+        return []
+    if (schema.get("parameters") or {}).get("required"):
+        return []
+    return [(name, {})]
+
+
 def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, dict]]:
     routed_text = routing_aliases(text)
     t = routed_text.lower()
@@ -2515,6 +2554,15 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if log_match and re.search(r"\blogs?\b", t):
         container_name = next(g for g in log_match.groups() if g)
         return [("get_container_logs", {"name": container_name})]
+    # Same fix, same reason, for a named container's status: "What's the
+    # status of the Home-AI-Tools container?" ranked get_container_status
+    # #1 by a wide margin in discovery, yet Qwen still called
+    # list_containers -- a real live-validation finding, not a routing
+    # score problem.
+    status_match = re.search(r"\bstatus\s+of\s+(?:the\s+)?([\w.-]+)\s+container\b|\bcontainer\b\s+([\w.-]+)\s+status\b|\bis\s+(?:the\s+)?([\w.-]+)\s+container\s+(?:running|up|healthy)\b", routed_text, re.I)
+    if status_match and re.search(r"\bstatus\b|\brunning\b|\bhealthy\b|\bup\b", t):
+        container_name = next(g for g in status_match.groups() if g)
+        return [("get_container_status", {"name": container_name})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
@@ -2980,7 +3028,7 @@ _DOMAIN_TOOL_PREFIXES = {
     "web_research": ("web_", "wikipedia_search"),
     "server": ("get_storage_status", "get_server_overview", "list_containers", "container_",
                "get_container_status", "get_container_logs", "restart_container", "get_docker",
-               "get_gpu_status", "netdata_", "investigate_downloads", "qbittorrent_"),
+               "get_gpu_status", "netdata_", "investigate_downloads", "qbittorrent_", "unraid_"),
 }
 
 
@@ -3975,6 +4023,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # issue bounded follow-up searches and fetch several sources.
         if profile["mode"] != "quick" and any(name == "web_search" for name, _ in planned):
             planned = []
+        if not planned:
+            planned = high_confidence_auto_dispatch(candidates, tools)
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
