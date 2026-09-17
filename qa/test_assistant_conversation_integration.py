@@ -365,6 +365,8 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": {"investigation": "downloads", "sources_checked": ["qbittorrent"], "sources": {"qbittorrent": {"torrent_count": 269, "active_count": 0}}}}
         if name == "unraid_container_status":
             return {"tool": name, "status": "ok", "result": {"container": arguments.get("container"), "state": "running", "uptime_seconds": 921550, "memory_usage_bytes": 512_000_000}}
+        if name == "unraid_storage_status":
+            return {"tool": name, "status": "ok", "result": {"target": arguments.get("target"), "used_percent": 57.0, "free_bytes": 212_000_000_000}}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
 
 
@@ -2179,6 +2181,29 @@ async def test_named_container_status_result_is_not_silently_dropped_before_synt
         final_text="Yes, Plex is running and has been up for about 10 days.",
     )
     assert reply == "Yes, Plex is running and has been up for about 10 days."
+
+
+@pytest.mark.asyncio
+async def test_storage_followup_naming_a_container_continues_the_server_topic_end_to_end(session):
+    # Real production bug found in a live continuity test: "How full is
+    # cache?" -> "What's using most of it?" -> "What's inside appdata?" ->
+    # "What about Plex?" reclassified the last turn as "media" purely
+    # because explicit_domain()'s bare "plex" keyword outranks any inherited
+    # storage topic, producing an unrelated media-acquisition non-answer
+    # ("I couldn't identify a confident media match") instead of continuing
+    # the storage-usage line of questioning. turn_context() now recognizes
+    # this bounded "what about X" continuation (keyed on the immediately
+    # preceding tool call, not the non-sticky per-turn "domain" signal) and
+    # routes it deterministically to the real capability that exists.
+    await session.turn(
+        "How full is cache?",
+        final_text="The cache is about 57 percent full.",
+    )
+    reply = await session.turn(
+        "What about Plex?",
+        final_text="Plex is running and using about 512 megabytes of memory.",
+    )
+    assert reply == "Plex is running and using about 512 megabytes of memory."
 
 
 @pytest.mark.asyncio

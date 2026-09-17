@@ -2087,6 +2087,40 @@ def explicit_domain(text: str, prior: dict | None = None) -> str | None:
     return None
 
 
+def _server_container_followup_target(text: str, prior: dict) -> str | None:
+    """A short "what about X" continuation naming a known container is a
+    server-topic continuation, not a fresh media request, when the
+    immediately preceding turn actually ran a storage/server tool.
+
+    Real production bug found in a live continuity test: "How full is
+    cache?" -> "What's using most of it?" -> "What's inside appdata?" ->
+    "What about Plex?" reclassified the last turn as "media" purely
+    because explicit_domain()'s bare "plex" keyword outranks any inherited
+    storage topic, producing an unrelated media-acquisition non-answer
+    instead of continuing the storage-usage line of questioning. The
+    per-turn "domain" signal is not reliably sticky across multiple
+    referential hops (a turn with no explicit domain of its own, like
+    "What's using most of it?", leaves domain unset rather than inheriting
+    the prior turn's), so `latest_tool_result` (set unconditionally by
+    store_provenance after every tool call, whichever tool it was) is used
+    instead as the "what did we actually just do" signal. Bounded to the
+    known CONTAINER_DISPLAY_NAMES set (never an arbitrary word) and to this
+    narrow "what about X"/"how about X" continuation frame, so this cannot
+    redirect an unrelated fresh sentence that merely mentions a container's
+    name.
+    """
+    match = re.search(r"^\s*(?:and\s+|but\s+)?(?:what about|how about)\s+(?:the\s+)?([a-z0-9\-\s]+?)\s*\??\s*$", text, re.I)
+    if not match:
+        return None
+    last_tools = (prior.get("latest_tool_result") or {}).get("tools") or []
+    if not any(str(tool or "").startswith(("unraid_", "get_storage_status", "get_server_overview", "list_containers", "get_container_status")) for tool in last_tools):
+        return None
+    candidate = match.group(1).strip().casefold()
+    if candidate in CONTAINER_DISPLAY_NAMES:
+        return candidate
+    return next((name for name in sorted(CONTAINER_DISPLAY_NAMES, key=len, reverse=True) if name in candidate or candidate in name), None)
+
+
 def turn_context(client_id: str, text: str) -> dict:
     """Apply explicit current-turn topic/entity state before discovery or tool execution."""
     prior = dict(conversation_context.get(client_id, {}))
@@ -2111,7 +2145,8 @@ def turn_context(client_id: str, text: str) -> dict:
         # them in place. Real gap found while building PendingMediaResolution.
         "pending_disambiguation", "pending_title_clarification",
     ) if key in prior}
-    domain = explicit_domain(text, prior)
+    container_followup = _server_container_followup_target(text, prior)
+    domain = "server" if container_followup else explicit_domain(text, prior)
     # A correction without a new action is a patch to the immediately preceding
     # resolved request. Do not let the corrected service name create a new intent.
     if repair and not domain:
@@ -2131,6 +2166,8 @@ def turn_context(client_id: str, text: str) -> dict:
         current.update({"domain": "camera", "kind": "camera", "group": "cameras", "tools": [], "camera": prior.get("camera", "front_door"), "subject": prior.get("subject")})
     elif domain == "server":
         current.update({"domain": "server", "kind": "server", "group": "server", "tools": [], "entities": routing_aliases(text)})
+        if container_followup:
+            current["container_followup"] = container_followup
     elif domain == "general":
         current.update({"domain": "general", "kind": "general", "group": "general", "tools": []})
     elif prior.get("kind") == "weather" and re.search(r"\b(?:what about|how about|tomorrow|today)\b", text, re.I):
@@ -2273,6 +2310,13 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    # turn_context() already resolved this as a bounded storage-topic
+    # continuation naming a known container (see
+    # _server_container_followup_target) -- must run before direct_file_request/
+    # playback_request or anything else gets a chance to reclassify "Plex" as
+    # an unrelated media request.
+    if context.get("container_followup"):
+        return [("unraid_container_status", {"container": CONTAINER_DISPLAY_NAMES[context["container_followup"]]})]
     if direct_file_request(text) or playback_request(text):
         return []
     # Real production bug: "What time is it in Tokyo right now?" used

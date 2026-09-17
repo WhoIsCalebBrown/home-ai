@@ -3869,7 +3869,7 @@ CAPABILITY_METADATA = {
     # network facts those cannot provide (uptime detail, network_mode,
     # ports, live CPU/memory), so its aliases name only that difference.
     "unraid_container_status": {"aliases": ["how long has it been running", "container network", "container ports", "container memory usage"], "examples": ["how long has plex been running", "what network is home-ai-tools on", "how much memory is home-ai using"], "group": "unraid", "freshness": "current"},
-    "unraid_container_metrics": {"aliases": ["most ram", "most cpu", "unhealthy containers", "which container is using"], "examples": ["what's using the most ram", "what's using the most cpu", "which containers are unhealthy"], "group": "unraid", "freshness": "current"},
+    "unraid_container_metrics": {"aliases": ["most ram", "most cpu", "unhealthy containers", "which container is using"], "examples": ["what's using the most ram", "what's using the most cpu", "which containers are unhealthy"], "group": "unraid", "freshness": "current", "requires_keyword": ["ram", "cpu", "memory", "unhealthy"]},
     "unraid_system_health": {"aliases": ["server status", "server health", "is the server ok", "uptime"], "examples": ["give me a quick server status", "is anything wrong with the server", "how long has the server been up"], "group": "unraid", "freshness": "current"},
     "list_items": {"aliases": ["list", "grocery list", "packing list", "to do"], "examples": ["what's on my grocery list"], "group": "lists", "freshness": "current"},
     "add_list_items": {"aliases": ["add to list", "grocery list", "packing list"], "examples": ["put milk on my grocery list"], "group": "lists", "freshness": "current"},
@@ -3884,7 +3884,7 @@ def capability_record(item):
     name, desc, permission, service, _, _ = item
     meta = CAPABILITY_METADATA.get(name, {})
     words = [name.replace("_", " "), desc, service, meta.get("group", service), *meta.get("aliases", []), *meta.get("examples", [])]
-    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission in {"confirm", "destructive"}, "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "requires_referent": bool(meta.get("requires_referent", False)), "alias_text": " ".join(meta.get("aliases", [])), "example_text": " ".join(meta.get("examples", [])), "search_text": " ".join(words)}}
+    return {**schema, "metadata": {"canonical_name": name, "aliases": meta.get("aliases", []), "examples": meta.get("examples", []), "group": meta.get("group", service), "read_write": permission, "confirmation_required": permission in {"confirm", "destructive"}, "freshness": meta.get("freshness", "current"), "required_service": service, "visual_evidence": meta.get("visual_evidence", False), "requires_referent": bool(meta.get("requires_referent", False)), "requires_keyword": meta.get("requires_keyword"), "alias_text": " ".join(meta.get("aliases", [])), "example_text": " ".join(meta.get("examples", [])), "search_text": " ".join(words)}}
 
 def _search_tokens(value: str) -> set[str]:
     stop = {"what", "is", "the", "my", "do", "you", "have", "i", "a", "an", "are", "on", "in", "of", "for", "to", "and", "how", "did", "it", "there", "right", "now", "please", "can", "me", "this", "that", "from"}
@@ -3917,6 +3917,21 @@ def discover_capabilities(query: str, max_results: int = 8, context: dict[str, A
         score = (overlap * 1.5) + (alias_overlap * 2.5) + (example_overlap * 1.0) + (gram_score * 4.0) + (referent_overlap * 1.5)
         if meta.get("requires_referent") and not referents:
             score *= 0.35
+        # Real production bug: unraid_container_metrics scored highly for a
+        # bare referential storage-breakdown follow-up ("What's using most
+        # of it?" after a cache/array question) purely via alias/gram
+        # overlap on the generic word "using" -- there is no domain
+        # narrowing for this turn (a bare pronoun sets no explicit domain),
+        # so this became the top candidate and Qwen presented its CPU/RAM
+        # numbers as if they were disk-space consumption, a real but
+        # unlabeled mismatch between question and answer. A tool this
+        # narrowly scoped (only ever answers a RAM/CPU/unhealthy-container
+        # question) must not win on vocabulary its aliases share with
+        # unrelated questions -- require the query to contain at least one
+        # of its own real distinguishing words.
+        required_keywords = meta.get("requires_keyword")
+        if required_keywords and not (q & set(required_keywords)):
+            score *= 0.2
         if score > 0:
             ranked.append((score, record))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]["metadata"]["canonical_name"]))

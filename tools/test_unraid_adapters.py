@@ -136,6 +136,28 @@ def test_container_status_falls_back_to_fuzzy_name_match(monkeypatch):
     assert still_missing["found"] is False
 
 
+def test_container_metrics_does_not_win_discovery_for_a_generic_storage_followup():
+    # Real production bug found in a live continuity test: "What's using
+    # most of it?" (a referential storage-breakdown follow-up with no
+    # explicit domain and no ram/cpu/memory keyword of its own) scored
+    # unraid_container_metrics as the top discovery candidate purely via
+    # alias/gram overlap on the generic word "using" -- Qwen then answered
+    # with its CPU/RAM numbers presented as if they were disk-space
+    # consumption, a real question/answer mismatch. unraid_container_metrics
+    # only ever legitimately answers a RAM/CPU/unhealthy-container question,
+    # so it must not win when none of those words are present, even though
+    # its aliases happen to share the word "using" with unrelated questions.
+    results = module.discover_capabilities("What's using most of it?", max_results=8)
+    names = [r["metadata"]["canonical_name"] for r in results]
+    assert "unraid_container_metrics" not in names[:1], f"unraid_container_metrics should not win a generic 'using' query, got top candidates: {names}"
+
+    # The legitimate RAM/CPU/unhealthy questions must still work correctly.
+    ram_results = module.discover_capabilities("What's using the most RAM?", max_results=8)
+    assert ram_results[0]["metadata"]["canonical_name"] == "unraid_container_metrics"
+    unhealthy_results = module.discover_capabilities("Are any containers unhealthy?", max_results=8)
+    assert unhealthy_results[0]["metadata"]["canonical_name"] == "unraid_container_metrics"
+
+
 def test_container_metrics_ranks_by_cpu_and_flags_unhealthy(monkeypatch):
     _install_fake_mcp(monkeypatch, {
         "list_containers": [
