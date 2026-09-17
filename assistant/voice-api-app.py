@@ -2695,6 +2695,14 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # acquisition-language matcher.
     if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
         return [("plex_recently_added", {"limit": 1})]
+    # A complete imperative of the form "Get/Request/Add the <title>" is
+    # title-shaped even when the title has only one non-article token (the
+    # mandatory P0 confirmation case is "Get The Room."). Keep obvious home
+    # devices and list nouns out so this does not become a generic "get"
+    # catch-all.
+    if (re.fullmatch(r"\s*(?:get|request|add)\s+the\s+[a-z0-9][a-z0-9' -]*[.!]?\s*", t)
+            and not re.search(r"\b(?:light|lights|lamp|outlet|switch|plug|socket|thermostat|list|groceries|weather)\b", t)):
+        return [("media_plan_goal", {"goal": text})]
     # A named media identity plus acquisition language is a semantic media goal,
     # even when the title is not in a fixed vocabulary (for example, "give me
     # Dumb and Dumber from 1994").  Direct file delivery and playback are kept

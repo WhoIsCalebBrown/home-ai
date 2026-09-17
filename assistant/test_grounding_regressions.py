@@ -1572,6 +1572,12 @@ def test_p0_cache_wording_variants_use_authoritative_unraid_capacity():
         assert preflight_plan(text) == [("unraid_storage_status", {"target": "cache"})], text
 
 
+def test_p0_the_room_confirmation_prompt_is_a_media_goal_without_title_allowlist():
+    assert preflight_plan("Get The Room.") == [("media_plan_goal", {"goal": "Get The Room."})]
+    assert preflight_plan("Request the Matrix!") == [("media_plan_goal", {"goal": "Request the Matrix!"})]
+    assert preflight_plan("Get the lights.") != [("media_plan_goal", {"goal": "Get the lights."})]
+
+
 def test_bug_b_do_that_and_it_are_interchangeable_confirmation_replies():
     """Bug B: "it" and "that" are interchangeable anaphoric references to
     an already-offered action -- real production bug, "yes do that" lost
