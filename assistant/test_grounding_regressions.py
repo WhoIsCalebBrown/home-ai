@@ -1560,6 +1560,18 @@ def test_bug_a_fix_does_not_misroute_unrelated_domains_or_bare_offer_replies():
         assert not (plan and plan[0][0] == "media_plan_goal"), text
 
 
+def test_p0_cache_wording_variants_use_authoritative_unraid_capacity():
+    variants = (
+        "How full is cache?", "How much space is left on cache?",
+        "What's the cache usage?", "Show me cache capacity.",
+        "How much cache space is free?", "What percent full is cache?",
+        "Give me cache storage status.", "How used is the cache drive?",
+        "How many GB are free on cache?", "Check cache disk space.",
+    )
+    for text in variants:
+        assert preflight_plan(text) == [("unraid_storage_status", {"target": "cache"})], text
+
+
 def test_bug_b_do_that_and_it_are_interchangeable_confirmation_replies():
     """Bug B: "it" and "that" are interchangeable anaphoric references to
     an already-offered action -- real production bug, "yes do that" lost

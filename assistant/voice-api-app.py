@@ -2658,7 +2658,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # built), so a "using"/"use" framing must not be captured here and
     # should fall through to the existing, tested get_storage_status path
     # instead of confidently answering the wrong shape of question.
-    if (re.search(r"\b(array|cache)\b", t) and re.search(r"\b(full|fullest|space|left|free|used|percent)\b", t)
+    if (re.search(r"\b(array|cache)\b", t) and re.search(r"\b(full|fullest|space|left|free|used|usage|percent|capacity|status)\b", t)
             and not re.search(r"\b(using|use|uses)\b", t)):
         return [("unraid_storage_status", {"target": "cache" if re.search(r"\bcache\b", t) else "array"})]
     if re.search(r"\bdisk(?:s)?\b", t) and re.search(r"\b(error|errors|smart|health|healthy|hottest|temperature)\b", t):
