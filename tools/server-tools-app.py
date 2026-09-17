@@ -2539,7 +2539,15 @@ def _plot_description_hint(text: str) -> bool:
     if relational:
         return True
     clauses = [clause for clause in re.split(r"[.!?]+", text) if clause.strip()]
-    return len(clauses) >= 2 and len(re.findall(r"[a-zA-Z']+", clauses[-1])) >= 3
+    # Accumulated UnresolvedSubject goals may append the media type after the
+    # clues ("memory prompt. plot clue. movie"). Looking only at the final
+    # clause therefore mistakes a real plot clue for another low-information
+    # memory prompt. Any later clause with at least three words is sufficient;
+    # the initial memory prompt alone still has no later clause and stays in
+    # NEEDS_MORE_CLUES.
+    return len(clauses) >= 2 and any(
+        len(re.findall(r"[a-zA-Z']+", clause)) >= 3 for clause in clauses[1:]
+    )
 
 
 def _descriptive_discovery_query(text: str) -> str:

@@ -30,6 +30,7 @@ spec.loader.exec_module(_module)
 _media_goal_parts = _module._media_goal_parts
 _descriptive_discovery_query = _module._descriptive_discovery_query
 _web_discovery_title_from_results = _module._web_discovery_title_from_results
+_plot_description_hint = _module._plot_description_hint
 _normalize_identity_title = _module._normalize_identity_title
 _evaluate_plex_candidate = _module._evaluate_plex_candidate
 
@@ -84,6 +85,10 @@ def test_accumulated_memory_clues_build_a_clean_discovery_query():
     assert _descriptive_discovery_query(
         "I'm trying to remember a science-fiction movie. A soldier keeps reliving the same battle."
     ) == "science-fiction movie. A soldier keeps reliving the same battle"
+    assert not _plot_description_hint("I'm trying to remember a science-fiction movie.")
+    assert _plot_description_hint(
+        "I'm trying to remember a science-fiction movie. A soldier keeps reliving the same battle. movie"
+    )
 
 
 def test_web_discovery_extracts_title_from_trailer_result():
