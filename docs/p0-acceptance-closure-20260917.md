@@ -63,3 +63,45 @@ configuration values, or secret-file contents. The closure procedure used
 only the old/new HTTP status codes, in-memory equality checks, and occurrence
 counts from explicitly scoped active log/config paths. No standalone
 credential-diagnostic artifact is installed on the server.
+
+## Acceptance closure
+
+- Production Assistant: `sha-038fff2` (unchanged).
+- Production Tools: `sha-af8dfb2` (healthy after deployment).
+- Rollback snapshot retained unchanged at
+  `/mnt/cache/appdata/home-ai/rollback/p0-20260917-183136`.
+- A parallel Open WebUI v0.11.3 / Assistant / Tools QA stack uses dedicated
+  credentials, state, chats, and a non-admin QA user. QA Tools reports
+  `qa_mode=live_readonly` and `mutation_scope=read_only`; it has no Docker
+  socket or cli_debrid credential configured.
+- Direct negative-containment probes for Home Assistant control, list writes,
+  media acquisition, and container restart all returned
+  `QA_LIVE_READONLY` before adapter execution.
+- Live cache response preserved the authoritative facts exactly: 59.8% full,
+  299.1 GB used, and 201 GB free. GPU failure rendered as unavailable rather
+  than successful.
+- Six successful Open WebUI turns used six unique trace/request/turn tuples.
+  The two identical first-prompt chats had different frontend chat IDs and
+  different `openwebui:<user>:<chat>` Home-AI sessions; each follow-up retained
+  only its own session. The clean-state Tom Hanks answers were not
+  conversationally correct and remain routing/disambiguation P1 evidence;
+  they did not show cross-chat state leakage.
+- The no-network isolated matrix exercised real binding, persistence,
+  confirmation, and workflow code with an in-process counted fake executor.
+  It covers absent/cross-chat/forged/expired/cancelled/legacy confirmations,
+  canonical and rehashed-argument tampering, replay, simultaneous approvals,
+  planner/executor interleaving, and restart semantics. No outbound mutation
+  attempt occurred.
+- Complete network-disabled suite: 668 passed. Focused identity,
+  confirmation, containment, and frontend-state suite: 40 passed.
+- Successful production mutation audit records after the closure-task cutoff:
+  zero.
+
+Sanitized live evidence is retained under
+`/mnt/cache/appdata/home-ai/qa/evidence/`. Raw QA chats and logs remain in the
+root-only QA appdata scope.
+
+At the final read-only status check, the historical Anatomy of a Fall workflow
+was `Scraping` / canonical state `REQUESTED`; its confirmation was
+`INVALIDATED`. This current state is distinct from the earlier reported
+`VERIFYING` state. No cleanup, cancellation, retry, or replacement was made.
