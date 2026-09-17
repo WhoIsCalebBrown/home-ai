@@ -357,6 +357,10 @@ class FakeToolsBackend:
                 "beets": {"count": 0, "items": []},
                 "torbox": {"summary": {"active": 0, "completed": 0, "errored": 0, "pulling": 0}},
             }}
+        if name == "get_container_logs":
+            return {"tool": name, "status": "ok", "result": {"name": arguments.get("name"), "lines": "\x02\x00\x00\x00\x00\x00\x00%INFO:     Started server process [1]\n"}}
+        if name == "investigate_downloads":
+            return {"tool": name, "status": "ok", "result": {"investigation": "downloads", "sources_checked": ["qbittorrent"], "sources": {"qbittorrent": {"torrent_count": 269, "active_count": 0}}}}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
 
 
@@ -2136,3 +2140,63 @@ async def test_bug_b_yes_do_that_continues_the_offered_identity(session):
     await session.turn("yes do that")
     assert len(session.backend.submitted_writes) == 1
     assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_container_logs_result_is_not_silently_dropped_before_synthesis(session):
+    # Real production bug: _DOMAIN_TOOL_PREFIXES is a hardcoded allowlist
+    # that filter_relevant_tool_results() uses to decide which live tool
+    # results reach synthesis at all -- "get_container_logs" was missing
+    # from the "server" domain's tuple, so a real, successful call's result
+    # was silently dropped (grounding_results became []) before
+    # evidence_supported_answer ever saw it, and its dynamic_fact_question
+    # guard then reported "unavailable" purely because the (filtered-empty)
+    # results list had nothing in it -- even though Qwen's own synthesis
+    # text was perfectly fine and never even mentioned unavailability.
+    reply = await session.turn(
+        "Show me the last few log lines for the Home-AI-Tools container.",
+        final_text="Here are the recent log lines for Home-AI-Tools: the server started successfully.",
+    )
+    assert reply == "Here are the recent log lines for Home-AI-Tools: the server started successfully."
+
+
+@pytest.mark.asyncio
+async def test_investigate_downloads_result_is_not_silently_dropped_before_synthesis(session):
+    # Same root cause as the logs bug above: "investigate_downloads" was
+    # missing from BOTH the "server" and "media" domain tuples in
+    # _DOMAIN_TOOL_PREFIXES (the turn can land in either domain depending on
+    # phrasing), so its real, successful result was silently dropped before
+    # synthesis and the turn fell back to a generic "unavailable" answer.
+    reply = await session.turn(
+        "Investigate my downloads across all services.",
+        final_text="You have 269 torrents in qBittorrent, none currently active.",
+    )
+    assert reply == "You have 269 torrents in qBittorrent, none currently active."
+
+
+def test_every_domain_relevant_tool_has_a_matching_prefix(app):
+    # _DOMAIN_TOOL_PREFIXES is a hand-maintained allowlist: any tool name
+    # missing from its own domain's tuple gets its real, successful result
+    # silently dropped before synthesis ever sees it (filter_relevant_
+    # tool_results returns [] for that tool), which then reads to the user
+    # as a live-tool "unavailable" even though the call plainly succeeded --
+    # found three times over in one night (get_container_logs,
+    # investigate_downloads, overseerr_status) before this test existed.
+    # Guard every currently-known tool this way instead of waiting for the
+    # next one to slip through the same gap.
+    checks = {
+        "server": ["get_container_logs", "get_container_status", "get_gpu_status", "get_server_overview",
+                   "get_storage_status", "list_containers", "restart_container", "investigate_downloads"],
+        "media": ["overseerr_status", "overseerr_recent_requests", "investigate_downloads",
+                  "investigate_plex_missing", "investigate_media_pipeline", "plex_library_counts",
+                  "sonarr_health", "radarr_health", "lidarr_health", "torbox_status", "slskd_downloads",
+                  "qbittorrent_summary", "beets_status", "music_enricher_status"],
+        "web_research": ["web_search", "web_fetch", "wikipedia_search"],
+        "weather": ["weather_forecast"],
+        "camera": ["frigate_stats", "frigate_recent_activity", "frigate_recent_events"],
+    }
+    for domain, tools in checks.items():
+        for tool in tools:
+            result = [{"tool": tool, "status": "ok", "result": {"x": 1}}]
+            filtered = app.filter_relevant_tool_results(result, {"domain": domain})
+            assert filtered == result, f"{tool!r} was dropped under domain {domain!r} -- add it to _DOMAIN_TOOL_PREFIXES[{domain!r}]"

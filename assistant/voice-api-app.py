@@ -2949,14 +2949,26 @@ def promote_unresolved_subject(client_id: str) -> None:
 # result may ground the FINAL answer -- it never blocks a tool from being
 # called, logged, or traced for debugging.
 _DOMAIN_TOOL_PREFIXES = {
+    # Real production bug: this allowlist silently drops a tool's real,
+    # successful result before it ever reaches synthesis if the tool's name
+    # (or a matching prefix) isn't listed here -- grounding_results becomes
+    # [], and evidence_supported_answer's dynamic_fact_question guard then
+    # reports a live-tool "unavailable" even though the call plainly
+    # succeeded moments earlier. "get_container_logs" ("server" domain via
+    # explicit_domain's "container" keyword) and "investigate_downloads"/
+    # "overseerr_status" (both land under "media" via a sonarr/qbittorrent/
+    # download keyword, or a stray discovery_subject making the domain
+    # default to "media") were all missing.
     "media": ("media_", "plex_", "lidarr_", "radarr_", "sonarr_", "slskd_", "qbittorrent_",
-              "torbox_", "music_", "beets_", "investigate_media", "web_search", "web_fetch"),
+              "torbox_", "music_", "beets_", "overseerr_", "investigate_media", "investigate_downloads",
+              "investigate_plex_missing", "web_search", "web_fetch"),
     "weather": ("weather",),
     "camera": ("frigate",),
     "cameras": ("frigate",),
-    "web_research": ("web_",),
+    "web_research": ("web_", "wikipedia_search"),
     "server": ("get_storage_status", "get_server_overview", "list_containers", "container_",
-               "get_container_status", "restart_container", "get_docker", "qbittorrent_"),
+               "get_container_status", "get_container_logs", "restart_container", "get_docker",
+               "get_gpu_status", "netdata_", "investigate_downloads", "qbittorrent_"),
 }
 
 
