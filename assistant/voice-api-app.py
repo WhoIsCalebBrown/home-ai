@@ -838,7 +838,8 @@ SOURCE_NAMES = {
 CONTAINER_DISPLAY_NAMES = {
     "lidarr": "Lidarr", "sonarr": "Sonarr", "radarr": "Radarr", "plex": "Plex",
     "frigate": "Frigate", "ollama": "Ollama", "piper": "Piper", "whisper": "Faster-Whisper",
-    "kokoro": "Kokoro-FastAPI",
+    "kokoro": "Kokoro-FastAPI", "home-ai-tools": "Home-AI-Tools", "home-ai-assistant": "Home-AI-Assistant",
+    "home-ai": "Home-AI-Assistant",
 }
 
 
@@ -2301,6 +2302,42 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if (device_state_match and device_state_match.group(1).strip()
             and re.search(r"\b(light|lights|lamp|outlet|switch|plug|socket|neon)\b", device_state_match.group(1))):
         return [("home_get_state", {"entity_or_area": device_state_match.group(1).strip()})]
+    # Real production bug: these unambiguous Unraid-host questions were
+    # matching two DIFFERENT earlier catch-alls before ever reaching a
+    # storage/health-specific check -- the "acquisition_verb + 2+ leftover
+    # words" untyped-media-request gate ("Give me a quick server status"
+    # has "give" plus enough non-scaffolding words left over) and the
+    # generic gpu/container/server-status block (bare "container"/"server
+    # status" keywords) both fired first, sending these to media_plan_goal
+    # or a bare list_containers count instead of the new, far more detailed
+    # unraid_* tools. Separately, even when discovery WAS reached, a
+    # "server" domain/group turn's candidate set was silently narrowed to
+    # only tools registered under the "server"/"docker"/"system" groups,
+    # dropping the new "unraid" group entirely -- fixed at the source in
+    # semantic_routing.py's _CAPABILITY_GROUP_ALIASES, but resolving these
+    # specific high-value phrasings deterministically here (as early as
+    # possible in this function) removes any remaining dependence on
+    # Qwen's own tool choice for them too.
+    # "What's using up most of the space in the cache" is a breakdown
+    # question (what's consuming it), not a capacity question (how full is
+    # it) -- unraid_storage_status can only answer the latter (see
+    # capability-gap.md on why a true per-directory breakdown tool was not
+    # built), so a "using"/"use" framing must not be captured here and
+    # should fall through to the existing, tested get_storage_status path
+    # instead of confidently answering the wrong shape of question.
+    if (re.search(r"\b(array|cache)\b", t) and re.search(r"\b(full|fullest|space|left|free|used|percent)\b", t)
+            and not re.search(r"\b(using|use|uses)\b", t)):
+        return [("unraid_storage_status", {"target": "cache" if re.search(r"\bcache\b", t) else "array"})]
+    if re.search(r"\bdisk(?:s)?\b", t) and re.search(r"\b(error|errors|smart|health|healthy|hottest|temperature)\b", t):
+        return [("unraid_disk_health", {})]
+    if re.search(r"\bdisk(?:s)?\b", t) and re.search(r"\b(fullest|full)\b", t):
+        return [("unraid_storage_status", {"target": "disks"})]
+    if re.search(r"\barray\b", t) and re.search(r"\b(health|healthy)\b", t):
+        return [("unraid_disk_health", {})]
+    if re.search(r"\bcontainers?\b", t) and re.search(r"\b(unhealthy|most ram|most cpu|most memory)\b", t):
+        return [("unraid_container_metrics", {})]
+    if re.search(r"\b(server|system)\b", t) and re.search(r"\b(status|health|healthy|wrong|ok\b|okay)\b", t):
+        return [("unraid_system_health", {})]
     # Library recency questions contain the verb "add" but are read-only
     # Plex queries, not acquisition goals. Resolve them before the broad
     # acquisition-language matcher.
@@ -2563,6 +2600,18 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if status_match and re.search(r"\bstatus\b|\brunning\b|\bhealthy\b|\bup\b", t):
         container_name = next(g for g in status_match.groups() if g)
         return [("get_container_status", {"name": container_name})]
+    # "Is Plex running?"/"How long has Plex been running?"/"How much memory
+    # is Home-AI using?" all name a real container but never say the literal
+    # word "container" (unlike the pattern above), so they were falling
+    # through to media/web routing instead ("Plex" is a media-identity word,
+    # "Home-AI" happened to trip current_external_question's bare "ai"
+    # keyword via the hyphen-bounded substring). Bounded to the known
+    # CONTAINER_DISPLAY_NAMES set (never an arbitrary word) so this cannot
+    # turn an unrelated "is the door open" or "is the light on" into a
+    # container lookup.
+    container_word = next((name for name in CONTAINER_DISPLAY_NAMES if re.search(rf"\b{re.escape(name)}\b", t.replace(" ", "-")) or re.search(rf"\b{re.escape(name.replace('-', ' '))}\b", t)), None)
+    if container_word and re.search(r"\brunning\b|\buptime\b|\bbeen\s+up\b|\bis\s+(?:it\s+)?up\b|\bup\s+and\s+running\b|how much (?:memory|ram|cpu) (?:is|does)", t):
+        return [("unraid_container_status", {"container": CONTAINER_DISPLAY_NAMES[container_word]})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):

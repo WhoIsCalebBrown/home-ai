@@ -22,7 +22,16 @@ REFERENTIAL_WORDS = frozenset(
 # capabilities must not be offered to the small model as competing choices.
 _CAPABILITY_GROUP_ALIASES = {
     "weather": frozenset({"weather"}),
-    "server": frozenset({"server", "docker", "system"}),
+    # Real production bug: a "server" domain turn ("What's using the most
+    # RAM?") sets context["group"]="server", which narrow_capability_entries
+    # uses to filter candidates down to only this allowlist's groups --
+    # "unraid" (the group every new unraid_* tool registers under) was
+    # missing, so the correct, decisively-top-ranked tool
+    # (unraid_container_metrics, score 18.7) was silently dropped down to a
+    # single fallback candidate (get_server_overview, score 3.1) before
+    # Qwen ever saw it. Same allowlist-completeness bug class as
+    # _DOMAIN_TOOL_PREFIXES found earlier tonight, different list.
+    "server": frozenset({"server", "docker", "system", "unraid"}),
     "internet": frozenset({"internet", "web", "knowledge"}),
     "cameras": frozenset({"cameras", "frigate"}),
     "media": frozenset({"media", "plex", "movies", "tv", "music", "downloads", "requests"}),

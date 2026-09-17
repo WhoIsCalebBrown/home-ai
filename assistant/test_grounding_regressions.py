@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -443,7 +443,11 @@ def test_retained_media_diagnosis_beats_generic_status():
 
 
 def test_server_status_is_a_bounded_read():
-    assert preflight_plan("What is the server status?") == [("list_containers", {})]
+    # Intentional behavior change: "server status" now resolves to the new,
+    # far more detailed unraid_system_health tool (array/CPU/RAM/uptime/
+    # firing-alerts summary) instead of a bare container count, once the
+    # Unraid Management Agent MCP adapter tools existed to answer it properly.
+    assert preflight_plan("What is the server status?") == [("unraid_system_health", {})]
 
 
 def test_asr_where_its_title_stays_a_media_status_read():
@@ -818,6 +822,47 @@ def test_named_container_status_question_resolves_deterministically():
         ("get_container_status", {"name": "Home-AI-Tools"})
     ]
     assert preflight_plan("Is the Plex container running?") == [("get_container_status", {"name": "Plex"})]
+
+
+def test_unraid_storage_and_health_questions_resolve_deterministically():
+    # Found by a live acceptance-test sweep against the newly-added Unraid
+    # Management Agent MCP adapter tools: two DIFFERENT earlier catch-alls
+    # (the acquisition_verb + leftover-words untyped-media-request gate for
+    # "Give me a quick server status", and the generic gpu/container/
+    # server-status block for "cache"/"container"/"server status" keywords)
+    # both fired before ever reaching a storage/health-specific check,
+    # sending these to media_plan_goal or a bare list_containers count
+    # instead of the new, far more detailed tools.
+    assert preflight_plan("How full is the cache drive?") == [("unraid_storage_status", {"target": "cache"})]
+    assert preflight_plan("How much space is left on the array?") == [("unraid_storage_status", {"target": "array"})]
+    assert preflight_plan("Which disk is fullest?") == [("unraid_storage_status", {"target": "disks"})]
+    assert preflight_plan("Is the array healthy?") == [("unraid_disk_health", {})]
+    assert preflight_plan("Are any disks having errors?") == [("unraid_disk_health", {})]
+    assert preflight_plan("Are any containers unhealthy?") == [("unraid_container_metrics", {})]
+    assert preflight_plan("Give me a quick server status.") == [("unraid_system_health", {})]
+    assert preflight_plan("Is anything wrong with the server?") == [("unraid_system_health", {})]
+    # A true storage-BREAKDOWN question (what's consuming the space) is a
+    # different shape unraid_storage_status cannot answer (see
+    # capability-gap.md) and must fall through to the existing tested path,
+    # not be confidently answered with the wrong kind of data.
+    assert preflight_plan("What's using up most of the space in the cache?") == [("get_storage_status", {})]
+
+
+def test_named_container_uptime_and_memory_questions_resolve_deterministically():
+    # "Is Plex running?"/"How long has Plex been running?"/"How much memory
+    # is Home-AI using?" all name a real container but never say the literal
+    # word "container", so they fell through to media/web routing instead
+    # ("Plex" is a media-identity word; "Home-AI" tripped
+    # current_external_question's bare "ai" keyword via the hyphen-bounded
+    # substring). Bounded to the known CONTAINER_DISPLAY_NAMES set so this
+    # cannot turn an unrelated "is the light on" into a container lookup,
+    # and must not steal a real media-library question just because "Plex"
+    # and a bare "up" both appear in it.
+    assert preflight_plan("How long has Plex been running?") == [("unraid_container_status", {"container": "Plex"})]
+    assert preflight_plan("Is Plex running?") == [("unraid_container_status", {"container": "Plex"})]
+    assert preflight_plan("How much memory is Home-AI using?") == [("unraid_container_status", {"container": "Home-AI-Assistant"})]
+    assert preflight_plan("Is the front door light on?")[0][0] != "unraid_container_status"
+    assert preflight_plan("Why isn't The Matrix showing up in my Plex library?")[0][0] == "investigate_plex_missing"
 
 
 def test_container_logs_request_is_not_swallowed_by_generic_container_catch_all():
