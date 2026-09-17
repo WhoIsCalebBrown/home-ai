@@ -1166,6 +1166,24 @@ def test_sentence_initial_capitalization_is_not_mistaken_for_a_person_name():
     assert _descriptive_media_clue("What's that Tom Hanks movie where he's stuck on an island?")
 
 
+def test_lowercase_character_who_plot_clue_reaches_identity_resolution():
+    """A lowercase typed person name is not dependable title-case evidence,
+    but a character-role relative clause is enough generic plot evidence to
+    avoid searching Plex for the entire description as though it were a title.
+    """
+    text = "whats the movie with tom hanks and he plays some guy who is running a lot and is disabled"
+    assert _descriptive_media_clue(text)
+    assert preflight_plan(text) == [("media_plan_goal", {"goal": text})]
+
+
+def test_who_questions_without_a_character_plot_clause_are_not_media_clues():
+    # The new relative-clause shape is deliberately narrower than a bare
+    # "who is ..." question, which is common outside media discovery.
+    assert not _descriptive_media_clue("Who is running the Plex server?")
+    assert not _descriptive_media_clue("Who is tom hanks?")
+    assert preflight_plan("Who is running the Plex server?")[0][0] != "media_plan_goal"
+
+
 def test_explicit_manager_search_resolves_directly_to_its_own_tool():
     # "Search Radarr/Lidarr for X" names its own manager service; the
     # generic Plex/pipeline catch-alls have no way to express that and

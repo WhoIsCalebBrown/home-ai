@@ -2346,8 +2346,8 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
 
 def _descriptive_media_clue(text: str) -> bool:
     """A rich descriptive clue -- a person name, or a relative-clause plot
-    description ("about"/"where" followed by a description, but not the
-    established "where's"/"where is" status-question shape) -- names a
+    description ("about"/"where", or a character-role "who" clause, rather
+    than the established "where's"/"where is" status-question shape) -- names a
     media item by DESCRIPTION rather than a known title or an existing
     conversational referent. This signal must outrank incidental
     status-sounding words that happen to appear INSIDE the description
@@ -2375,7 +2375,17 @@ def _descriptive_media_clue(text: str) -> bool:
         r"|Restart|Reboot|Reload|Get|Give|Add|Request|Play|Stop|Start|Check|Show|Send|Grab|Find|Please|Search|Look)\b)"
         r"[A-Z][a-z]+ (?!(?:Sonarr|Radarr|Lidarr|Plex|Docker|Frigate|Torbox|Overseerr|Wikipedia|Netdata|Beets|Slskd|Soulseek|Qbittorrent|Plexium)\b)[A-Z][a-z]+\b", text))
     has_plot_clause = bool(re.search(r"\b(?:where|about)\b(?!(?:'s|\s+is|\s+it))", text, re.I))
-    return has_person or has_plot_clause
+    # A typed prompt commonly loses title case (and a name alone therefore
+    # cannot safely identify a person), but a character role followed by a
+    # relative "who" clause is independently a plot description: "some guy
+    # who is running ...".  Do not treat every "who is ..." question as a
+    # clue -- that would hijack ordinary identity questions in other domains.
+    has_character_who_clause = bool(re.search(
+        r"\b(?:guy|man|woman|person|character|someone|child|kid)\s+who\b",
+        text,
+        re.I,
+    ))
+    return has_person or has_plot_clause or has_character_who_clause
 
 
 def media_status_question(text: str) -> bool:
