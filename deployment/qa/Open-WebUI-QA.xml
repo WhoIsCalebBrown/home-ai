@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Open-WebUI-QA</Name>
+  <Repository>ghcr.io/open-webui/open-webui:v0.11.3</Repository>
+  <Registry>https://ghcr.io/</Registry>
+  <Network>voiceai-qa</Network>
+  <Privileged>false</Privileged>
+  <Overview>Unmodified Open WebUI client for restricted Home-AI acceptance testing.</Overview>
+  <WebUI>http://[IP]:[PORT:13000]/</WebUI>
+  <Config Name="Web UI" Target="8080" Default="18091" Mode="tcp" Description="QA-only host port." Type="Port" Display="always" Required="true" Mask="false">18091</Config>
+  <Config Name="QA data" Target="/app/backend/data" Default="/mnt/cache/appdata/home-ai/qa/open-webui" Mode="rw" Description="Separate QA Open WebUI database and chats." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/home-ai/qa/open-webui</Config>
+  <Config Name="Provider URL" Target="OPENAI_API_BASE_URL" Default="http://Home-AI-QA-Assistant:8088/v1" Mode="" Description="QA-only Home-AI provider." Type="Variable" Display="always" Required="true" Mask="false">http://Home-AI-QA-Assistant:8088/v1</Config>
+  <Config Name="Provider key" Target="OPENAI_API_KEY" Default="__QA_OPENAI_KEY__" Mode="" Description="Dedicated QA key; configure through a protected secret, never commit it." Type="Variable" Display="advanced" Required="true" Mask="true">__QA_OPENAI_KEY__</Config>
+  <Config Name="WebUI secret" Target="WEBUI_SECRET_KEY" Default="__QA_WEBUI_SECRET__" Mode="" Description="Dedicated QA session secret." Type="Variable" Display="advanced" Required="true" Mask="true">__QA_WEBUI_SECRET__</Config>
+  <Config Name="Forward session identity" Target="ENABLE_FORWARD_USER_INFO_HEADERS" Default="true" Mode="" Description="Forward authenticated QA user and chat IDs." Type="Variable" Display="always" Required="true" Mask="false">true</Config>
+  <Config Name="Disable Ollama integration" Target="ENABLE_OLLAMA_API" Default="false" Mode="" Description="Use only the QA Home-AI provider." Type="Variable" Display="advanced" Required="true" Mask="false">false</Config>
+</Container>

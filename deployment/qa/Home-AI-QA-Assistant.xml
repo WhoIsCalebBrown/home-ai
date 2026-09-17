@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Home-AI-QA-Assistant</Name>
+  <Repository>ghcr.io/whoiscalebbrown/home-ai-assistant:stable</Repository>
+  <Registry>https://ghcr.io/whoiscalebbrown/home-ai-assistant</Registry>
+  <Network>voiceai-qa</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/WhoIsCalebBrown/home-ai</Support>
+  <Project>https://github.com/WhoIsCalebBrown/home-ai</Project>
+  <Overview>Parallel Home-AI Assistant for restricted live-read-only acceptance testing.</Overview>
+  <Category>AI:Tools</Category>
+  <Config Name="Host Port" Target="8088" Default="8088" Mode="tcp" Description="Optional QA API port." Type="Port" Display="advanced" Required="true" Mask="false">18089</Config>
+  <Config Name="Tools URL" Target="TOOLS_URL" Default="http://Home-AI-QA-Tools:8090" Mode="" Description="QA-only Tools endpoint; do not point at production server-tools." Type="Variable" Display="always" Required="true" Mask="false">http://Home-AI-QA-Tools:8090</Config>
+  <Config Name="OpenAI model ID" Target="OPENAI_COMPAT_MODEL" Default="home-ai-qa" Mode="" Description="Distinct model ID for the QA provider." Type="Variable" Display="always" Required="true" Mask="false">home-ai-qa</Config>
+  <Config Name="OpenAI compatibility API key file" Target="OPENAI_COMPAT_API_KEY_FILE" Default="/run/secrets/home-ai-qa-openai-key" Mode="" Description="Dedicated QA provider key; never use the production key." Type="Variable" Display="advanced" Required="true" Mask="true">/run/secrets/home-ai-qa-openai-key</Config>
+  <Config Name="QA OpenAI secret" Target="/run/secrets/home-ai-qa-openai-key" Default="/run/secrets/home-ai-qa-openai-key" Mode="ro" Description="Dedicated QA-only provider credential." Type="Path" Display="advanced" Required="true" Mask="true">/mnt/cache/appdata/home-ai/qa/secrets/openai-compat.key</Config>
+  <Config Name="Tools token file" Target="TOOLS_SERVICE_TOKEN_FILE" Default="/run/secrets/home-ai-qa-tools-token" Mode="" Description="Dedicated QA service credential." Type="Variable" Display="advanced" Required="true" Mask="true">/run/secrets/home-ai-qa-tools-token</Config>
+  <Config Name="QA Tools secret" Target="/run/secrets/home-ai-qa-tools-token" Default="/run/secrets/home-ai-qa-tools-token" Mode="ro" Description="Dedicated QA token; never use the production token." Type="Path" Display="advanced" Required="true" Mask="true">/mnt/cache/appdata/home-ai/qa/secrets/tools-service.token</Config>
+  <Config Name="QA pronunciation state" Target="/app/pronunciation" Default="/mnt/cache/appdata/home-ai/qa/assistant-state" Mode="rw" Description="Separate QA state." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/home-ai/qa/assistant-state</Config>
+</Container>

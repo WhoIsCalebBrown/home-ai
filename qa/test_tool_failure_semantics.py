@@ -2,7 +2,10 @@
 
 import asyncio
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import httpx
 
@@ -74,3 +77,81 @@ def test_malformed_success_payload_is_invalid_tool_result(tmp_path):
     assert result["status"] == "error"
     assert result["result"]["error_code"] == "INVALID_TOOL_RESULT"
     assert result["result"]["evidence_available"] is False
+
+
+def test_live_readonly_scope_denies_mutations_before_handler(monkeypatch, tmp_path):
+    module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
+    module.QA_MODE = "live_readonly"
+    called = False
+
+    async def writer(_):
+        nonlocal called
+        called = True
+        return {"status": "ok", "write_executed": True}
+
+    module.TOOLS["qa_writer"] = ("qa_writer", "isolated", "confirm", "qa", {}, writer)
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_writer", confirmed=True)))
+    assert result["status"] == "disabled"
+    assert result["result"]["error_code"] == "QA_LIVE_READONLY"
+    assert result["result"]["write_executed"] is False
+    assert called is False
+
+
+def test_isolated_scope_denies_production_mutations_before_handler(tmp_path):
+    module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
+    module.QA_MODE = "isolated_execution"
+    called = False
+
+    async def writer(_):
+        nonlocal called
+        called = True
+        return {"status": "ok", "write_executed": True}
+
+    module.TOOLS["qa_writer"] = ("qa_writer", "isolated", "destructive", "qa", {}, writer)
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_writer", confirmed=True)))
+    assert result["status"] == "disabled"
+    assert result["result"]["error_code"] == "QA_ISOLATED_EXECUTOR_REQUIRED"
+    assert called is False
+
+
+def _qa_startup(tmp_path, **settings):
+    env = os.environ.copy()
+    for name in (
+        "HOME_AI_QA_MODE", "HOME_AI_QA_EXECUTOR", "HOME_AI_QA_STATE_ROOT",
+        "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+    ):
+        env.pop(name, None)
+    env.update({name: str(value) for name, value in settings.items()})
+    app_path = Path(__file__).parents[1] / "tools" / "server-tools-app.py"
+    script = (
+        "import importlib.util; "
+        f"s=importlib.util.spec_from_file_location('qa_startup', {str(app_path)!r}); "
+        "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+    )
+    return subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+
+
+def test_isolated_mode_startup_is_fail_closed(tmp_path):
+    valid_root = tmp_path / "isolated-state"
+    valid_root.mkdir()
+    valid = _qa_startup(
+        tmp_path,
+        HOME_AI_QA_MODE="isolated_execution",
+        HOME_AI_QA_EXECUTOR="fake",
+        HOME_AI_QA_STATE_ROOT=valid_root,
+    )
+    assert valid.returncode == 0, valid.stderr
+
+    cases = (
+        {"HOME_AI_QA_MODE": "unknown"},
+        {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_STATE_ROOT": valid_root},
+        {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_EXECUTOR": "fake",
+         "HOME_AI_QA_STATE_ROOT": tmp_path / "missing"},
+        {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_EXECUTOR": "fake",
+         "HOME_AI_QA_STATE_ROOT": valid_root, "CLIDEBRID_BRIDGE_TOKEN": "must-refuse"},
+    )
+    for settings in cases:
+        result = _qa_startup(tmp_path, **settings)
+        assert result.returncode != 0, settings

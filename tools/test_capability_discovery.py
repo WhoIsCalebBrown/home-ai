@@ -351,7 +351,8 @@ def test_enabled_executor_revalidates_provider_before_using_stale_active_state(m
             "episode_scope": [], "session_id": "session-a"}
     plan = {"canonical_identity": {"media_type": "movie", "tmdb_id": 8467, "title": "Dumb and Dumber", "year": 1994}}
     confirmation_args = {key: args[key] for key in ("workflow_id", "mode", "media_type",
-                                                      "canonical_external_id", "season_scope", "episode_scope")}
+                                                      "canonical_external_id", "canonical_title",
+                                                      "season_scope", "episode_scope")}
     record = module.media_confirmation_record(workflow_id=args["workflow_id"], plan=plan,
                                               session_id="session-a", operation="cli_debrid.webhook",
                                               arguments=confirmation_args)

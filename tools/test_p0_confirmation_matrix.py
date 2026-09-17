@@ -30,6 +30,8 @@ def harness(tmp_path, monkeypatch):
     module.STANDARD_MEDIA_BACKEND_READY = True
     module.STANDARD_MEDIA_WRITES_ENABLED = True
     module.STANDARD_MOVIE_WRITES_ENABLED = True
+    module.QA_MODE = "isolated_execution"
+    module.QA_EXECUTOR = "fake"
     module._standard_bridge_secret = lambda: "fake-only-token"
     monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {"matched": False})
     monkeypatch.setattr(module, "plex_match_canonical_media", _async_false)
@@ -38,7 +40,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "radarr_search", fake_radarr)
     monkeypatch.setattr(module, "sonarr_search", lambda args: _async_false())
     monkeypatch.setattr(module, "arr_get", _async_false)
-    calls = []
+    outbound_attempts = []
 
     class Response:
         content = b"{}"
@@ -60,11 +62,11 @@ def harness(tmp_path, monkeypatch):
             return False
 
         async def post(self, url, json=None, **kwargs):
-            calls.append({"url": url, "json": json})
-            return Response()
+            outbound_attempts.append({"url": url, "json": json})
+            raise AssertionError(f"isolated executor attempted outbound mutation: {url}")
 
     monkeypatch.setattr(module, "httpx", type("FakeHttpx", (), {"AsyncClient": FakeClient}))
-    return module, calls
+    return module, outbound_attempts
 
 
 async def _async_false(*args, **kwargs):
@@ -99,12 +101,14 @@ async def test_matrix_b_identical_prompts_confirm_only_b(harness):
     mod, calls = harness
     a, b = await _plan(mod, "openwebui:user:chat-a"), await _plan(mod, "openwebui:user:chat-b")
     result = await mod.media_standard_request(_args(b, "openwebui:user:chat-b"))
-    assert result["write_executed"] is True and len(calls) == 1
-    assert calls[0]["json"]["request"]["media_id"] == 438631
+    assert result["executor"] == "in_process_fake"
+    assert result["fake_execution_count"] == 1
+    assert result["write_executed"] is False and not calls
     workflow = next(r for r in mod._media_workflows() if r["workflow_id"] == a["workflow_id"])
     states = {item["confirmation_id"]: item["status"] for item in workflow["pending_confirmations"]}
     assert states[a["confirmation_record"]["confirmation_id"]] == "PENDING"
     assert states[b["confirmation_record"]["confirmation_id"]] == "CONSUMED"
+    assert workflow["qa_execution_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -114,7 +118,8 @@ async def test_matrix_b_identical_prompts_confirm_only_b(harness):
 ])
 async def test_matrix_negative_cases_never_execute(harness, case):
     mod, calls = harness
-    plan = await _plan(mod, "openwebui:user:chat-a")
+    planned_session = "legacy:old-client" if case == "legacy" else "openwebui:user:chat-a"
+    plan = await _plan(mod, planned_session)
     binding = dict(plan["confirmation_record"])
     session = "openwebui:user:chat-a"
     current = _args(plan, session)
@@ -145,13 +150,14 @@ async def test_matrix_replay_and_concurrent_approvals_at_most_once(harness):
     plan = await _plan(mod, "openwebui:user:chat-a")
     args = _args(plan, "openwebui:user:chat-a")
     first, second = await asyncio.gather(mod.media_standard_request(args), mod.media_standard_request(args))
-    assert sum(bool(item.get("write_executed")) for item in (first, second)) == 1
-    assert len(calls) == 1
+    assert sum(item.get("executor") == "in_process_fake" for item in (first, second)) == 1
+    assert not calls
     replay = await mod.media_standard_request(args)
     assert replay["write_executed"] is False
-    assert len(calls) == 1
+    assert not calls
     row = next(r for r in mod._media_workflows() if r["workflow_id"] == plan["workflow_id"])
     assert row["confirmation_status"] in {"CONSUMED", "SUBMITTING"}
+    assert row["qa_execution_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -159,15 +165,19 @@ async def test_matrix_restart_reconnect_does_not_resurrect_consumed(harness, tmp
     mod, calls = harness
     plan = await _plan(mod, "openwebui:user:chat-a")
     args = _args(plan, "openwebui:user:chat-a")
-    assert (await mod.media_standard_request(args))["write_executed"] is True
+    executed = await mod.media_standard_request(args)
+    assert executed["executor"] == "in_process_fake"
+    assert executed["fake_execution_count"] == 1
     # Reloading the module against the same persisted store models a process restart.
     fresh_spec = importlib.util.spec_from_file_location("tools_p0_restart", ROOT / "server-tools-app.py")
     fresh = importlib.util.module_from_spec(fresh_spec)
     fresh_spec.loader.exec_module(fresh)
     fresh.MEDIA_WORKFLOWS_PATH = mod.MEDIA_WORKFLOWS_PATH
+    fresh.QA_MODE = "isolated_execution"
+    fresh.QA_EXECUTOR = "fake"
     fresh.STANDARD_MEDIA_BACKEND_READY = True
     fresh.STANDARD_MEDIA_WRITES_ENABLED = True
     fresh._standard_bridge_secret = lambda: "fake-only-token"
     result = await fresh.media_standard_request(args)
     assert result["write_executed"] is False
-    assert len(calls) == 1
+    assert not calls

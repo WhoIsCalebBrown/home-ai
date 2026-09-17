@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from canonical_identity import build_canonical_identity
+import workflow_events
 from workflow_events import log_event_safe
 
 app = FastAPI(title="Local Server Tools", version="2026.09.13")
@@ -92,9 +93,6 @@ STANDARD_MEDIA_BACKEND_READY = os.getenv("STANDARD_MEDIA_BACKEND_READY", "false"
 QA_MODE = os.getenv("HOME_AI_QA_MODE", "").strip().casefold()
 QA_EXECUTOR = os.getenv("HOME_AI_QA_EXECUTOR", "").strip().casefold()
 QA_STATE_ROOT = os.getenv("HOME_AI_QA_STATE_ROOT", "").strip()
-QA_ALLOWED_MUTATION_MODES = frozenset({"", "production"})
-
-
 def validate_qa_configuration() -> None:
     if QA_MODE not in {"", "live_readonly", "isolated_execution"}:
         raise RuntimeError("invalid HOME_AI_QA_MODE; refusing to start")
@@ -106,6 +104,9 @@ def validate_qa_configuration() -> None:
             raise RuntimeError("isolated_execution requires HOME_AI_QA_EXECUTOR=fake")
         if not QA_STATE_ROOT or QA_STATE_ROOT in {"/", "/data", "/config"}:
             raise RuntimeError("isolated_execution requires a dedicated QA state root")
+        qa_root = Path(QA_STATE_ROOT)
+        if not qa_root.is_absolute() or not qa_root.is_dir():
+            raise RuntimeError("isolated_execution QA state root must be an existing absolute directory")
         if any(os.getenv(name, "").strip() for name in ("CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE")):
             raise RuntimeError("isolated_execution refuses production cli_debrid credentials")
 
@@ -123,6 +124,7 @@ if QA_MODE == "isolated_execution":
     LISTS_PATH = _qa_root / "home-ai-lists.json"
     MEDIA_WORKFLOWS_PATH = _qa_root / "media-workflows.json"
     USER_PROFILE_PATH = _qa_root / "user-profile.json"
+    workflow_events.WORKFLOW_EVENTS_DB = _qa_root / "workflow-events.sqlite3"
 HOME_ASSISTANT_URL = os.getenv("HOME_ASSISTANT_URL", "http://192.168.40.44:8123").rstrip("/")
 HOME_ASSISTANT_TOKEN_FILE = Path(os.getenv(
     "HOME_ASSISTANT_TOKEN_FILE",
@@ -3356,6 +3358,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     binding = args.get("confirmation_context")
     if not isinstance(binding, dict) or not required_binding.issubset(binding):
         return {"status": "rejected", "reason": "CONFIRMATION_BINDING_REQUIRED", "write_executed": False}
+    if str(args.get("session_id", "")).startswith("legacy:") or str(binding.get("session_id", "")).startswith("legacy:"):
+        return {"status": "rejected", "reason": "LEGACY_SESSION_NOT_AUTHORIZED", "write_executed": False}
     if binding.get("status") != "PENDING" or str(args.get("session_id", "")) != str(binding.get("session_id")):
         return {"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID", "write_executed": False}
     try:
@@ -3396,13 +3400,16 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
         # HTTP request, filesystem media write, or production event source is
         # reachable from this branch.
         _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
+        fake_execution_count = int(workflow.get("qa_execution_count") or 0) + 1
         workflow.update({"canonical_state": "REQUESTED", "mode": "standard",
-                         "qa_executor": "fake", "write_executed": False})
+                         "qa_executor": "fake", "qa_execution_count": fake_execution_count,
+                         "write_executed": False})
         _save_workflow_update(rows, workflow)
         log_event_safe(workflow_id=workflow_id, event_type="QA_FAKE_EXECUTION",
                        canonical_subject_id=str(payload["mediaId"]), source_service="qa_fake")
         return {"status": "ok", "reason": "QA_FAKE_EXECUTOR", "write_executed": False,
                 "executor": "in_process_fake", "workflow_id": workflow_id,
+                "fake_execution_count": fake_execution_count,
                 "canonical_identity": workflow.get("canonical_identity", {})}
     # Persisted lifecycle state is correlation/history, not proof of a live
     # request. Revalidate the provider first so stale REQUESTED/SEARCHING
@@ -4345,9 +4352,11 @@ async def health(request: Request):
         authenticated = False
     payload = {"ok": True, "service": "server-tools"}
     if authenticated:
+        mutation_scope = ("read_only" if QA_MODE == "live_readonly"
+                          else "fake_only" if QA_MODE == "isolated_execution"
+                          else "configured")
         payload.update({"tools": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION,
-                        "qa_mode": QA_MODE or "production",
-                        "mutation_scope": "read_only" if QA_MODE else "configured"})
+                        "qa_mode": QA_MODE or "production", "mutation_scope": mutation_scope})
     return payload
 
 
@@ -4463,7 +4472,8 @@ async def invoke(request: Request, req: Invoke):
     if not item:
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
-    if QA_MODE in {"live_readonly", "isolated_execution"} and permission in {"confirm", "destructive"}:
+    isolated_fake_media_executor = QA_MODE == "isolated_execution" and req.name == "media_standard_request"
+    if (QA_MODE == "live_readonly" or (QA_MODE == "isolated_execution" and not isolated_fake_media_executor)) and permission in {"confirm", "destructive"}:
         # This is enforced at the trusted Tools boundary, before confirmation
         # handling or an adapter can run.  Prompts, dry_run fields, and model
         # generated arguments cannot override deployment scope.
