@@ -3086,7 +3086,11 @@ _DOMAIN_TOOL_PREFIXES = {
     "weather": ("weather",),
     "camera": ("frigate",),
     "cameras": ("frigate",),
-    "web_research": ("web_", "wikipedia_search"),
+    # "How much memory is Home-AI using?" resolves to "web_research" domain
+    # (explicit_domain's bare "ai" keyword matches the hyphen-bounded
+    # substring in "Home-AI") even though preflight_plan correctly routes it
+    # to unraid_container_status -- fifth instance of the same allowlist gap.
+    "web_research": ("web_", "wikipedia_search", "unraid_container_status"),
     "server": ("get_storage_status", "get_server_overview", "list_containers", "container_",
                "get_container_status", "get_container_logs", "restart_container", "get_docker",
                "get_gpu_status", "netdata_", "investigate_downloads", "qbittorrent_", "unraid_"),

@@ -2182,6 +2182,21 @@ async def test_named_container_status_result_is_not_silently_dropped_before_synt
 
 
 @pytest.mark.asyncio
+async def test_home_ai_container_memory_result_is_not_silently_dropped_before_synthesis(session):
+    # Fifth instance of the same allowlist-completeness bug: "How much
+    # memory is Home-AI using?" resolves to "web_research" domain
+    # (explicit_domain's bare "ai" keyword matches the hyphen-bounded
+    # substring in "Home-AI") even though preflight_plan correctly routes
+    # it to unraid_container_status -- "web_research" domain's tuple did
+    # not include it, so the real, successful result was silently dropped.
+    reply = await session.turn(
+        "How much memory is Home-AI using?",
+        final_text="Home-AI-Assistant is using about 512 megabytes of memory.",
+    )
+    assert reply == "Home-AI-Assistant is using about 512 megabytes of memory."
+
+
+@pytest.mark.asyncio
 async def test_investigate_downloads_result_is_not_silently_dropped_before_synthesis(session):
     # Same root cause as the logs bug above: "investigate_downloads" was
     # missing from BOTH the "server" and "media" domain tuples in
@@ -2216,7 +2231,11 @@ def test_every_domain_relevant_tool_has_a_matching_prefix(app):
                   # bare "plex" keyword) but is answered by unraid_container_status --
                   # fourth instance of this exact bug class, found live.
                   "unraid_container_status"],
-        "web_research": ["web_search", "web_fetch", "wikipedia_search"],
+        "web_research": ["web_search", "web_fetch", "wikipedia_search",
+                         # "How much memory is Home-AI using?" resolves to "web_research"
+                         # domain via explicit_domain's bare "ai" keyword collision --
+                         # fifth instance of this exact bug class, found live.
+                         "unraid_container_status"],
         "weather": ["weather_forecast"],
         "camera": ["frigate_stats", "frigate_recent_activity", "frigate_recent_events"],
     }
