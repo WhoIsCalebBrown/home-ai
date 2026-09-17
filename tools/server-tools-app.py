@@ -3579,7 +3579,33 @@ async def unraid_container_status(args: dict[str, Any]) -> dict[str, Any]:
     except RuntimeError as exc:
         return {"found": False, "container": name, "error": str(exc)}
     if not isinstance(info, dict) or not info:
-        return {"found": False, "container": name}
+        # Real production bug: Home-AI's own CONTAINER_DISPLAY_NAMES map (e.g.
+        # "plex" -> "Plex") does not always match the real Docker container
+        # name the MCP indexes by exact string ("Plex-Media-Server"), and the
+        # MCP's own get_container_info lookup is exact-match, not fuzzy --
+        # "Is Plex running?" was answered "isn't running" even while Plex was
+        # plainly running and consuming CPU/RAM in the same session's
+        # unraid_container_metrics call. Resolve the requested name against
+        # the live container list (case-insensitive substring match, never an
+        # arbitrary MCP call) before concluding it does not exist.
+        try:
+            containers = await unraid_mcp_call("list_containers", {})
+        except RuntimeError:
+            containers = None
+        needle = name.casefold()
+        match = None
+        if isinstance(containers, list):
+            match = next((c for c in containers if needle in str(c.get("name") or "").casefold()), None)
+            if not match:
+                match = next((c for c in containers if str(c.get("name") or "").casefold() in needle), None)
+        if not match:
+            return {"found": False, "container": name}
+        try:
+            info = await unraid_mcp_call("get_container_info", {"container_id": match.get("name")})
+        except RuntimeError as exc:
+            return {"found": False, "container": name, "error": str(exc)}
+        if not isinstance(info, dict) or not info:
+            return {"found": False, "container": name}
     return {"found": True, "name": info.get("name"), "state": info.get("state"), "status": info.get("status"),
             "image": info.get("image"), "network_mode": info.get("network_mode"), "ip_address": info.get("ip_address"),
             "ports": info.get("port_mappings") or info.get("ports"), "cpu_percent": info.get("cpu_percent"),

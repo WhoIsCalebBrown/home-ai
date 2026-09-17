@@ -52,7 +52,9 @@ def _install_fake_mcp(monkeypatch, tool_results: dict[str, object]):
                 name = json["params"]["name"]
                 if name not in tool_results:
                     return FakeResponse("event: message\ndata: " + _json.dumps({"jsonrpc": "2.0", "id": 2, "error": {"code": -1, "message": f"no fixture for {name}"}}))
-                return FakeResponse(_mcp_result(tool_results[name]))
+                fixture = tool_results[name]
+                payload = fixture(json["params"].get("arguments") or {}) if callable(fixture) else fixture
+                return FakeResponse(_mcp_result(payload))
             raise AssertionError(f"unexpected MCP method: {method}")
 
     monkeypatch.setattr(module, "httpx", type("FakeHttpxModule", (), {"AsyncClient": FakeAsyncClient}))
@@ -104,6 +106,34 @@ def test_container_status_found_and_not_found(monkeypatch):
 
     empty = asyncio.run(module.unraid_container_status({"container": ""}))
     assert "error" in empty
+
+
+def test_container_status_falls_back_to_fuzzy_name_match(monkeypatch):
+    # Real production bug: "Is Plex running?" was answered "isn't running"
+    # even while Plex was plainly running and consuming CPU/RAM in the same
+    # session -- CONTAINER_DISPLAY_NAMES maps "plex" -> "Plex", but the real
+    # Docker container is named "Plex-Media-Server" and get_container_info's
+    # own lookup is exact-match, not fuzzy. A miss must fall back to a
+    # case-insensitive substring match against the live container list
+    # before concluding the container does not exist.
+    def _get_container_info(arguments):
+        container_id = arguments.get("container_id")
+        if container_id == "Plex-Media-Server":
+            return {"name": "Plex-Media-Server", "state": "running", "status": "Up 10 days", "cpu_percent": 7.8}
+        return {}
+
+    _install_fake_mcp(monkeypatch, {
+        "get_container_info": _get_container_info,
+        "list_containers": [
+            {"name": "Plex-Media-Server", "cpu_percent": 7.8, "status": "Up 10 days"},
+            {"name": "Ollama", "cpu_percent": 1.0, "status": "Up 10 days"},
+        ],
+    })
+    info = asyncio.run(module.unraid_container_status({"container": "Plex"}))
+    assert info["found"] is True and info["name"] == "Plex-Media-Server"
+
+    still_missing = asyncio.run(module.unraid_container_status({"container": "Nonexistent-Thing"}))
+    assert still_missing["found"] is False
 
 
 def test_container_metrics_ranks_by_cpu_and_flags_unhealthy(monkeypatch):
