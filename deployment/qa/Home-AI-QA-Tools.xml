@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>Home-AI-QA-Tools</Name>
-  <Repository>ghcr.io/whoiscalebbrown/home-ai-tools:stable</Repository>
+  <Repository>ghcr.io/whoiscalebbrown/home-ai-tools:sha-a68c20d</Repository>
   <Registry>https://ghcr.io/whoiscalebbrown/home-ai-tools</Registry>
   <Network>voiceai-qa</Network>
   <Privileged>false</Privileged>
@@ -11,6 +11,11 @@
   <Category>AI:Tools</Category>
   <Config Name="Host Port" Target="8090" Default="8090" Mode="tcp" Description="Optional LAN port; keep unexposed unless required by the QA runner." Type="Port" Display="advanced" Required="true" Mask="false">18090</Config>
   <Config Name="QA mode" Target="HOME_AI_QA_MODE" Default="live_readonly" Mode="" Description="Server-enforced read-only scope. Any other value is rejected by the image." Type="Variable" Display="always" Required="true" Mask="false">live_readonly</Config>
+  <Config Name="Media workflow state" Target="MEDIA_WORKFLOWS_PATH" Default="/app/state/media-workflows.json" Mode="" Description="Dedicated QA workflow store." Type="Variable" Display="advanced" Required="true" Mask="false">/app/state/media-workflows.json</Config>
+  <Config Name="Standard media writes" Target="STANDARD_MEDIA_WRITES_ENABLED" Default="false" Mode="" Description="Explicit defense in depth; live_readonly also denies mutations." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
+  <Config Name="Movie writes" Target="STANDARD_MOVIE_WRITES_ENABLED" Default="false" Mode="" Description="Explicitly disabled in QA." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
+  <Config Name="Season writes" Target="STANDARD_SEASON_WRITES_ENABLED" Default="false" Mode="" Description="Explicitly disabled in QA." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
+  <Config Name="Episode writes" Target="STANDARD_EPISODE_WRITES_ENABLED" Default="false" Mode="" Description="Explicitly disabled in QA." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
   <Config Name="Tools service token" Target="TOOLS_SERVICE_TOKEN_FILE" Default="/run/secrets/home-ai-qa-tools-token" Mode="" Description="Private QA Assistant-to-Tools credential; never expose to Open WebUI or models." Type="Variable" Display="advanced" Required="true" Mask="true">/run/secrets/home-ai-qa-tools-token</Config>
   <Config Name="QA Tools secret" Target="/run/secrets/home-ai-qa-tools-token" Default="/run/secrets/home-ai-qa-tools-token" Mode="ro" Description="Dedicated QA-only service token. Do not point at the production token." Type="Path" Display="advanced" Required="true" Mask="true">/mnt/cache/appdata/home-ai/qa/secrets/tools-service.token</Config>
   <Config Name="QA state" Target="/app/state" Default="/mnt/cache/appdata/home-ai/qa/tools-state" Mode="rw" Description="Separate QA workflow and audit state; never share production state." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/home-ai/qa/tools-state</Config>

@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>Home-AI-QA-Assistant</Name>
-  <Repository>ghcr.io/whoiscalebbrown/home-ai-assistant:stable</Repository>
+  <Repository>ghcr.io/whoiscalebbrown/home-ai-assistant:sha-038fff2</Repository>
   <Registry>https://ghcr.io/whoiscalebbrown/home-ai-assistant</Registry>
   <Network>voiceai-qa</Network>
   <Privileged>false</Privileged>
