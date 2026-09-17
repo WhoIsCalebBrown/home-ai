@@ -357,6 +357,8 @@ class FakeToolsBackend:
                 "beets": {"count": 0, "items": []},
                 "torbox": {"summary": {"active": 0, "completed": 0, "errored": 0, "pulling": 0}},
             }}
+        if name == "list_items":
+            return {"tool": name, "status": "ok", "result": {"list": arguments.get("list", "grocery"), "items": [], "count": 0}}
         if name == "get_container_logs":
             return {"tool": name, "status": "ok", "result": {"name": arguments.get("name"), "lines": "\x02\x00\x00\x00\x00\x00\x00%INFO:     Started server process [1]\n"}}
         if name == "investigate_downloads":
@@ -2200,3 +2202,39 @@ def test_every_domain_relevant_tool_has_a_matching_prefix(app):
             result = [{"tool": tool, "status": "ok", "result": {"x": 1}}]
             filtered = app.filter_relevant_tool_results(result, {"domain": domain})
             assert filtered == result, f"{tool!r} was dropped under domain {domain!r} -- add it to _DOMAIN_TOOL_PREFIXES[{domain!r}]"
+
+
+@pytest.mark.asyncio
+async def test_generic_discovery_shape_does_not_default_non_media_subjects_to_media(session):
+    # Real production bug: discovery_question()'s "what's X" shape is
+    # intentionally domain-agnostic and matches ANY "what's X" sentence,
+    # including "What's on my grocery list?" -- which made
+    # _effective_relevance_domain() assume "media" domain purely from that
+    # generic pattern match, which then made filter_relevant_tool_results()
+    # drop list_items' real, successful (but genuinely empty) result before
+    # synthesis ever saw it, producing a false "I don't have access" answer
+    # instead of the real "your list is empty" one.
+    reply = await session.turn(
+        "What's on my grocery list?",
+        final_text="I don't have access to your grocery list. I can only see what's on my screen right now, which doesn't include personal data like yours.",
+    )
+    assert reply == "That check succeeded, but it came back empty -- there's nothing there to report right now."
+
+
+@pytest.mark.asyncio
+async def test_generic_discovery_shape_respects_a_subjects_own_unambiguous_domain(session):
+    # Same root cause as the grocery-list bug above, but for a subject with
+    # its OWN unambiguous keyword domain rather than no domain at all:
+    # "What's the state of the neon lights?" and "What's the current GPU
+    # usage?" both match discovery_question()'s domain-agnostic "what's X"
+    # shape, so _effective_relevance_domain() used to default them to
+    # "media" too -- dropping home_get_state's/get_gpu_status's real result
+    # (neither matches any "media_..." prefix) before synthesis ever saw
+    # it. A subject's own home/server/weather keyword must win over the
+    # generic "media" default.
+    session.backend.responses = {}
+    reply = await session.turn(
+        "What's the current GPU usage?",
+        final_text="I couldn't check the GPU usage because the required data wasn't available.",
+    )
+    assert "media" not in reply.lower()

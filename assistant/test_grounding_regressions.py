@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -728,13 +728,39 @@ def test_conversational_news_request_becomes_a_clean_search_query():
     assert web_search_query_from_text(
         "can you give me an in depth review on the canadian news for today"
     ) == "canadian news"
-    assert web_search_query_from_text("what is happening in canada today") == "what is happening in canada"
+    assert web_search_query_from_text("what is happening in canada today") == "canada"
     assert preflight_plan("can you give me an in depth review on the canadian news for today") == [
         ("web_search", {"query": "canadian news"})
     ]
     recovery = web_recovery_queries("can you give me an in depth review on the canadian news for today")
     assert recovery[0] == "canadian news"
     assert all("2026" not in query and "September" not in query for query in recovery)
+
+
+def test_nested_conversational_filler_is_also_stripped_from_the_search_query():
+    # Real production example flagged directly by the user: "can you give me
+    # an in depth review of what's gone on in the canadian news today" only
+    # had its OUTER request-verb scaffolding stripped ("can you give me an
+    # in depth review of"), leaving a second, still-unclean layer ("what's
+    # gone on in the canadian news") that also returned zero usable SearXNG
+    # results.
+    assert web_search_query_from_text(
+        "can you give me an in depth review of what's gone on in the canadian news today"
+    ) == "canadian news"
+
+
+def test_yesterday_is_recognized_as_a_fresh_research_question_not_a_media_goal():
+    # Real production bug found by the user: "can you give me an in depth
+    # review of what's gone on in the canadian news yesterday" was routed to
+    # media_plan_goal (its "give" verb matched media_acquisition_language)
+    # instead of web_search, because current_external_question()'s
+    # freshness vocabulary only recognized "today"/"now"/"current" and not
+    # "yesterday" -- asking about yesterday's news is still unambiguously a
+    # fresh research question, not a stale one.
+    assert current_external_question("what's gone on in the canadian news yesterday")
+    assert preflight_plan(
+        "can you give me an in depth review of what's gone on in the canadian news yesterday"
+    ) == [("web_search", {"query": "canadian news yesterday"})]
 
 
 def test_container_logs_request_is_not_swallowed_by_generic_container_catch_all():

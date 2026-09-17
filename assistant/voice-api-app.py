@@ -871,7 +871,7 @@ def dynamic_fact_question(text: str) -> bool:
 
 
 def current_external_question(text: str) -> bool:
-    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this morning|this week|breaking|updated|update|release|version)\b"
+    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this morning|this week|breaking|updated|update|release|version|yesterday|last night)\b"
     subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?|world|event|events?|company|companies|business|stock|stocks?|nvidia|openai|microsoft|apple|google|tesla)\b"
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
     return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
@@ -900,6 +900,15 @@ _WEB_QUERY_LEADING_SCAFFOLDING = re.compile(
     re.I,
 )
 _WEB_QUERY_TRAILING_FILLER = re.compile(r"\b(?:for\s+)?(?:today|right\s+now|currently|now)\b\s*[?.!]*\s*$", re.I)
+# A second layer of conversational filler often sits UNDERNEATH the request-
+# verb scaffolding above: "can you give me an in depth review of what's gone
+# on in the canadian news today" strips down to "what's gone on in the
+# canadian news", which is still not a clean search query -- real production
+# example: this exact phrasing returned zero usable SearXNG results.
+_WEB_QUERY_NESTED_SCAFFOLDING = re.compile(
+    r"^\s*what(?:'s|\s+is|\s+has)?\s+(?:gone\s+on|happened|happening|going\s+on)\s+(?:in|with)\s+",
+    re.I,
+)
 
 
 def web_search_query_from_text(text: str) -> str:
@@ -914,6 +923,7 @@ def web_search_query_from_text(text: str) -> str:
     """
     stripped = text.strip()
     cleaned = _WEB_QUERY_LEADING_SCAFFOLDING.sub("", stripped, count=1)
+    cleaned = _WEB_QUERY_NESTED_SCAFFOLDING.sub("", cleaned, count=1)
     cleaned = _WEB_QUERY_TRAILING_FILLER.sub("", cleaned).strip(" ?.!")
     cleaned = re.sub(r"^\s*the\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -2682,6 +2692,8 @@ def enrich_research_arguments(name: str, arguments: dict, profile: dict[str, int
         enriched.setdefault("max_results", {"quick": 5, "normal": 12, "deep": 20}.get(profile["mode"], 5))
         if re.search(r"\b(today|tonight|latest|currently|this morning|breaking)\b", user_text, re.I):
             enriched.setdefault("recency_days", 1)
+        elif re.search(r"\b(yesterday|last night)\b", user_text, re.I):
+            enriched.setdefault("recency_days", 2)
         elif re.search(r"\bthis week\b", user_text, re.I):
             enriched.setdefault("recency_days", 7)
         if re.search(r"\b(news|headlines|current events)\b", user_text, re.I):
@@ -2982,6 +2994,29 @@ def _effective_relevance_domain(context: dict) -> str | None:
     domain = context.get("domain")
     if domain:
         return domain
+    # Real production bug: discovery_question()'s "what's X" shape is
+    # intentionally domain-agnostic (its own docstring: "whether the
+    # extracted subject is media, general knowledge, or a web topic is left
+    # entirely to ... Qwen") and matches ANY "what's X" sentence -- "What's
+    # on my grocery list?", "What's the state of the neon lights?", and
+    # "What's the current GPU usage?" all match it just as readily as a
+    # genuine media discovery question, and this function used to assume
+    # "media" domain for every one of them. That then made
+    # filter_relevant_tool_results() drop the real tool's successful result
+    # before synthesis ever saw it (list_items/home_get_state/get_gpu_status
+    # match no "media_..." prefix), producing a false "unavailable"/"no
+    # access" answer despite the call succeeding. A subject with its own
+    # unambiguous keyword domain (home/server/weather/camera/web_research)
+    # must win over the "media" default -- that default exists only for a
+    # bare, keyword-free subject (a plain title, "Cowboy Bebop"), which
+    # explicit_domain() also can't classify on its own.
+    subject = str(context.get("discovery_subject") or context.get("latest_unresolved_subject") or "")
+    if subject:
+        subject_domain = explicit_domain(subject)
+        if subject_domain and subject_domain != "general":
+            return subject_domain
+        if re.search(r"\b(?:list|grocery|shopping|todo|to-do|task|reminder|calendar|coffee|alarm|timer|note)\b", subject, re.I):
+            return None
     if context.get("discovery_subject") or context.get("latest_unresolved_subject") or context.get("canonical_identity"):
         return "media"
     return None
@@ -4228,7 +4263,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if profile["mode"] in {"normal", "deep"} and completed_searches < minimum_searches and research_calls < int(profile["max_calls"]):
                     recovery_queries = web_recovery_queries(user_text)
                     query = recovery_queries[min(completed_searches, len(recovery_queries) - 1)]
-                    followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 7, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
+                    followup_recency = 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
+                    followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": followup_recency, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
                     research_calls += 1
                     live_results.append(followup)
                     messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
