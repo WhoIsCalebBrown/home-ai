@@ -78,6 +78,49 @@ never accepting an arbitrary path or script name from the model. This is
 explicitly deferred pending that approval and script provisioning — it was
 not attempted with a lower-safety substitute.
 
+## Live Continuity-Test Finding (deferred, not fixed this round)
+
+Running the explicit continuity acceptance test ("How full is cache?" ->
+"What's using most of it?" -> "What's inside appdata?" -> "What about
+Plex?") in one live Open WebUI conversation surfaced two related, but not
+independently regression-worthy, symptoms of the deferred breakdown gap
+above -- documenting both here rather than shipping a rushed fix for
+either late in an unattended session:
+
+1. **"What's using most of it?"** (a pure referential follow-up, no
+   "cache"/"array"/"ram"/"cpu" keyword of its own) was answered using
+   `unraid_container_metrics` data (per-container CPU/RAM) presented as
+   if it were disk-space consumption ("Docker is taking up 212GB,
+   followed by Unraid itself at 150GB") -- a plausible-sounding but
+   **fabricated mapping of the wrong tool's numbers onto the wrong
+   question**, because the "server"/"unraid" capability group was the
+   only thing narrowed into scope by the previous turn's storage domain,
+   and Qwen chose the closest-available tool rather than admitting no
+   real breakdown tool exists. This is read-only and non-destructive, but
+   it is a real correctness/trust issue: the tool is not actually
+   answering the question it is labeled as answering.
+2. **"What about Plex?"** (continuing the same storage topic) was
+   reclassified out of the "server" domain into "media" purely because
+   `explicit_domain()`'s bare "plex" keyword check outranks the inherited
+   storage continuity, producing a media-acquisition non-answer
+   ("I couldn't identify a confident media match") instead of continuing
+   the storage-usage line of questioning.
+
+**Why not fixed tonight:** a safe fix for (2) requires `explicit_domain()`
+(or `turn_context()`) to consult `prior["domain"]` before its bare-keyword
+classification wins -- a change to core domain-classification logic that
+327 existing regression tests pin precisely, not a bounded allowlist
+addition like tonight's five fixes. A safe fix for (1) requires excluding
+resource-metrics tools (`unraid_container_metrics`, `get_gpu_status`) from
+discovery candidates for a storage-shaped referential follow-up that
+doesn't mention their own vocabulary (ram/cpu/memory/gpu) -- a new
+candidate-filtering rule, not a one-line data fix. Both are real, valid
+fixes to make, but both are architecture-touching changes better made
+with live iteration available rather than as the last unverified change
+before ending an unattended session. **REQUIRES USER REVIEW** (read-only,
+non-destructive, no safety-boundary risk -- purely an answer-quality gap
+in an already-documented deferred capability).
+
 ## New Home-AI Tools Added This Round
 
 | Tool | User Question Enabled | Backend MCP Tool(s) | Read/Write |
