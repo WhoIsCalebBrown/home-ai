@@ -2206,8 +2206,17 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         # the classifier/scope words below; a "the" anywhere else in the
         # string (including a title's own leading article) is left alone.
         title = re.sub(r"\bthe\s+(?=(?:original|animated|version|movie|film|series|show|anime|album|whole|entire)\b)", "", title, flags=re.I)
+        # Real production bug found live: "Add The Last of Us to my
+        # server" was mangled to "The Last Us" -- the bare, unconditional
+        # "of" removal below stripped the "of" that is part of the ACTUAL
+        # TITLE ("The Last of Us"), not request framing. "of" must only be
+        # removed when it directly follows one of the classifier words
+        # (the shape this stripping actually exists for: "the whole
+        # series OF X", "a season OF X" -> "of" only ever appears as
+        # scaffolding immediately after one of these words, never as part
+        # of a real title in that exact position).
+        title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|anime|album|whole|entire|all)\s+of\b", " ", title, flags=re.I)
         title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|anime|album|whole|entire|all)\b", " ", title, flags=re.I)
-        title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     # Real production bug found live: "Can you get me the show Silo"
     # resolved an EXACT title match in Sonarr ("Silo" == "Silo") yet still

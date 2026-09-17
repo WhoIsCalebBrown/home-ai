@@ -89,6 +89,27 @@ def test_status_question_framing_strips_cleanly_for_the_identification_fallback(
     assert _media_goal_parts("What is going on with Silo?", None)["title_query"] == "Silo"
 
 
+def test_bare_of_is_never_stripped_from_a_real_title():
+    # Real production bug found live: "Add The Last of Us to my server"
+    # was mangled to "The Last Us" -- the classifier-word cleanup's "of"
+    # removal was unconditional (`\bof\b` anywhere in the string), meant
+    # only to clean up request framing like "the whole series OF X", but
+    # it also destroyed the "of" that is part of the ACTUAL TITLE whenever
+    # one was present. This silently broke the exact-title-match path for
+    # any real title containing "of" (confirmed live: Radarr/Sonarr's own
+    # search returns "The Last of Us" as a clean, dominant exact match --
+    # "The Last Us" matches nothing). "of" must only be removed when it
+    # directly follows one of the classifier words themselves.
+    assert _media_goal_parts("Add The Last of Us to my server", "tv")["title_query"] == "The Last of Us"
+    assert _media_goal_parts("Add The Last of Us to my server", None)["title_query"] == "The Last of Us"
+    assert _media_goal_parts("Get me Rise of the Machines", "movie")["title_query"] == "Rise of the Machines"
+    assert _media_goal_parts("Get me Call of Duty", "movie")["title_query"] == "Call of Duty"
+    assert _media_goal_parts("I want the movie Lord of the Rings", "movie")["title_query"] == "Lord of the Rings"
+    # Genuine request-framing "of" (immediately after a classifier word)
+    # must still be stripped.
+    assert _media_goal_parts("I want the whole series of Breaking Bad", None)["title_query"] == "Breaking Bad"
+
+
 def test_100_conversation_sweep_phrasings_strip_cleanly_to_a_bare_title():
     # Real production bugs found in a 65-conversation, 124-turn live sweep
     # of naive request phrasing. Each of these polluted the literal query
