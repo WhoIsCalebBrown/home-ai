@@ -1341,9 +1341,8 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         # the count operation but filters only against exact *returned*
         # library names/types.  It never treats the category word as a title
         # and never invents a library that Plex did not report.
-        category_match = re.fullmatch(r"\s*(?:and\s+|but\s+)?(?:what|how)\s+about\s+(?:the\s+)?(anime|movies?|films?|shows?|series|tv|music)\s*[?!.,]*\s*", user_text, re.I)
-        if category_match:
-            category = category_match.group(1).casefold()
+        category = library_count_category(user_text)
+        if category:
             aliases = {
                 "anime": {"anime"}, "movie": {"movie", "film"}, "movies": {"movie", "film"},
                 "film": {"movie", "film"}, "films": {"movie", "film"},
@@ -1357,7 +1356,7 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
                 or any(token in str(library.get("library") or "").casefold() for token in accepted)
             )]
             if not libraries:
-                return f"I couldn't find a configured Plex {category_match.group(1)} library to count."
+                return f"I couldn't find a configured Plex {category} library to count."
         labels = []
         for library in libraries:
             name = library.get("library") or library.get("type") or "library"
@@ -2136,6 +2135,29 @@ def library_category_followup(text: str) -> str | None:
     return category
 
 
+def library_count_category(text: str) -> str | None:
+    """Return the requested Plex count category on first or follow-up turns."""
+    followup = library_category_followup(text)
+    if followup:
+        return followup
+    match = re.fullmatch(
+        r"\s*how\s+many\s+(movies?|films?|shows?|series|tv\s+(?:shows?|series)|albums?|artists?)\s+"
+        r"(?:do\s+(?:i|we)\s+have|are\s+in\s+(?:my\s+)?(?:plex\s+)?library)\s*[?!.,]*\s*",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    category = match.group(1).casefold()
+    if category in {"movie", "movies", "film", "films"}:
+        return "movie"
+    if category in {"show", "shows", "series", "tv show", "tv shows", "tv series"}:
+        return "show"
+    if category in {"album", "albums", "artist", "artists"}:
+        return "music"
+    return category
+
+
 def referential_media_library_question(text: str, context: dict | None = None) -> bool:
     """Recognize a possession question whose only subject is a retained item.
 
@@ -2305,7 +2327,7 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
         operation = "MEDIA_REQUEST"
     elif "plex_library_counts" in names:
         operation = "PLEX_LIBRARY_COUNT"
-        category = library_category_followup(text)
+        category = library_count_category(text)
         if category:
             scope["category"] = category
     elif "plex_artist_library" in names:

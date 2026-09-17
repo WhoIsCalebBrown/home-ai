@@ -10,9 +10,10 @@ SOURCE = Path(__file__).with_name("voice-api-app.py")
 
 def _direct_answer():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
-    node = next(node for node in tree.body if getattr(node, "name", None) == "direct_structured_answer")
+    names = {"direct_structured_answer", "library_category_followup", "library_count_category"}
+    nodes = [node for node in tree.body if getattr(node, "name", None) in names]
     namespace = {"re": re, "tts_suppressed": type("Suppressed", (), {"get": staticmethod(lambda: False)})()}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
     return namespace["direct_structured_answer"]
 
 
@@ -77,7 +78,7 @@ def test_container_and_plex_counts_are_direct_structured_answers():
         "libraries": [{"library": "Movies", "type": "movie", "items": 123}, {"library": "TV Shows", "type": "show", "items": 45}],
     })])
     assert container == "Plex-Media-Server is running, healthy, CPU 3.5%, memory 1.2 GiB / 4 GiB."
-    assert counts == "Plex library counts: Movies: 123; TV Shows: 45."
+    assert counts == "Plex library counts: Movies: 123."
 
 
 def test_category_followup_uses_only_returned_plex_library_names_and_types():

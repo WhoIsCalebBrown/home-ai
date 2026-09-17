@@ -2236,7 +2236,7 @@ async def test_identify_then_library_then_web_preserves_subject_but_changes_oper
 @pytest.mark.asyncio
 async def test_library_count_category_followup_retains_count_not_literal_anime_search(session):
     first = await session.turn("How many movies do I have?")
-    assert "Movies: 123" in first
+    assert first == "Plex library counts: Movies: 123."
     assert session.app.conversation_context[session.client_id]["latest_operation"] == "PLEX_LIBRARY_COUNT"
     calls_before = len(session.backend.call_log)
     second = await session.turn("What about anime?")
