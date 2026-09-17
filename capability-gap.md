@@ -78,14 +78,14 @@ never accepting an arbitrary path or script name from the model. This is
 explicitly deferred pending that approval and script provisioning — it was
 not attempted with a lower-safety substitute.
 
-## Live Continuity-Test Finding (deferred, not fixed this round)
+## Live Continuity-Test Finding (found and fixed)
 
 Running the explicit continuity acceptance test ("How full is cache?" ->
 "What's using most of it?" -> "What's inside appdata?" -> "What about
-Plex?") in one live Open WebUI conversation surfaced two related, but not
-independently regression-worthy, symptoms of the deferred breakdown gap
-above -- documenting both here rather than shipping a rushed fix for
-either late in an unattended session:
+Plex?") in one live Open WebUI conversation surfaced two related symptoms
+of the deferred breakdown gap above. Both were fixed after the user
+explicitly authorized going further than the original deferred-and-
+documented plan ("fuck it dude go for it").
 
 1. **"What's using most of it?"** (a pure referential follow-up, no
    "cache"/"array"/"ram"/"cpu" keyword of its own) was answered using
@@ -93,12 +93,22 @@ either late in an unattended session:
    if it were disk-space consumption ("Docker is taking up 212GB,
    followed by Unraid itself at 150GB") -- a plausible-sounding but
    **fabricated mapping of the wrong tool's numbers onto the wrong
-   question**, because the "server"/"unraid" capability group was the
-   only thing narrowed into scope by the previous turn's storage domain,
-   and Qwen chose the closest-available tool rather than admitting no
-   real breakdown tool exists. This is read-only and non-destructive, but
-   it is a real correctness/trust issue: the tool is not actually
-   answering the question it is labeled as answering.
+   question**, because no domain narrowing applies to a bare referential
+   turn and `unraid_container_metrics` scored highest via alias/gram
+   overlap on the generic word "using" alone.
+
+   **Fix (commit e63fcb4):** added a generic `requires_keyword` discovery-
+   scoring gate (mirrors the existing `requires_referent` gate) that
+   suppresses a capability's score to 0.2x when the query contains none
+   of its own declared distinguishing vocabulary. Applied to
+   `unraid_container_metrics` (requires ram/cpu/memory/unhealthy). Live
+   result after the fix: the assistant now calls `unraid_container_status`
+   (the next-best candidate, which needs a container name) and, lacking
+   one, honestly asks "I need a specific container name to check what's
+   using the most space" instead of fabricating a number. This is not the
+   ideal answer (an explicit "I don't have a space breakdown for that yet"
+   would be better), but it is no longer misleading -- no fabricated
+   figures are presented as fact.
 2. **"What about Plex?"** (continuing the same storage topic) was
    reclassified out of the "server" domain into "media" purely because
    `explicit_domain()`'s bare "plex" keyword check outranks the inherited
@@ -106,20 +116,25 @@ either late in an unattended session:
    ("I couldn't identify a confident media match") instead of continuing
    the storage-usage line of questioning.
 
-**Why not fixed tonight:** a safe fix for (2) requires `explicit_domain()`
-(or `turn_context()`) to consult `prior["domain"]` before its bare-keyword
-classification wins -- a change to core domain-classification logic that
-327 existing regression tests pin precisely, not a bounded allowlist
-addition like tonight's five fixes. A safe fix for (1) requires excluding
-resource-metrics tools (`unraid_container_metrics`, `get_gpu_status`) from
-discovery candidates for a storage-shaped referential follow-up that
-doesn't mention their own vocabulary (ram/cpu/memory/gpu) -- a new
-candidate-filtering rule, not a one-line data fix. Both are real, valid
-fixes to make, but both are architecture-touching changes better made
-with live iteration available rather than as the last unverified change
-before ending an unattended session. **REQUIRES USER REVIEW** (read-only,
-non-destructive, no safety-boundary risk -- purely an answer-quality gap
-in an already-documented deferred capability).
+   **Fix (commit e63fcb4):** added `_server_container_followup_target()`,
+   a narrowly-scoped continuation signal recognizing a bounded "what
+   about X"/"how about X" frame naming a known `CONTAINER_DISPLAY_NAMES`
+   entry, gated on the immediately preceding tool call (via
+   `latest_tool_result`, set unconditionally after every tool call --
+   unlike the non-sticky per-turn "domain" signal) having actually been a
+   storage/server tool. This intercepts before `explicit_domain()`'s own
+   classification runs, so none of its existing tested behavior for any
+   other input changed. Live result after the fix: "Plex is running on
+   your server, up for three days and healthy. It's using about 3.12
+   gigabytes of memory out of 62.7 gigabytes available." -- correct,
+   grounded, real data.
+
+Both fixes are read-only, bounded (CONTAINER_DISPLAY_NAMES-only container
+matching; no arbitrary word/path ever reachable), and covered by
+regression tests at every layer (discovery-scoring, preflight_plan/
+turn_context units, and a full multi-turn end-to-end integration test).
+Live-verified against the real production deployment after re-running the
+exact continuity scenario that found the gap.
 
 ## New Home-AI Tools Added This Round
 
