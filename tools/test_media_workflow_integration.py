@@ -146,6 +146,7 @@ async def test_real_confirmation_round_trip_to_fake_write(app, monkeypatch):
     args = {
         "workflow_id": workflow_id,
         "media_type": "movie",
+        "canonical_title": "Dune",
         "canonical_external_id": 438631,
         "confirmation_context": confirmation,
         "session_id": "sess-1",
@@ -226,6 +227,7 @@ async def test_same_title_plans_keep_each_chat_confirmation_isolated_without_a_w
                         lambda _payload: {"matched": True, "rows": [{"state": "queued"}]})
     result = await module.media_standard_request({
         "workflow_id": plan_a["workflow_id"], "media_type": "movie",
+        "canonical_title": "Dune",
         "canonical_external_id": 438631,
         "confirmation_context": plan_a["confirmation_record"],
         "session_id": "openwebui:user:chat-a",
@@ -291,7 +293,7 @@ async def test_status_check_finds_a_real_confirmed_request_by_natural_phrasing(a
     monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", fake_evidence)
 
     result = await module.media_standard_request({
-        "workflow_id": workflow_id, "media_type": "movie", "canonical_external_id": 438631,
+        "workflow_id": workflow_id, "media_type": "movie", "canonical_title": "Dune", "canonical_external_id": 438631,
         "confirmation_context": confirmation, "session_id": "sess-1",
     })
     assert result["status"] == "submitted" and result["write_executed"] is True
@@ -426,7 +428,7 @@ async def test_fresh_session_verb_form_status_phrasings_find_the_real_workflow(a
     monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", fake_evidence)
 
     result = await module.media_standard_request({
-        "workflow_id": workflow_id, "media_type": "movie", "canonical_external_id": 438631,
+        "workflow_id": workflow_id, "media_type": "movie", "canonical_title": "Dune", "canonical_external_id": 438631,
         "confirmation_context": confirmation, "session_id": "sess-1",
     })
     assert result["status"] == "submitted" and result["write_executed"] is True
