@@ -170,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=os.getenv("OPENWEBUI_MODEL", "home-ai"))
     parser.add_argument("--user-id", default=os.getenv("OPENWEBUI_USER_ID", "qa-p0-user"))
     parser.add_argument("--token-env", default="OPENWEBUI_TOKEN", help="environment variable containing the bearer token")
+    parser.add_argument("--token-file", help="read the bearer token from a protected file instead of an environment variable")
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--safe-mode", action="store_true", help="allow write-shaped prompts for refusal/confirmation isolation only; never approves")
     parser.add_argument("--prompt", action="append", help="single prompt; repeat for multiple isolated chats")
@@ -178,9 +179,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-percent", type=float, help="authoritative cache used percentage from the raw tool result")
     parser.add_argument("--output", default="-", help="JSON output path, or - for stdout")
     args = parser.parse_args(argv)
-    token = os.getenv(args.token_env)
+    token = ""
+    if args.token_file:
+        with open(args.token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    else:
+        token = os.getenv(args.token_env, "")
     if not token:
-        parser.error(f"set ${args.token_env}; tokens are never accepted as command-line arguments")
+        parser.error(f"set ${args.token_env} or --token-file; tokens are never accepted as command-line arguments")
     api = OpenWebUILive(args.base_url, token, args.model, args.user_id, args.timeout, args.safe_mode)
     try:
         prompts = args.prompt or ["How full is cache?"]
