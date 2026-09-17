@@ -174,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--safe-mode", action="store_true", help="allow write-shaped prompts for refusal/confirmation isolation only; never approves")
     parser.add_argument("--prompt", action="append", help="single prompt; repeat for multiple isolated chats")
+    parser.add_argument("--identity-prompt", default="What's that Tom Hanks movie where he's on an island with a volleyball?",
+                        help="read-only prompt used in two separate chats for subject/session isolation")
     parser.add_argument("--cache-used-gb", type=float, help="authoritative rounded cache used value from the raw tool result")
     parser.add_argument("--cache-free-gb", type=float, help="authoritative rounded cache free value from the raw tool result")
     parser.add_argument("--cache-percent", type=float, help="authoritative cache used percentage from the raw tool result")
@@ -198,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             records.append(asdict(api.turn(prompt, expected=cache_expected if "cache" in prompt.casefold() else {})))
         # Same first prompt in two independent chats is the minimum isolation
         # probe; follow-ups remain separate and never approve a write.
-        identical = prompts[0]
+        identical = args.identity_prompt
         chat_a = api.new_chat("P0 LIVE identical prompt A")
         chat_b = api.new_chat("P0 LIVE identical prompt B")
         records.extend(asdict(x) for x in _chain(api, [identical, "Do I have it?"], chat_a))
