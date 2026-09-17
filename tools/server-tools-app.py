@@ -100,6 +100,11 @@ def validate_qa_configuration() -> None:
     if QA_MODE == "live_readonly":
         if QA_EXECUTOR or QA_STATE_ROOT:
             raise RuntimeError("live_readonly cannot configure an executor or state root")
+        if any(os.getenv(name, "").strip() for name in (
+            "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+            "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_TOKEN_FILE",
+        )):
+            raise RuntimeError("live_readonly refuses production mutation credentials")
     elif QA_MODE == "isolated_execution":
         if QA_EXECUTOR != "fake":
             raise RuntimeError("isolated_execution requires HOME_AI_QA_EXECUTOR=fake")
@@ -1056,10 +1061,12 @@ def _candidate_summaries(rows: list[dict[str, Any]], media_type: str) -> list[di
                                "media_type": "album", "foreign_album_id": row.get("foreign_album_id")})
         elif media_type in {"tv", "anime"}:
             summaries.append({"title": row.get("title"), "year": row.get("year"), "media_type": media_type,
-                               "tmdb_id": row.get("tmdbId"), "tvdb_id": row.get("tvdbId")})
+                               "tmdb_id": row.get("tmdbId"), "tvdb_id": row.get("tvdbId"),
+                               "people": _person_evidence(row)[:6]})
         else:
             summaries.append({"title": row.get("title"), "year": row.get("year"),
-                               "media_type": "movie", "tmdb_id": row.get("tmdbId")})
+                               "media_type": "movie", "tmdb_id": row.get("tmdbId"),
+                               "people": _person_evidence(row)[:6]})
     return summaries
 
 
@@ -2325,6 +2332,54 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
             "requested_year": requested_year}
 
 
+def _person_evidence(row: dict[str, Any]) -> list[str]:
+    """Return explicitly structured people evidence supplied by a catalog.
+
+    Catalog rows are not consistent: some include ``cast`` as strings, some
+    use person dictionaries, and many Radarr rows contain no people at all.
+    A missing field is unknown evidence, not evidence against a candidate.
+    Keep this deliberately bounded to person-shaped fields rather than
+    searching the whole serialized row, whose overview/title text can create
+    accidental name matches.
+    """
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                values.append(value.strip())
+        elif isinstance(value, dict):
+            name = value.get("name") or value.get("personName")
+            if isinstance(name, str) and name.strip():
+                values.append(name.strip())
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    for field in ("cast", "crew", "directors", "creators", "writers", "people", "artist", "artistName"):
+        collect(row.get(field))
+    credits = row.get("credits")
+    if isinstance(credits, dict):
+        for field in ("cast", "crew"):
+            collect(credits.get(field))
+    return values
+
+
+def _has_person_evidence(row: dict[str, Any], person: str | None) -> bool:
+    """Whether a candidate positively supports a supplied person hint.
+
+    ``False`` intentionally means "not present in returned evidence", never
+    "the catalog proves this candidate conflicts".
+    """
+    wanted = " ".join(re.findall(r"[a-z0-9]+", str(person or "").casefold()))
+    if not wanted:
+        return False
+    return any(
+        wanted in " ".join(re.findall(r"[a-z0-9]+", candidate.casefold()))
+        for candidate in _person_evidence(row)
+    )
+
+
 def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = None) -> tuple[dict[str, Any] | None, bool, list[dict[str, Any]]]:
     """Returns (identity, ambiguous, candidates). `candidates` is only ever
     populated when ambiguous=True -- it carries the top close/tied rows so
@@ -2353,7 +2408,8 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
     title_cf = _amp(title).casefold()
     artist_cf = (artist or "").casefold()
     exact = [m for m in matches if _amp(str(m.get("title") or m.get("artistName") or "")).casefold() == title_cf
-              and (not artist_cf or artist_cf in json.dumps(m).casefold())]
+              and (not artist_cf or _has_person_evidence(m, artist)
+                   or artist_cf in str(m.get("artistName") or "").casefold())]
     if len(exact) == 1:
         return exact[0], False, []
     if len(exact) > 1:
@@ -2391,7 +2447,8 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
         candidate = _amp(str(row.get("title") or row.get("artistName") or "")).casefold()
         tokens = set(re.findall(r"[a-z0-9]+", candidate))
         score = len(wanted & tokens) / max(len(wanted), 1)
-        if artist_cf and artist_cf in json.dumps(row).casefold():
+        if artist_cf and (_has_person_evidence(row, artist)
+                          or artist_cf in str(row.get("artistName") or "").casefold()):
             score += 1.0
         # A minor popularity tiebreaker only -- capped well below the 0.25
         # margin threshold below, so it can only decide between candidates
@@ -2448,6 +2505,24 @@ def _person_mention_hint(text: str, known_artist: str | None) -> str | None:
         return None
     match = re.search(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b", text)
     return match.group(1) if match else None
+
+
+def _plot_description_hint(text: str) -> bool:
+    """Recognize a sufficiently rich plot clue without a named person.
+
+    This only opens the bounded media web-discovery fallback after catalog
+    lookup produced no candidate.  It is intentionally not a generic web
+    search trigger: a real plot relation plus enough natural-language detail
+    is required, so an ordinary unmatched title remains a clean no-match.
+    """
+    words = re.findall(r"[a-zA-Z']+", text)
+    if len(words) < 7:
+        return False
+    return bool(re.search(
+        r"\b(?:about|where|in which|set in|takes place|who)\b",
+        text,
+        re.I,
+    ))
 
 
 def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | None:
@@ -2568,17 +2643,29 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
                 plan["ambiguity_reason"] = "CROSS_DOMAIN_CANDIDATE"
                 ambiguous = True
         # Structured lookup found nothing at all (not a tie -- a genuine
-        # zero) and the utterance carries a real descriptive/person clue
+        # zero) and the utterance carries a real person or plot clue
         # ("the Tom Hanks movie where he's stuck on an island with a
         # volleyball") -- fall back to a bounded web search for a likely
         # NAME, then re-search that name through the SAME real canonical
         # lookup below. A titleless request with no such clue never
         # reaches here; it already returned via NO_TITLE_GIVEN above.
         person_hint = artist or _person_mention_hint(parts["raw_goal"], artist)
-        if not identity and not ambiguous and person_hint:
+        descriptive_hint = bool(person_hint or _plot_description_hint(parts["raw_goal"]))
+        if not identity and not ambiguous and descriptive_hint:
             discovered_title = await _web_discover_title(title, person_hint, "movie")
             if discovered_title and discovered_title.casefold() != title.casefold():
                 web_lookup = await radarr_search({"query": discovered_title})
+                web_matches = web_lookup.get("matches", [])
+                # The discovery query may find the right title but a
+                # different release.  An explicit year remains a hard
+                # identity constraint across every lookup stage, including
+                # this fallback; it is never merely a ranking hint.
+                if parts.get("requested_year"):
+                    web_matches = [
+                        row for row in web_matches
+                        if str(row.get("year", "")).isdigit()
+                        and int(row.get("year")) == parts["requested_year"]
+                    ]
                 # _pick_match's `artist` parameter's contract assumes the
                 # value appears somewhere in the candidate row's own JSON --
                 # true for Lidarr album/artist lookups (which carry cast/
@@ -2593,9 +2680,9 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
                 # provides the generic tiebreaker for any residual tie
                 # between the real feature and bonus content when Radarr
                 # genuinely returns no single exact-title match.
-                identity, ambiguous, near_candidates = _pick_match(web_lookup.get("matches", []), discovered_title)
+                identity, ambiguous, near_candidates = _pick_match(web_matches, discovered_title)
                 if identity:
-                    matches = web_lookup.get("matches", [])
+                    matches = web_matches
                     title = discovered_title
                     plan["ambiguity_reason"] = "WEB_DISCOVERY_MATCH"
                 elif ambiguous and near_candidates:
@@ -2813,6 +2900,15 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
     # identity exists, this is a read-only candidate/clarification result, not
     # a durable media goal or an idempotency claim.
     if not identity:
+        plan["workflow_id"] = None
+        plan["idempotent"] = False
+        return plan
+    # Identification, details, and library inspection are read operations.
+    # They may return a canonical subject and availability evidence, but must
+    # not create durable acquisition/workflow state.  A workflow is created
+    # only when the user actually asked to ensure availability (including a
+    # season/episode-scoped request).
+    if parts.get("action") != "ensure_available":
         plan["workflow_id"] = None
         plan["idempotent"] = False
         return plan

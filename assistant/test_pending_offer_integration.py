@@ -23,7 +23,7 @@ SOURCE_PATH = Path(__file__).with_name("voice-api-app.py")
 SOURCE_TEXT = SOURCE_PATH.read_text()
 tree = ast.parse(SOURCE_TEXT)
 
-needed = {"stage_media_offer", "discovery_audit", "explicit_domain", "media_goal_request", "classify_offer_reply"}
+needed = {"stage_media_offer", "discovery_audit", "explicit_domain", "media_goal_request", "classify_offer_reply", "conversation_context"}
 
 
 def is_needed_assignment(node):
@@ -44,6 +44,7 @@ namespace = {
     "available_actions": available_actions, "build_canonical_identity": build_canonical_identity,
     "next_best_action": next_best_action, "classify_offer_reply": classify_offer_reply,
     "pending_offers": {},
+    "conversation_context": {},
     "DISCOVERY_AUDIT_LOG": "/tmp/home-ai-test-discovery-audit.jsonl",
     "Path": Path,
 }

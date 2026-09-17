@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "library_category_followup", "referential_media_library_question", "referential_media_request", "retained_media_goal", "canonical_identity_matches", "enforce_retained_media_identity", "collective_library_query", "referential_web_query", "storage_state_followup", "operation_for_plan", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -71,6 +71,16 @@ guess_media_title = namespace["guess_media_title"]
 fresh_title_restatement = namespace["fresh_title_restatement"]
 media_intent = namespace["media_intent"]
 media_library_query = namespace["media_library_query"]
+library_category_followup = namespace["library_category_followup"]
+referential_media_library_question = namespace["referential_media_library_question"]
+referential_media_request = namespace["referential_media_request"]
+retained_media_goal = namespace["retained_media_goal"]
+canonical_identity_matches = namespace["canonical_identity_matches"]
+enforce_retained_media_identity = namespace["enforce_retained_media_identity"]
+collective_library_query = namespace["collective_library_query"]
+referential_web_query = namespace["referential_web_query"]
+storage_state_followup = namespace["storage_state_followup"]
+operation_for_plan = namespace["operation_for_plan"]
 _descriptive_media_clue = namespace["_descriptive_media_clue"]
 canonical_media_year_answer = namespace["canonical_media_year_answer"]
 web_search_query_from_text = namespace["web_search_query_from_text"]
@@ -495,6 +505,80 @@ def test_asr_start_stopped_collision_fails_closed_to_clarification():
     assert ambiguous_container_status_followup("What about start?", context) is True
     assert ambiguous_container_status_followup("Start Plex", context) is False
     assert ambiguous_container_status_followup("What about stopped?", context) is False
+
+
+def test_library_count_category_followup_preserves_count_operation_not_title_search():
+    context = {"latest_operation": "PLEX_LIBRARY_COUNT", "operation_scope": {"category": "movie"}}
+    assert library_category_followup("What about anime?") == "anime"
+    assert preflight_plan("What about anime?", context) == [("plex_library_counts", {})]
+    # An explicit new server question must outrank the inherited Plex count.
+    assert preflight_plan("How many containers are running?", context) == [("list_containers", {"status": "running"})]
+
+
+def test_storage_state_followup_reuses_storage_target_never_container_without_name():
+    context = {"latest_operation": "STORAGE_CAPACITY", "operation_scope": {"target": "cache"}}
+    assert storage_state_followup("Is it running?", context)
+    assert preflight_plan("Is it running?", context) == [("unraid_storage_status", {"target": "cache"})]
+    assert preflight_plan("Is Plex running?", context) != [("unraid_storage_status", {"target": "cache"})]
+
+
+def test_referential_media_operations_preserve_subject_while_source_changes():
+    context = {"canonical_identity": {"title": "Cast Away", "media_type": "movie", "year": 2000},
+               "latest_resolved_referent": "Cast Away"}
+    assert referential_media_library_question("Do I have it?", context)
+    assert preflight_plan("Do I have it?", context) == [
+        ("media_plan_goal", {"goal": "Cast Away from 2000", "media_type": "movie"})
+    ]
+    assert referential_web_query("Can you look it up on the internet?", context) == "Cast Away"
+    assert preflight_plan("Can you look it up on the internet?", context) == [
+        ("web_search", {"query": "Cast Away"})
+    ]
+
+
+def test_collective_library_inventory_is_read_only_while_acquisition_stays_canonical():
+    assert collective_library_query("What Galactic Saga stuff do I have?") == "Galactic Saga"
+    assert preflight_plan("What Galactic Saga stuff do I have?") == [
+        ("plex_search", {"query": "Galactic Saga"})
+    ]
+    acquisition = preflight_plan("Get Galactic Saga.")
+    assert acquisition == [("media_plan_goal", {"goal": "Get Galactic Saga."})]
+
+
+def test_operation_for_plan_uses_existing_media_vocabulary_and_bounded_scopes():
+    operation, scope = operation_for_plan("Get The Room.", {"operation": "MEDIA_REQUEST"}, [("media_plan_goal", {"goal": "Get The Room."})])
+    assert operation == "MEDIA_REQUEST"
+    assert scope == {}
+    operation, scope = operation_for_plan("How full is cache?", {}, [("unraid_storage_status", {"target": "cache"})])
+    assert operation == "STORAGE_CAPACITY"
+    assert scope == {"target": "cache"}
+
+
+def test_referential_media_identity_is_preserved_and_validated():
+    expected = {"title": "The Thing", "media_type": "movie", "year": 1982, "tmdb_id": 1091}
+    assert preflight_plan("Get it.", {"canonical_identity": expected}) == [
+        ("media_plan_goal", {"goal": "get The Thing from 1982", "media_type": "movie"})
+    ]
+    good = {"tool": "media_plan_goal", "status": "ok", "result": {"canonical_identity": dict(expected)}}
+    assert enforce_retained_media_identity(expected, good) == good
+    wrong = {"tool": "media_plan_goal", "status": "ok", "result": {
+        "canonical_identity": {"title": "The Thing", "media_type": "movie", "year": 2011, "tmdb_id": 60935}}}
+    rejected = enforce_retained_media_identity(expected, wrong)
+    assert rejected["status"] == "error"
+    assert rejected["error"]["code"] == "CANONICAL_IDENTITY_MISMATCH"
+    assert rejected["result"] == {"ok": False, "error_code": "CANONICAL_IDENTITY_MISMATCH"}
+    assert "canonical_identity" not in rejected["result"]
+
+
+def test_successful_topic_switch_clears_stale_operation():
+    client_id = "topic-switch"
+    conversation_context[client_id] = {
+        "latest_operation": "STORAGE_CAPACITY", "operation_scope": {"target": "cache"},
+    }
+    store_provenance(client_id, [{"tool": "weather_forecast", "status": "ok", "result": {
+        "source": "Open-Meteo", "location": {"name": "Toronto"}}}])
+    assert "latest_operation" not in conversation_context[client_id]
+    assert "operation_scope" not in conversation_context[client_id]
+    assert preflight_plan("Is it running?", conversation_context[client_id]) == []
 
 
 def test_storage_stt_repair_is_bounded_to_capacity_questions():

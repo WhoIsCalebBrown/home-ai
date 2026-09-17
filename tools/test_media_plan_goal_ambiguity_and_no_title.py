@@ -481,6 +481,81 @@ async def test_web_discovery_does_not_trigger_for_an_ordinary_unmatched_title(ap
 
 
 @pytest.mark.asyncio
+async def test_plot_only_description_resolves_via_web_discovery(app, monkeypatch):
+    """A plot clue is useful evidence even when the user did not name an
+    actor.  The web result still has to be revalidated by Radarr before it
+    becomes canonical identity; this is identification, not acquisition."""
+    web_calls = []
+
+    async def fake_radarr_search(args):
+        if args["query"].casefold() == "the martian":
+            return {"matches": [{"title": "The Martian", "year": "2015", "tmdbId": 286217}]}
+        return {"matches": []}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    async def fake_web_search(args):
+        web_calls.append(args["query"])
+        return {"results": [{"title": "The Martian (2015) - Wikipedia"}]}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    monkeypatch.setattr(app, "web_search", fake_web_search)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({
+        "goal": "What is that movie about a stranded engineer growing potatoes on Mars?",
+        "media_type": "movie",
+    })
+
+    assert web_calls, "the bounded fallback must use the plot clue"
+    assert plan["canonical_identity"]["title"] == "The Martian"
+    assert plan["goal"]["action"] == "inspect"
+    assert plan["confirmation_required"] is False
+    assert plan["writes_required"] == []
+
+
+def test_person_evidence_prefers_only_a_supported_candidate_when_other_rows_are_unknown(app):
+    """Missing cast/creator fields are unknown, not a negative constraint.
+
+    The positive returned evidence is sufficient to choose one candidate;
+    an otherwise-identical row that simply omitted cast must not be treated
+    as contradicting the user's creator hint.
+    """
+    matches = [
+        {"title": "Example", "year": "2001", "tmdbId": 1,
+         "credits": {"cast": [{"name": "Avery Director"}]}},
+        {"title": "Example", "year": "2005", "tmdbId": 2},
+    ]
+    identity, ambiguous, candidates = app._pick_match(matches, "Example", "Avery Director")
+    assert identity["tmdbId"] == 1
+    assert ambiguous is False
+    assert candidates == []
+
+
+def test_person_hint_without_catalog_evidence_remains_ambiguous_not_conflicting(app):
+    """Do not invent creator conflict from absent catalog metadata."""
+    matches = [
+        {"title": "Example", "year": "2001", "tmdbId": 1},
+        {"title": "Example", "year": "2005", "tmdbId": 2},
+    ]
+    identity, ambiguous, candidates = app._pick_match(matches, "Example", "Avery Director")
+    assert identity is None
+    assert ambiguous is True
+    assert {candidate["tmdbId"] for candidate in candidates} == {1, 2}
+
+
+def test_candidate_summaries_expose_only_available_people_evidence(app):
+    summaries = app._candidate_summaries([
+        {"title": "Example", "year": "2001", "tmdbId": 1, "cast": ["Avery Director"]},
+        {"title": "Example Two", "year": "2002", "tmdbId": 2},
+    ], "movie")
+    assert summaries[0]["people"] == ["Avery Director"]
+    assert summaries[1]["people"] == []
+
+
+@pytest.mark.asyncio
 async def test_web_discovery_result_is_re_validated_not_trusted_directly(app, monkeypatch):
     """If web_search names something that Radarr does NOT recognize at
     all, the fallback must fail honestly, never fabricate identity from
@@ -507,6 +582,55 @@ async def test_web_discovery_result_is_re_validated_not_trusted_directly(app, mo
 
     assert plan["canonical_identity"] is None
     assert plan.get("ambiguity_reason") != "WEB_DISCOVERY_MATCH"
+
+
+@pytest.mark.asyncio
+async def test_web_discovery_reapplies_explicit_year_constraint(app, monkeypatch):
+    calls = {"radarr": 0}
+
+    async def fake_radarr_search(args):
+        calls["radarr"] += 1
+        if calls["radarr"] == 1:
+            return {"matches": []}
+        return {"matches": [
+            {"title": "Example", "year": 2003, "tmdbId": 3},
+            {"title": "Example", "year": 2015, "tmdbId": 15},
+        ]}
+
+    async def fake_discovery(title, person, media_type):
+        return "Example"
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "_web_discover_title", fake_discovery)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({
+        "goal": "the Avery Actor movie with the lighthouse from 2003",
+        "media_type": "movie",
+    })
+
+    assert plan["canonical_identity"]["tmdb_id"] == 3
+    assert plan["canonical_identity"]["year"] == 2003
+
+
+@pytest.mark.asyncio
+async def test_identity_only_resolution_does_not_create_workflow(app, monkeypatch, tmp_path):
+    async def fake_radarr_search(args):
+        return {"matches": [{"title": "Example", "year": 2003, "tmdbId": 3}]}
+
+    async def fake_sonarr_search(args):
+        return {"matches": []}
+
+    monkeypatch.setattr(app, "radarr_search", fake_radarr_search)
+    monkeypatch.setattr(app, "sonarr_search", fake_sonarr_search)
+    _stub_movie_side_calls(app, monkeypatch)
+
+    plan = await app.media_plan_goal({"goal": "the movie Example", "media_type": "movie"})
+
+    assert plan["canonical_identity"]["tmdb_id"] == 3
+    assert plan["workflow_id"] is None
+    assert plan["idempotent"] is False
+    assert not (tmp_path / "media-workflows.json").exists()
 
 
 # --- Candidate ranking: a minor, capped popularity tiebreaker -------------

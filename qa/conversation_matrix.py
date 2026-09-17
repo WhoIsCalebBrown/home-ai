@@ -23,6 +23,8 @@ def load_router():
         "contextual_entity_resolution", "weather_location_from_text", "artist_from_speech",
         "social_acknowledgement", "retained_media_status_repair", "DOMAIN_ENTITIES", "ARTIST_ALIASES",
         "_descriptive_media_clue", "web_search_query_from_text",
+        "library_category_followup", "referential_media_library_question", "referential_media_request",
+        "collective_library_query", "referential_web_query", "storage_state_followup",
         "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING",
         "CONTAINER_DISPLAY_NAMES",
     }
@@ -32,7 +34,15 @@ def load_router():
         assigned = any(getattr(t, "id", None) in names for t in targets)
         if getattr(node, "name", None) in names or assigned:
             body.append(node)
-    namespace = {"re": __import__("re"), "time": __import__("time"), "json": json}
+    re_module = __import__("re")
+    namespace = {
+        "re": re_module,
+        "time": __import__("time"),
+        "json": json,
+        "has_referential_language": lambda text: bool(re_module.search(
+            r"\b(?:it|that|this|them|those|the\s+(?:one|other\s+one))\b", text, re_module.I
+        )),
+    }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)
     return namespace
 

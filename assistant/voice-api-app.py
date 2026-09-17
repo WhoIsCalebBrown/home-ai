@@ -474,6 +474,8 @@ def resolved_request_record(client_id: str, raw_text: str, route_text: str, cont
         "normalized_utterance": routing_aliases(raw_text),
         "route_query": route_text,
         "resolved_domain": context.get("current_turn_domain") or context.get("domain") or "general",
+        "operation": context.get("operation") or context.get("latest_operation"),
+        "operation_scope": context.get("operation_scope") or {},
         "resolved_entities": context.get("canonical_entities") or context.get("entities") or context.get("location") or context.get("camera") or [],
         "inherited_referents": ({key: context[key] for key in ("location", "camera", "subject", "query", "referent_type", "latest_event_id", "latest_review_id") if context.get(key)} if referent_connected else {}),
         "selected_tools": selected_tools,
@@ -1236,6 +1238,17 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         if result.get("error"):
             return "I couldn't read the current storage capacity right now."
 
+        # A storage pool is not a container.  When an immediately preceding
+        # capacity question supplies the antecedent for "Is it running?",
+        # render only the adapter's own state field rather than manufacturing
+        # a container lookup with no container name.
+        if re.fullmatch(r"\s*is\s+(?:it|that|this)\s+(?:running|up|online|mounted)\s*[?!.,]*\s*", user_text, re.I):
+            state = result.get("status") or result.get("state")
+            target = str(result.get("name") or result.get("target") or "that storage target").capitalize()
+            if state:
+                return f"{target} status is {state}."
+            return f"I can check {target}, but its current operating state wasn't available."
+
         def capacity(value):
             if not isinstance(value, (int, float)):
                 return None
@@ -1324,6 +1337,27 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         libraries = [library for library in result.get("libraries", []) if isinstance(library, dict)]
         if not libraries:
             return "I couldn't find any Plex library counts to report."
+        # A category-changing continuation ("What about anime?") retains
+        # the count operation but filters only against exact *returned*
+        # library names/types.  It never treats the category word as a title
+        # and never invents a library that Plex did not report.
+        category_match = re.fullmatch(r"\s*(?:and\s+|but\s+)?(?:what|how)\s+about\s+(?:the\s+)?(anime|movies?|films?|shows?|series|tv|music)\s*[?!.,]*\s*", user_text, re.I)
+        if category_match:
+            category = category_match.group(1).casefold()
+            aliases = {
+                "anime": {"anime"}, "movie": {"movie", "film"}, "movies": {"movie", "film"},
+                "film": {"movie", "film"}, "films": {"movie", "film"},
+                "show": {"show", "series", "tv"}, "shows": {"show", "series", "tv"},
+                "series": {"show", "series", "tv"}, "tv": {"show", "series", "tv"},
+                "music": {"music", "artist", "album"},
+            }
+            accepted = aliases.get(category, {category})
+            libraries = [library for library in libraries if (
+                str(library.get("type") or "").casefold() in accepted
+                or any(token in str(library.get("library") or "").casefold() for token in accepted)
+            )]
+            if not libraries:
+                return f"I couldn't find a configured Plex {category_match.group(1)} library to count."
         labels = []
         for library in libraries:
             name = library.get("library") or library.get("type") or "library"
@@ -1331,6 +1365,29 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             if isinstance(items, int):
                 labels.append(f"{name}: {items}")
         return "Plex library counts: " + "; ".join(labels) + "." if labels else "I couldn't read usable Plex library counts."
+    if tool == "plex_search" and re.fullmatch(
+        r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+"
+        r"(?:stuff|content|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have"
+        r"(?:\s+in\s+(?:my\s+)?plex)?\s*[?!.,]*\s*",
+        user_text,
+        re.I,
+    ):
+        matches = [match for match in result.get("matches", []) if isinstance(match, dict)]
+        if not matches:
+            return "I couldn't find matching movie or TV entries in Plex."
+        grouped: dict[str, list[str]] = {}
+        for match in matches[:24]:
+            library = str(match.get("library_title") or match.get("library") or match.get("media_type") or match.get("type") or "Plex")
+            title = str(match.get("title") or match.get("name") or "").strip()
+            if not title:
+                continue
+            year = match.get("year")
+            label = f"{title} ({year})" if year not in (None, "") else title
+            grouped.setdefault(library, []).append(label)
+        if not grouped:
+            return "I couldn't find usable matching movie or TV entries in Plex."
+        groups = [f"{library}: {', '.join(items)}" for library, items in grouped.items()]
+        return "In Plex, I found " + "; ".join(groups) + "."
     if tool in {"unraid_container_status", "get_container_status"}:
         if result.get("found") is False:
             name = result.get("name") or result.get("container") or "that container"
@@ -1562,7 +1619,9 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
     if result.get("current_state") == "NO_TITLE_GIVEN":
         return result.get("message") or "I didn't catch a specific title -- what would you like me to look for?"
     if item.get("status") != "ok":
-        reason = str(result.get("reason") or result.get("error") or result.get("status") or "").upper()
+        reason = str(result.get("error_code") or result.get("reason") or result.get("error") or result.get("status") or "").upper()
+        if reason == "CANONICAL_IDENTITY_MISMATCH":
+            return "I couldn't verify that the result was the same media item, so I didn't use it or change anything."
         if result.get("ambiguous") or "AMBIGUOUS" in reason or "IDENTITY" in reason:
             return "I couldn't identify one confident media match without changing anything."
         return "I couldn't prepare that media request right now, and I haven't changed anything."
@@ -1607,6 +1666,36 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
             return f"You already have {title} in Plex."
         return f"I found {title}, but there isn't a confirmed request to start yet."
     return None
+
+
+def canonical_library_answer(live_results: list[dict]) -> str | None:
+    """Render one retained canonical item's Plex availability directly."""
+    item = next((entry for entry in reversed(live_results)
+                 if entry.get("tool") == "media_plan_goal" and entry.get("status") == "ok"), None)
+    result = item.get("result") if item and isinstance(item.get("result"), dict) else {}
+    identity = result.get("canonical_identity") if isinstance(result, dict) else None
+    if not isinstance(identity, dict) or not identity.get("title"):
+        return None
+    title = str(identity["title"])
+    state = str(result.get("current_state") or "").upper()
+    if state in {"AVAILABLE_IN_PLEX", "ALREADY_AVAILABLE", "AVAILABLE"}:
+        return f"You have {title} in Plex."
+    if state in {"IDENTIFIED", "ABSENT", "NOT_FOUND"}:
+        return f"I couldn't find {title} in Plex."
+    return None
+
+
+def canonical_identification_answer(live_results: list[dict]) -> str | None:
+    """Answer a read-only identity question from the resolved canonical fact."""
+    item = next((entry for entry in reversed(live_results)
+                 if entry.get("tool") == "media_plan_goal" and entry.get("status") == "ok"), None)
+    result = item.get("result") if item and isinstance(item.get("result"), dict) else {}
+    identity = result.get("canonical_identity") if isinstance(result, dict) else None
+    if not isinstance(identity, dict) or not identity.get("title"):
+        return None
+    title = str(identity["title"])
+    year = identity.get("year")
+    return f"That's {title} ({year})." if year not in (None, "") else f"That's {title}."
 
 
 async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str | None = None, origin: str = "assistant") -> None:
@@ -1978,6 +2067,175 @@ def media_intent(text: str) -> str | None:
     if discovery_question(text) and media_identity_signal(text):
         return "MEDIA_DISCOVERY"
     return None
+
+
+def library_category_followup(text: str) -> str | None:
+    """Return a bounded category word for a library-count continuation.
+
+    This deliberately describes the *question's scope*, not a Plex library
+    name.  The actual configured library names and types still come from the
+    current ``plex_library_counts`` result before an answer is produced.
+    """
+    match = re.fullmatch(r"\s*(?:and\s+|but\s+)?(?:what|how)\s+about\s+(?:the\s+)?(anime|movies?|films?|shows?|series|tv|music)\s*[?!.,]*\s*", text, re.I)
+    if not match:
+        return None
+    category = match.group(1).casefold()
+    if category in {"movie", "movies", "film", "films"}:
+        return "movie"
+    if category in {"show", "shows", "series", "tv"}:
+        return "show"
+    return category
+
+
+def referential_media_library_question(text: str, context: dict | None = None) -> bool:
+    """Recognize a possession question whose only subject is a retained item.
+
+    ``Do I have it?`` is not a new title search.  It is a library operation
+    over an already canonicalized subject, and therefore must not send the
+    literal pronoun to Plex or the media planner.
+    """
+    context = context or {}
+    if not isinstance(context.get("canonical_identity"), dict):
+        return False
+    return bool(re.fullmatch(r"\s*(?:do|did)\s+(?:i|we)\s+have\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*", text, re.I))
+
+
+def referential_media_request(text: str, context: dict | None = None) -> bool:
+    """Recognize an explicit new request for the retained canonical item.
+
+    ``Add it`` can also look like a generic confirmation. In the absence of
+    a pending action it is a request, not an approval, and must re-enter
+    normal planning with the retained identity.
+    """
+    context = context or {}
+    if not isinstance(context.get("canonical_identity"), dict):
+        return False
+    return bool(re.fullmatch(
+        r"\s*(?:(?:okay|ok|well|then)[,.]?\s+)?(?:please\s+)?"
+        r"(?:get|add|request|grab)\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*",
+        text,
+        re.I,
+    ))
+
+
+def retained_media_goal(identity: dict, *, request: bool = False) -> str:
+    """Build a planner goal without dropping a retained identity's year.
+
+    The planner's public contract is still natural-language ``goal`` plus a
+    media type.  Including an established year makes that contract precise;
+    the returned canonical IDs are independently checked below before any
+    answer, offer, or confirmation can be staged.
+    """
+    title = str(identity.get("title") or "").strip()
+    year = identity.get("year")
+    qualified = f"{title} from {year}" if title and year not in (None, "") else title
+    return f"get {qualified}" if request else qualified
+
+
+def canonical_identity_matches(expected: dict, actual: dict) -> bool:
+    """Fail closed when a referential turn resolves to a different item."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    if normalize(expected.get("title")) != normalize(actual.get("title")):
+        return False
+    for key in ("media_type", "year", "tmdb_id", "tvdb_id", "foreign_album_id"):
+        wanted = expected.get(key)
+        if wanted in (None, ""):
+            continue
+        if str(actual.get(key) or "") != str(wanted):
+            return False
+    return True
+
+
+def enforce_retained_media_identity(expected: dict, tool_result: dict) -> dict:
+    """Reject planner drift before it can ground prose or authorize a write."""
+    if tool_result.get("tool") != "media_plan_goal" or tool_result.get("status") != "ok":
+        return tool_result
+    result = tool_result.get("result") if isinstance(tool_result.get("result"), dict) else {}
+    if canonical_identity_matches(expected, result.get("canonical_identity") or {}):
+        return tool_result
+    return {
+        "tool": tool_result.get("tool", "media_plan_goal"),
+        "status": "error",
+        "transport_ok": tool_result.get("transport_ok", True),
+        "operation_ok": False,
+        "result": {"ok": False, "error_code": "CANONICAL_IDENTITY_MISMATCH"},
+        "error": {
+            "code": "CANONICAL_IDENTITY_MISMATCH",
+            "message": "The retained media identity did not match the planner result.",
+        },
+    }
+
+
+def collective_library_query(text: str) -> str | None:
+    """Extract a broad media family query without treating it as acquisition."""
+    match = re.fullmatch(
+        r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+(?:stuff|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?plex)?\s*[?!.,]*\s*",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    query = re.sub(r"\s+", " ", match.group(1)).strip(" .?!")
+    tokens = re.findall(r"[a-z0-9]+", query.casefold())
+    if not tokens or all(token in {"the", "my", "our", "any"} for token in tokens):
+        return None
+    return query
+
+
+def referential_web_query(text: str, context: dict | None = None) -> str | None:
+    """Resolve an explicit web request's pronoun from canonical session state."""
+    if not explicit_web_search_request(text) or not has_referential_language(text):
+        return None
+    context = context or {}
+    identity = context.get("canonical_identity")
+    if isinstance(identity, dict) and identity.get("title"):
+        return str(identity["title"])
+    referent = context.get("latest_resolved_referent")
+    return str(referent) if referent else None
+
+
+def storage_state_followup(text: str, context: dict | None = None) -> bool:
+    """Identify a bare state question bound to a preceding storage subject."""
+    context = context or {}
+    if context.get("latest_operation") != "STORAGE_CAPACITY":
+        return False
+    return bool(re.fullmatch(r"\s*is\s+(?:it|that|this)\s+(?:running|up|online|mounted)\s*[?!.,]*\s*", text, re.I))
+
+
+def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]) -> tuple[str | None, dict]:
+    """Attach a small, current-turn operation record to an existing plan.
+
+    This is deliberately derived from the current turn plus the already
+    selected bounded tool.  It is not a second routing system and cannot
+    authorize an action; it only lets the next elliptical read turn preserve
+    operation separately from subject/source.
+    """
+    # Start from the current utterance.  Inheriting the previous operation
+    # here made an unrelated successful turn silently re-promote stale state;
+    # the bounded branches below are the only places where an elliptical
+    # follow-up is allowed to carry an operation forward.
+    operation = media_intent(text)
+    scope: dict = {}
+    names = {name for name, _ in planned}
+    if "media_plan_goal" in names and (referential_media_request(text, context) or media_acquisition_language(text)):
+        operation = "MEDIA_REQUEST"
+    elif "plex_library_counts" in names:
+        operation = "PLEX_LIBRARY_COUNT"
+        category = library_category_followup(text)
+        if category:
+            scope["category"] = category
+    elif "unraid_storage_status" in names:
+        arguments = next((args for name, args in planned if name == "unraid_storage_status"), {})
+        operation = "STORAGE_CAPACITY"
+        if arguments.get("target"):
+            scope["target"] = arguments["target"]
+    elif "media_plan_goal" in names and referential_media_library_question(text, context):
+        operation = "MEDIA_LIBRARY_QUERY"
+    elif "web_search" in names and referential_web_query(text, context):
+        operation = "MEDIA_WEB_RESEARCH"
+    return operation, scope
 
 
 def _descriptive_media_clue(text: str) -> bool:
@@ -2423,6 +2681,7 @@ def turn_context(client_id: str, text: str) -> dict:
         "latest_media_status", "latest_event_id", "latest_review_id", "latest_event", "canonical_identity", "latest_unresolved_subject",
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
+        "latest_operation", "operation_scope",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
         # Pending media-resolution state (a disambiguation question or a
         # missing-title clarification already asked) must survive a turn
@@ -2436,6 +2695,9 @@ def turn_context(client_id: str, text: str) -> dict:
     ) if key in prior}
     container_followup = _server_container_followup_target(text, prior)
     domain = "server" if container_followup else explicit_domain(text, prior)
+    operation = media_intent(text)
+    if operation:
+        current["operation"] = operation
     # A correction without a new action is a patch to the immediately preceding
     # resolved request. Do not let the corrected service name create a new intent.
     if repair and not domain:
@@ -2608,6 +2870,41 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("unraid_container_status", {"container": CONTAINER_DISPLAY_NAMES[context["container_followup"]]})]
     if direct_file_request(text) or playback_request(text):
         return []
+    # A count can change scope without changing its operation.  The category
+    # is validated against the current returned Plex libraries during
+    # deterministic rendering; it is never assumed to be a title.
+    category = library_category_followup(text)
+    if category and context.get("latest_operation") == "PLEX_LIBRARY_COUNT":
+        return [("plex_library_counts", {})]
+    # "Do I have it?" after identification is a library query for the
+    # canonical subject, not a literal-pronoun Plex search or a new request.
+    if referential_media_library_question(text, context):
+        identity = context.get("canonical_identity") or {}
+        title = str(identity.get("title") or "").strip()
+        if title:
+            return [("media_plan_goal", {"goal": retained_media_goal(identity), "media_type": identity.get("media_type")})]
+    if referential_media_request(text, context):
+        identity = context.get("canonical_identity") or {}
+        title = str(identity.get("title") or "").strip()
+        if title:
+            return [("media_plan_goal", {
+                "goal": retained_media_goal(identity, request=True),
+                "media_type": identity.get("media_type"),
+            })]
+    # A collective inventory question is read-only and intentionally broad:
+    # search the configured Plex libraries for the family query, then group
+    # only the returned evidence.  A request such as "Get Avengers" does
+    # not match this shape and continues through canonical resolution.
+    collective_query = collective_library_query(text)
+    if collective_query:
+        return [("plex_search", {"query": collective_query})]
+    # A bare "Is it running?" can safely remain a storage question only
+    # when the preceding capacity turn named the storage target.  This keeps
+    # it from degenerating into a container-status invocation without a name.
+    if storage_state_followup(text, context):
+        target = str((context.get("operation_scope") or {}).get("target") or "").strip()
+        if target:
+            return [("unraid_storage_status", {"target": target})]
     # Real production bug: "What time is it in Tokyo right now?" used
     # web_search instead of the deterministic current_datetime tool, and
     # returned a factually wrong date. Time/date has one authoritative
@@ -2806,7 +3103,9 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # events" cannot be mistaken for public news, but before any inherited
     # domain can influence the model.
     if explicit_web_search_request(text) or current_external_question(text):
-        query = context.get("unresolved_request") if explicit_web_search_request(text) else web_search_query_from_text(text)
+        query = (referential_web_query(text, context)
+                 or (context.get("unresolved_request") if explicit_web_search_request(text) else None)
+                 or web_search_query_from_text(text))
         return [("web_search", {"query": query or web_search_query_from_text(text)})]
     list_match = re.search(r"\b(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     list_name = (list_match.group(0).rsplit(" ", 1)[0].casefold() if list_match else "grocery")
@@ -3513,6 +3812,8 @@ def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result
     authoritative record too; it is the only safe source for a follow-up such
     as "What year did it come out?".
     """
+    if result.get("status") != "ok":
+        return
     argument_key = _REFERENT_ARGUMENT_KEYS.get(tool_name)
     if not argument_key:
         return
@@ -3640,6 +3941,20 @@ def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | No
             matches = [c for c in candidates if str(c.get("media_type", "")).casefold() == media_type]
             if len(matches) == 1:
                 return matches[0]
+    # Catalog-provided people evidence can distinguish candidates after a
+    # user corrects with a creator/cast hint. Missing people fields are
+    # unknown, never negative evidence; require one positive unique match.
+    people_matches = []
+    for candidate in candidates:
+        people = candidate.get("people") or []
+        if isinstance(people, str):
+            people = [people]
+        if not isinstance(people, list):
+            continue
+        if any(str(person).strip() and str(person).casefold() in lowered for person in people):
+            people_matches.append(candidate)
+    if len(people_matches) == 1:
+        return people_matches[0]
     return None
 
 
@@ -3655,6 +3970,12 @@ def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     always replaces any previous one for this client_id, so "yes" can never
     become ambiguous between two live offers (spec section 33).
     """
+    # An explicit request is already in the confirmation path when it is
+    # actionable.  Never turn that same request into a read-only offer that
+    # asks an equivalent question a second time.
+    operation = conversation_context.get(client_id, {}).get("_pending_operation") or conversation_context.get(client_id, {}).get("latest_operation")
+    if operation in {"MEDIA_REQUEST", "MEDIA_DISCOVERY", "MEDIA_LIBRARY_QUERY"}:
+        return None
     identity = plan_result.get("canonical_identity") or {}
     if not identity:
         return None
@@ -3810,11 +4131,33 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
         and not (isinstance(item.get("result"), dict) and item["result"].get("ok") is False)
     ]
     if results:
-        conversation_context.setdefault(client_id, {})["latest_tool_result"] = {
+        latest_tool_result = {
             "tools": [item.get("tool") for item in results],
             "results": [{"tool": item.get("tool"), "status": item.get("status"), "result_keys": sorted((item.get("result") or {}).keys()) if isinstance(item.get("result"), dict) else []} for item in results],
             "timestamp": time.time(),
         }
+        # Every successful branch below reconstructs the session from
+        # ``prior_state``. Keep this provenance there too, rather than only
+        # in the transient global dict that those branches overwrite.
+        prior_state["latest_tool_result"] = latest_tool_result
+        conversation_context.setdefault(client_id, {})["latest_tool_result"] = latest_tool_result
+    pending_operation = prior_state.pop("_pending_operation", None)
+    pending_scope = prior_state.pop("_pending_operation_scope", None)
+    # An attempted tool call is not conversational evidence.  Only promote
+    # the operation/scope after at least one relevant tool completed
+    # successfully; failed reads cannot steer the next short follow-up.
+    if pending_operation and successful:
+        prior_state["latest_operation"] = pending_operation
+        prior_state["operation_scope"] = pending_scope if isinstance(pending_scope, dict) else {}
+    elif pending_operation and results and not successful:
+        conversation_context[client_id] = prior_state
+    elif successful:
+        # A successful explicit turn with no operation staged for it is a
+        # topic change.  Do not let a much older operation (for example,
+        # cache capacity) survive a weather/camera/media turn and later bind
+        # an elliptical question such as "Is it running?".
+        prior_state.pop("latest_operation", None)
+        prior_state.pop("operation_scope", None)
     if successful:
         last = successful[-1]
         tool_names = [item.get("tool") for item in successful if item.get("tool")]
@@ -3868,12 +4211,19 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             items = result.get("items") or []
             album_ids = sorted({item.get("album_id") for item in items if item.get("album_id") is not None})
             conversation_context[client_id] = {**prior_state, "domain": "music", "kind": "lidarr_wanted", "group": "music", "tools": tool_names, "referent_type": "lidarr_albums", "referent_ids": album_ids}
-        elif last.get("tool") == "media_plan_goal" and result.get("workflow_id"):
+        elif last.get("tool") == "media_plan_goal" and result.get("canonical_identity"):
             identity = result.get("canonical_identity") or {}
-            conversation_context[client_id] = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names,
-                                               "workflow_id": result.get("workflow_id"), "referent_type": "media_workflow",
-                                               "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
-                                               "canonical_identity": identity, "media_type": result.get("goal", {}).get("media_type")}
+            updated = {**prior_state, "domain": "media", "latest_domain": "media",
+                       "kind": "media_workflow" if result.get("workflow_id") else "media_identity",
+                       "group": "media", "tools": tool_names,
+                       "referent_type": "media_workflow" if result.get("workflow_id") else "media_identity",
+                       "referent_ids": [x for x in (identity.get("foreign_album_id"), identity.get("tmdb_id"), identity.get("tvdb_id")) if x],
+                       "canonical_identity": identity,
+                       "latest_resolved_referent": identity.get("title") or prior_state.get("latest_resolved_referent"),
+                       "media_type": result.get("goal", {}).get("media_type") or identity.get("media_type")}
+            if result.get("workflow_id"):
+                updated["workflow_id"] = result["workflow_id"]
+            conversation_context[client_id] = updated
         elif last.get("tool") == "media_status":
             identity = result.get("canonical_identity") or {}
             updated = {**prior_state, "domain": "media", "kind": "media_workflow", "group": "media", "tools": tool_names}
@@ -3899,6 +4249,13 @@ def store_provenance(client_id: str, results: list[dict]) -> None:
             conversation_context[client_id] = updated
         elif last.get("tool") in {"web_search", "web_fetch", "wikipedia_search"}:
             conversation_context[client_id] = {**prior_state, "domain": "web_research", "kind": "web_research", "group": "internet", "tools": tool_names}
+        else:
+            # Successful authoritative reads without a domain-specific
+            # provenance branch (for example unraid_storage_status) must
+            # still commit the pending operation/scope. Otherwise the next
+            # elliptical turn sees the old context and cannot resolve its
+            # antecedent even though this read succeeded.
+            conversation_context[client_id] = prior_state
     for item in reversed(results):
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         if result.get("sources_checked") or result.get("investigation"):
@@ -4034,6 +4391,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if ambiguous_container_status_followup(user_text, conversation_context.get(client_id, {})):
         full = "Did you mean the stopped containers, or are you asking to start one?"
         await emit_answer(ws, request_id, full, client_id=client_id, origin="ambiguous_container_status")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    if storage_state_followup(user_text, conversation_context.get(client_id, {})) and not (conversation_context.get(client_id, {}).get("operation_scope") or {}).get("target"):
+        full = "Do you mean the cache pool's state, or a particular container or service?"
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="ambiguous_storage_status")
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
@@ -4273,7 +4636,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # this turn. The subject the offer refers to is preserved separately
         # in conversation_context, so a later plain "yes" can still resolve
         # it even though this turn was not itself acceptance.
-    if not action and is_confirmation(user_text):
+    if not action and is_confirmation(user_text) and not referential_media_request(
+        user_text, conversation_context.get(client_id, {})
+    ):
         previous_media = conversation_context.get(client_id, {}).get("latest_media_workflow") or {}
         if previous_media.get("execution_status") in {"error", "failed_ingestion", "rejected", "disabled"}:
             full = "That request did not make it into the media queue, so I haven't started anything. I can prepare a fresh request if you want."
@@ -4495,6 +4860,19 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             planned = []
         if not planned:
             planned = high_confidence_auto_dispatch(candidates, tools)
+        operation, operation_scope = operation_for_plan(user_text, context, planned)
+        if operation:
+            context["operation"] = operation
+            context["operation_scope"] = operation_scope
+            # Stash the current operation only until the read succeeds.
+            # `store_provenance()` promotes it to latest_operation after
+            # authoritative evidence returns; a failed read must not steer a
+            # later elliptical follow-up.
+            conversation_context[client_id] = {
+                **conversation_context.get(client_id, {}),
+                "_pending_operation": operation,
+                "_pending_operation_scope": operation_scope,
+            }
         context["last_route_text"] = route_text
         context["last_user_text"] = user_text
         context["last_plan"] = [{"tool": name, "arguments": args} for name, args in planned]
@@ -4528,6 +4906,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 "role": "system",
                 "content": "Dispatch now: call the best supplied live capability to answer the current request. Do not answer in prose before making that tool call. " + research_tool_instruction(profile),
             })
+        retained_identity = None
+        if (referential_media_request(user_text, context)
+                or referential_media_library_question(user_text, context)):
+            candidate_identity = context.get("canonical_identity")
+            if isinstance(candidate_identity, dict):
+                retained_identity = dict(candidate_identity)
         for name, planned_args in planned:
             args = planned_args
             if name == "media_plan_goal" and isinstance(args, dict):
@@ -4535,6 +4919,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             planned_result = await invoke_tool(name, args, client_id, request_id)
+            if name == "media_plan_goal" and retained_identity:
+                planned_result = enforce_retained_media_identity(retained_identity, planned_result)
             live_results.append(planned_result)
             # preflight_plan now deterministically routes a much broader set
             # of media/camera requests than the old calculator/unit_convert-
@@ -4623,6 +5009,22 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
                 return
+        identification_direct = canonical_identification_answer(live_results) if context.get("operation") == "MEDIA_DISCOVERY" else None
+        if identification_direct:
+            store_provenance(client_id, live_results)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_answer(ws, request_id, identification_direct, client_id=client_id, origin="canonical_media_identification")
+            history.append({"role": "assistant", "content": identification_direct})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
+        library_direct = canonical_library_answer(live_results) if context.get("operation") == "MEDIA_LIBRARY_QUERY" else None
+        if library_direct:
+            store_provenance(client_id, live_results)
+            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_answer(ws, request_id, library_direct, client_id=client_id, origin="canonical_media_library")
+            history.append({"role": "assistant", "content": library_direct})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         media_direct = media_plan_response(user_text, live_results)
         if media_direct:
             # A planner result is authoritative for whether the request is

@@ -288,9 +288,16 @@ class FakeToolsBackend:
             return {"tool": name, "status": "error", "result": {"error": "That tool is not enabled."}}
         if name == "plex_search":
             query = str(arguments.get("query", ""))
-            found = self._find_identity(query)
-            identity = found if isinstance(found, dict) else None
-            return {"tool": name, "status": "ok", "result": {"matched": bool(identity), "matches": [identity] if identity else [], "library_title": "Movies"}}
+            matches = []
+            for entry in self.library.values():
+                candidate = entry["identity"]
+                if query.casefold() in str(candidate.get("title") or "").casefold():
+                    matches.append({**candidate, "library_title": "Movies" if candidate.get("media_type") == "movie" else "TV Shows"})
+            if not matches:
+                found = self._find_identity(query)
+                if isinstance(found, dict):
+                    matches = [found]
+            return {"tool": name, "status": "ok", "result": {"matched": bool(matches), "matches": matches, "library_title": "Movies"}}
         if name == "media_status" or name == "plex_match_canonical_media":
             workflow_id_arg = str(arguments.get("workflow_id") or "").strip()
             title = arguments.get("title") or arguments.get("query") or ""
@@ -374,7 +381,13 @@ class FakeToolsBackend:
                 "memory_display": "512 MB", "cpu_percent": 2.5,
             }}
         if name == "unraid_storage_status":
-            return {"tool": name, "status": "ok", "result": {"target": arguments.get("target"), "used_percent": 57.0, "free_bytes": 212_000_000_000}}
+            return {"tool": name, "status": "ok", "result": {"target": arguments.get("target"), "status": "ONLINE", "used_percent": 57.0, "free_bytes": 212_000_000_000}}
+        if name == "plex_library_counts":
+            return {"tool": name, "status": "ok", "result": {"libraries": [
+                {"library": "Movies", "type": "movie", "items": 123},
+                {"library": "Anime", "type": "show", "items": 45},
+                {"library": "TV Shows", "type": "show", "items": 22},
+            ]}}
         return {"tool": name, "status": "error", "result": {"error": f"FakeToolsBackend has no fixture for tool {name!r}"}}
 
 
@@ -2141,6 +2154,126 @@ async def test_descriptive_identity_year_followup_uses_canonical_session_fact(se
     assert reply == "Cast Away came out in 2000."
     assert "media_status" not in calls_this_turn
     assert not calls_this_turn
+
+
+@pytest.mark.asyncio
+async def test_referential_planner_drift_is_quarantined_before_answer_or_state(session):
+    session.backend.seed_person("avery actor", "The Thing")
+    session.backend.seed_library(
+        "The Thing", media_type="movie", state="ABSENT", tmdb_id="1091", year="1982"
+    )
+    await session.turn("What's that Avery Actor movie called The Thing?")
+    expected = dict(session.app.conversation_context[session.client_id]["canonical_identity"])
+
+    original_invoke = session.backend.invoke
+
+    async def drifting_invoke(name, arguments, client_id, request_id, confirmed=False, action_id=None):
+        if name == "media_plan_goal":
+            session.backend.call_log.append((name, dict(arguments)))
+            return {"tool": name, "status": "ok", "result": {
+                "canonical_identity": {
+                    "title": "The Thing", "media_type": "movie", "year": "2011", "tmdb_id": "60935",
+                },
+                "current_state": "AVAILABLE_IN_PLEX", "ambiguous": False,
+                "confirmation_required": False,
+            }}
+        return await original_invoke(
+            name, arguments, client_id, request_id, confirmed=confirmed, action_id=action_id
+        )
+
+    session.backend.invoke = drifting_invoke
+    reply = await session.turn("Do I have it?")
+
+    assert session.app.conversation_context[session.client_id]["canonical_identity"] == expected
+    assert "2011" not in reply
+    assert "you have" not in reply.casefold()
+    assert "couldn't verify" in reply.casefold()
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_identify_then_library_then_web_preserves_subject_but_changes_operation(session):
+    """A canonical subject survives details/library/web operation changes.
+
+    The follow-ups are deliberately short and natural; neither the literal
+    pronoun nor an older unrelated web topic may become the tool query.
+    """
+    session.backend.seed_person("tom hanks", "Cast Away")
+    session.backend.seed_library("Cast Away", media_type="movie", state="ABSENT", tmdb_id="8358", year="2000")
+    await session.turn("What's that Tom Hanks movie where he's stuck on an island with a volleyball?")
+    assert await session.turn("What year did it come out?") == "Cast Away came out in 2000."
+    reply = await session.turn("Do I have it?")
+    assert reply == "I couldn't find Cast Away in Plex."
+    calls_before = len(session.backend.call_log)
+    await session.turn(
+        "Can you look it up on the internet?",
+        ollama_script=[{"message": {"content": "", "tool_calls": []}}],
+        final_text="Cast Away is a 2000 film.",
+    )
+    calls = session.backend.call_log[calls_before:]
+    assert ("web_search", {"query": "Cast Away"}) in calls
+    context = session.app.conversation_context[session.client_id]
+    assert context["canonical_identity"]["title"] == "Cast Away"
+    assert context["latest_operation"] == "MEDIA_WEB_RESEARCH"
+
+
+@pytest.mark.asyncio
+async def test_library_count_category_followup_retains_count_not_literal_anime_search(session):
+    first = await session.turn("How many movies do I have?")
+    assert "Movies: 123" in first
+    assert session.app.conversation_context[session.client_id]["latest_operation"] == "PLEX_LIBRARY_COUNT"
+    calls_before = len(session.backend.call_log)
+    second = await session.turn("What about anime?")
+    calls = session.backend.call_log[calls_before:]
+    assert second == "Plex library counts: Anime: 45."
+    assert calls == [("plex_library_counts", {})]
+    assert not any(name == "plex_search" and "anime" in str(args).casefold() for name, args in calls)
+
+
+@pytest.mark.asyncio
+async def test_cache_state_followup_reuses_cache_not_container_without_argument(session):
+    await session.turn("How full is cache?")
+    assert session.app.conversation_context[session.client_id]["operation_scope"] == {"target": "cache"}
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("Is it running?")
+    calls = session.backend.call_log[calls_before:]
+    assert calls == [("unraid_storage_status", {"target": "cache"})]
+    assert reply == "Cache status is ONLINE."
+    assert not any(name == "unraid_container_status" for name, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_question_outranks_retained_library_count_operation(session):
+    await session.turn("How many movies do I have?")
+    calls_before = len(session.backend.call_log)
+    await session.turn("How many containers are running?", final_text="There are 2 running containers.")
+    calls = session.backend.call_log[calls_before:]
+    assert any(name == "list_containers" for name, _ in calls)
+    assert not any(name == "plex_library_counts" for name, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_collective_library_inventory_is_broad_but_request_stays_canonical(session):
+    session.backend.seed_library("Galactic Saga", media_type="movie", state="AVAILABLE_IN_PLEX", tmdb_id="101", year=2011)
+    session.backend.seed_library("Galactic Saga: Origins", media_type="tv", state="AVAILABLE_IN_PLEX", tvdb_id="202", year=2015)
+    reply = await session.turn("What Galactic Saga stuff do I have?")
+    assert "Movies: Galactic Saga (2011)" in reply
+    assert "TV Shows: Galactic Saga: Origins (2015)" in reply
+    calls_before = len(session.backend.call_log)
+    await session.turn("Get Galactic Saga.")
+    calls = session.backend.call_log[calls_before:]
+    assert any(name == "media_plan_goal" for name, _ in calls)
+    assert not any(name == "plex_search" for name, _ in calls)
+
+
+def test_creator_hint_only_resolves_when_catalog_candidates_supply_unique_people_evidence(app):
+    candidates = [
+        {"title": "Same Title", "year": 2003, "media_type": "movie", "people": ["Creator One"]},
+        {"title": "Same Title", "year": 2015, "media_type": "movie", "people": ["Creator Two"]},
+    ]
+    assert app.resolve_disambiguation_reply("The Creator Two one.", candidates) == candidates[1]
+    # Missing people evidence remains uncertainty, not negative proof.
+    assert app.resolve_disambiguation_reply("The Unknown Person one.", candidates) is None
 
 
 @pytest.mark.asyncio

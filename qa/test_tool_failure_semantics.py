@@ -140,6 +140,7 @@ def _qa_startup(tmp_path, **settings):
     for name in (
         "HOME_AI_QA_MODE", "HOME_AI_QA_EXECUTOR", "HOME_AI_QA_STATE_ROOT",
         "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+        "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_TOKEN_FILE",
     ):
         env.pop(name, None)
     env.update({name: str(value) for name, value in settings.items()})
@@ -173,4 +174,17 @@ def test_isolated_mode_startup_is_fail_closed(tmp_path):
     )
     for settings in cases:
         result = _qa_startup(tmp_path, **settings)
+        assert result.returncode != 0, settings
+
+
+def test_live_readonly_mode_refuses_mutation_credentials(tmp_path):
+    valid = _qa_startup(tmp_path, HOME_AI_QA_MODE="live_readonly")
+    assert valid.returncode == 0, valid.stderr
+    for settings in (
+        {"CLIDEBRID_BRIDGE_TOKEN": "must-refuse"},
+        {"CLIDEBRID_BRIDGE_TOKEN_FILE": "/run/secrets/production-bridge"},
+        {"HOME_ASSISTANT_TOKEN": "must-refuse"},
+        {"HOME_ASSISTANT_TOKEN_FILE": "/run/secrets/production-home"},
+    ):
+        result = _qa_startup(tmp_path, HOME_AI_QA_MODE="live_readonly", **settings)
         assert result.returncode != 0, settings

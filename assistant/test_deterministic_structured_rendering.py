@@ -78,3 +78,35 @@ def test_container_and_plex_counts_are_direct_structured_answers():
     })])
     assert container == "Plex-Media-Server is running, healthy, CPU 3.5%, memory 1.2 GiB / 4 GiB."
     assert counts == "Plex library counts: Movies: 123; TV Shows: 45."
+
+
+def test_category_followup_uses_only_returned_plex_library_names_and_types():
+    answer = direct_structured_answer("What about anime?", [_ok("plex_library_counts", {
+        "libraries": [
+            {"library": "Movies", "type": "movie", "items": 123},
+            {"library": "Anime", "type": "show", "items": 45},
+        ],
+    })])
+    assert answer == "Plex library counts: Anime: 45."
+    absent = direct_structured_answer("What about anime?", [_ok("plex_library_counts", {
+        "libraries": [{"library": "Movies", "type": "movie", "items": 123}],
+    })])
+    assert absent == "I couldn't find a configured Plex anime library to count."
+
+
+def test_storage_state_followup_uses_storage_status_not_container_semantics():
+    answer = direct_structured_answer("Is it running?", [_ok("unraid_storage_status", {
+        "target": "cache", "status": "ONLINE", "used_percent": 58,
+    })])
+    assert answer == "Cache status is ONLINE."
+
+
+def test_collective_library_inventory_groups_only_returned_plex_matches():
+    answer = direct_structured_answer("What Galactic Saga stuff do I have?", [_ok("plex_search", {
+        "query": "Galactic Saga",
+        "matches": [
+            {"title": "Galactic Saga", "year": 2011, "media_type": "movie", "library_title": "Movies"},
+            {"title": "Galactic Saga: Origins", "year": 2015, "media_type": "show", "library_title": "TV Shows"},
+        ],
+    })])
+    assert answer == "In Plex, I found Movies: Galactic Saga (2011); TV Shows: Galactic Saga: Origins (2015)."
