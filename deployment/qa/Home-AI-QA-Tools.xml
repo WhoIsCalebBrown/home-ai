@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>Home-AI-QA-Tools</Name>
-  <Repository>ghcr.io/whoiscalebbrown/home-ai-tools:sha-8efd599</Repository>
+  <Repository>ghcr.io/whoiscalebbrown/home-ai-tools:sha-af8dfb2</Repository>
   <Registry>https://ghcr.io/whoiscalebbrown/home-ai-tools</Registry>
   <Network>voiceai-qa</Network>
   <Privileged>false</Privileged>
