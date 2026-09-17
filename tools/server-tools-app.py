@@ -4473,7 +4473,11 @@ async def invoke(request: Request, req: Invoke):
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
     isolated_fake_media_executor = QA_MODE == "isolated_execution" and req.name == "media_standard_request"
-    if (QA_MODE == "live_readonly" or (QA_MODE == "isolated_execution" and not isolated_fake_media_executor)) and permission in {"confirm", "destructive"}:
+    qa_denies_mutation = permission != "read" and (
+        QA_MODE == "live_readonly"
+        or (QA_MODE == "isolated_execution" and not isolated_fake_media_executor)
+    )
+    if qa_denies_mutation:
         # This is enforced at the trusted Tools boundary, before confirmation
         # handling or an adapter can run.  Prompts, dry_run fields, and model
         # generated arguments cannot override deployment scope.

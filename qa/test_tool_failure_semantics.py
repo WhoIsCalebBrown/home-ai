@@ -98,6 +98,25 @@ def test_live_readonly_scope_denies_mutations_before_handler(monkeypatch, tmp_pa
     assert called is False
 
 
+def test_live_readonly_scope_denies_write_low_before_handler(tmp_path):
+    module = _load_tools()
+    module.AUDIT = tmp_path / "audit.jsonl"
+    module.QA_MODE = "live_readonly"
+    called = False
+
+    async def writer(_):
+        nonlocal called
+        called = True
+        return {"status": "ok"}
+
+    module.TOOLS["qa_writer"] = ("qa_writer", "isolated", "write_low", "qa", {}, writer)
+    result = asyncio.run(_invoke(module, module.Invoke(name="qa_writer", confirmed=True)))
+    assert result["status"] == "disabled"
+    assert result["result"]["error_code"] == "QA_LIVE_READONLY"
+    assert result["result"]["write_executed"] is False
+    assert called is False
+
+
 def test_isolated_scope_denies_production_mutations_before_handler(tmp_path):
     module = _load_tools()
     module.AUDIT = tmp_path / "audit.jsonl"
