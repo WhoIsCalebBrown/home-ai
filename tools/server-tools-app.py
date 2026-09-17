@@ -1529,8 +1529,18 @@ async def torbox_status(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def overseerr_status(_: dict[str, Any]) -> dict[str, Any]:
-    data = await get_json("overseerr", "/api/v1/status")
-    return {"version": data.get("version"), "commit": data.get("commitTag"), "update_available": data.get("updateAvailable")}
+    # Real production bug: without an explicit "reachable" boolean, a real
+    # successful call still got reported to the user as "I couldn't verify
+    # that current server information because the required live tool
+    # result was unavailable" -- the strict grounding rule requires every
+    # dynamic claim to map to an explicit field, and "is it up" had nothing
+    # to point to even though the call plainly succeeded. Match the same
+    # convention already used by torbox_status.
+    try:
+        data = await get_json("overseerr", "/api/v1/status")
+        return {"reachable": True, "version": data.get("version"), "commit": data.get("commitTag"), "update_available": data.get("updateAvailable")}
+    except Exception as exc:
+        return {"reachable": False, "error": "Overseerr unavailable", "detail": type(exc).__name__}
 
 
 async def overseerr_recent_requests(_: dict[str, Any]) -> dict[str, Any]:

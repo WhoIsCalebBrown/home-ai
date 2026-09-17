@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries", "collapse_repeated_sentences"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -368,6 +368,24 @@ def test_latest_activity_answer_separates_age_from_duration():
     assert "10 minutes" not in answer.split("for")[-1]
 
 
+def test_recent_activity_answer_never_prepends_a_stray_yes():
+    # Real production bug: "What happened at the front door recently?" (a
+    # WH-question, not yes/no -- front_door_presence_question() is already
+    # False for it, and this function's only caller is reached precisely
+    # when that presence-question branch did NOT fire) got answered "Yes.
+    # about 1.7 hours ago, a single person walks into the front foyer..."
+    # -- an ungrammatical "Yes." with nothing for it to affirm.
+    answer = grounded_recent_activity_answer({
+        "latest_only": True,
+        "reviews": [{
+            "time": {"start": {"relative_time": "about 1.7 hours ago"}},
+            "genai": {"shortSummary": "a single person walks into the front foyer."},
+            "objects": ["person"],
+        }],
+    })
+    assert not answer.startswith("Yes.")
+
+
 def test_historical_clock_answer_uses_event_normalized_time():
     assert historical_timing_question("What time was that?")
     answer = grounded_event_timing_answer({
@@ -717,6 +735,61 @@ def test_conversational_news_request_becomes_a_clean_search_query():
     recovery = web_recovery_queries("can you give me an in depth review on the canadian news for today")
     assert recovery[0] == "canadian news"
     assert all("2026" not in query and "September" not in query for query in recovery)
+
+
+def test_container_logs_request_is_not_swallowed_by_generic_container_catch_all():
+    # Real production bug found by the user directly inspecting a live
+    # transcript: "Show me the last few log lines for the Home-AI-Tools
+    # container." matched the generic docker/service catch-all ("container"
+    # is in its word list) before ever reaching a logs-specific check, so it
+    # got routed to list_containers (a container count) instead of
+    # get_container_logs. The container name's real casing must survive.
+    assert preflight_plan("Show me the last few log lines for the Home-AI-Tools container.") == [
+        ("get_container_logs", {"name": "Home-AI-Tools"})
+    ]
+
+
+def test_investigate_downloads_request_is_not_swallowed_by_generic_service_catch_all():
+    # Same root cause as the logs bug above: "Investigate my downloads
+    # across all services." matched the generic catch-all ("services") and
+    # got routed to list_containers -- a completely wrong domain -- instead
+    # of the tool built to correlate qBittorrent/Sonarr/Radarr/Lidarr/Slskd/
+    # Torbox download state. A single-service question ("any active
+    # Soulseek downloads") must still reach discovery/its own tool, not this
+    # broad multi-service correlation tool.
+    assert preflight_plan("Investigate my downloads across all services.") == [("investigate_downloads", {})]
+    assert preflight_plan("Any active Soulseek downloads?") == []
+
+
+def test_frigate_stats_request_outranks_the_recent_events_catch_all():
+    # Real production bug: "What are the current Frigate camera stats?"
+    # matched the recent-events branch ("camera" is in its word list)
+    # before ever reaching the frigate_stats branch, so an explicit
+    # "stats"/"statistics" request always lost to a recent-activity
+    # narrative instead of actual fps/detector numbers.
+    assert preflight_plan("What are the current Frigate camera stats?") == [("frigate_stats", {})]
+
+
+def test_datetime_question_resolves_deterministically_not_via_web_search():
+    # Real production bug: "What time is it in Tokyo right now?" used
+    # web_search instead of the deterministic current_datetime tool, and
+    # returned a factually wrong date. Time/date has one authoritative
+    # source and needs no model judgment.
+    assert preflight_plan("What time is it in Tokyo right now?") == [("current_datetime", {"timezone": "Asia/Tokyo"})]
+    assert preflight_plan("What time is it?") == [("current_datetime", {})]
+    assert preflight_plan("What's the weather today?")[0][0] == "weather_forecast"
+
+
+def test_named_device_state_question_resolves_to_home_get_state_not_area():
+    # Real production bug: "What's the state of the neon lights?" scored
+    # home_get_area_state fractionally higher than home_get_state in
+    # discovery (home_get_area_state takes a room/area name, not a device
+    # name), and Qwen picked the area tool for a named DEVICE -- falsely
+    # reporting "I couldn't find any lights" even though the device exists.
+    # Bounded to actual light/switch language so unrelated "state of X"
+    # questions (a Sonarr download, a Docker service) are unaffected.
+    assert preflight_plan("What's the state of the neon lights?") == [("home_get_state", {"entity_or_area": "neon lights"})]
+    assert preflight_plan("What's the state of my Sonarr download?") != [("home_get_state", {"entity_or_area": "my sonarr download"})]
 
 
 def test_natural_why_isnt_it_in_plex_phrasing_reaches_investigate_plex_missing():

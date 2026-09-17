@@ -1099,11 +1099,11 @@ def grounded_recent_activity_answer(result: dict) -> str | None:
         # deterministic normalized timing above owns all clock statements.
         summary = re.sub(r"\b(?:around|at|before|after)\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?", "", summary, flags=re.I)
         summary = re.sub(r"\s+([,.])", r"\1", summary).strip()
-        return f"Yes. {when}, {summary}"
+        return f"{when}, {summary}"
     if isinstance(duration, (int, float)):
-        return f"Yes. {when}, a person was visible for about {duration:g} seconds."
+        return f"{when}, a person was visible for about {duration:g} seconds."
     objects = ", ".join(review.get("objects") or []) or "activity"
-    return f"Yes. {when}, Frigate recorded {objects} at the front door."
+    return f"{when}, Frigate recorded {objects} at the front door."
 
 
 def historical_timing_question(text: str) -> bool:
@@ -2195,6 +2195,27 @@ def _media_title_candidate_words(text: str) -> list[str]:
     return [t for t in tokens if t not in _MEDIA_QUESTION_SCAFFOLDING and t not in _MEDIA_CATEGORY_WORDS]
 
 
+_TIMEZONE_CITY_MAP = {
+    "tokyo": "Asia/Tokyo", "london": "Europe/London", "paris": "Europe/Paris",
+    "new york": "America/New_York", "los angeles": "America/Los_Angeles",
+    "chicago": "America/Chicago", "toronto": "America/Toronto",
+    "vancouver": "America/Vancouver", "berlin": "Europe/Berlin",
+    "sydney": "Australia/Sydney", "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
+    "moscow": "Europe/Moscow", "dubai": "Asia/Dubai", "mumbai": "Asia/Kolkata",
+    "delhi": "Asia/Kolkata", "singapore": "Asia/Singapore", "hong kong": "Asia/Hong_Kong",
+    "seoul": "Asia/Seoul", "mexico city": "America/Mexico_City", "sao paulo": "America/Sao_Paulo",
+    "cairo": "Africa/Cairo", "istanbul": "Europe/Istanbul",
+}
+
+
+def _timezone_from_text(text: str) -> str | None:
+    lowered = text.casefold()
+    for city, zone in _TIMEZONE_CITY_MAP.items():
+        if re.search(rf"\b{re.escape(city)}\b", lowered):
+            return zone
+    return None
+
+
 def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, dict]]:
     routed_text = routing_aliases(text)
     t = routed_text.lower()
@@ -2204,6 +2225,33 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return deterministic
     if direct_file_request(text) or playback_request(text):
         return []
+    # Real production bug: "What time is it in Tokyo right now?" used
+    # web_search instead of the deterministic current_datetime tool, and
+    # returned a factually wrong date. Time/date has one authoritative
+    # source and needs no model judgment at all -- resolve it directly
+    # before anything else gets a chance to misroute it.
+    if re.search(r"\bwhat(?:'s| is) the (?:current )?time\b|\bwhat time is it\b|\bcurrent time\b"
+                 r"|\bwhat(?:'s| is) the (?:current )?date\b|\bwhat day is it\b|\btoday'?s date\b",
+                 t) and not re.search(r"\bweather\b", t):
+        args = {}
+        zone = _timezone_from_text(text)
+        if zone:
+            args["timezone"] = zone
+        return [("current_datetime", args)]
+    # Real production bug: "What's the state of the neon lights?" scored
+    # home_get_area_state fractionally higher than home_get_state in
+    # discovery (both plausible candidates for generic "state" language),
+    # and Qwen picked the area tool for a named DEVICE -- which takes a
+    # room/area name, not a device name, and so falsely reported "I
+    # couldn't find any lights" even though home_find_device's own results
+    # in the same session prove the device exists. A named-device state
+    # question is unambiguous enough to resolve directly: home_get_state
+    # already fuzzy-matches its entity_or_area argument against known
+    # devices server-side, so passing the raw phrase through is sufficient.
+    device_state_match = re.search(r"\bwhat(?:'s| is) the state of (?:the |my )?(.+?)\??$", t)
+    if (device_state_match and device_state_match.group(1).strip()
+            and re.search(r"\b(light|lights|lamp|outlet|switch|plug|socket|neon)\b", device_state_match.group(1))):
+        return [("home_get_state", {"entity_or_area": device_state_match.group(1).strip()})]
     # Library recency questions contain the verb "add" but are read-only
     # Plex queries, not acquisition goals. Resolve them before the broad
     # acquisition-language matcher.
@@ -2437,6 +2485,26 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # by a second resolver here.
     if media_nouns and _descriptive_media_clue(text):
         return [("media_plan_goal", {"goal": text})]
+    # Real production bug: "Investigate my downloads across all services."
+    # was swallowed by the generic docker/service catch-all just below
+    # ("services" matched) into list_containers -- completely the wrong
+    # domain (a Docker container list, not a download-pipeline correlation)
+    # -- and produced a garbled, self-contradicting answer. Bounded to an
+    # explicit "investigate" imperative with no single named download
+    # service, so "any active Soulseek downloads" still reaches its own
+    # specific tool via discovery rather than being swept in here too.
+    if (re.search(r"\binvestigate\b", t) and re.search(r"\bdownloads?\b", t)
+            and not re.search(r"\b(torbox|overseerr|slskd|soulseek|qbittorrent|sonarr|radarr|lidarr)\b", t)):
+        return [("investigate_downloads", {})]
+    # "Show me the last few log lines for the Home-AI-Tools container." was
+    # also swallowed by that same generic catch-all ("container" matched)
+    # into list_containers instead of the tool that actually returns log
+    # text. Extract the container name from the ORIGINAL (not lowercased)
+    # text so its real casing reaches the Docker API unchanged.
+    log_match = re.search(r"\blogs?\b.*?\bfor\b\s+(?:the\s+)?([\w.-]+)\s+container\b|\bcontainer\b\s+([\w.-]+)\s+logs?\b|\blogs?\s+for\s+([\w.-]+)\b", routed_text, re.I)
+    if log_match and re.search(r"\blogs?\b", t):
+        container_name = next(g for g in log_match.groups() if g)
+        return [("get_container_logs", {"name": container_name})]
     if re.search(r"\b(gpu|gpus|vram|docker|container|containers|service|services|process|processes|server health|server status|system status|server overview)\b", t):
         plan = []
         if re.search(r"\b(gpu|gpus|vram)\b", t):
@@ -2556,7 +2624,14 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if re.search(r"\b(plex|movie|movies|show|shows|episode|music|artist|album|interstellar)\b", t):
         browse_shaped = bool(re.search(r"\bhow many|counts?|libraries\b", t)) or not _media_title_candidate_words(plex_query_from_speech(text))
         plan.append(("plex_library_counts", {}) if browse_shaped else ("plex_search", {"query": plex_query_from_speech(text)}))
-    if front_door_presence_question(text) or re.search(r"\b(front door|camera|detection|motion|alert|alerts|last thing detected|what happened)\b", t):
+    # Real production bug: "What are the current Frigate camera stats?"
+    # matched the recent-events branch below ("camera" is in its word list)
+    # before ever reaching the frigate_stats branch, so an explicit
+    # "stats"/"statistics" request always lost to a recent-activity
+    # narrative instead of actual fps/detector numbers. Check this first.
+    if re.search(r"\b(stats|statistics)\b", t) and re.search(r"\b(camera|cameras|frigate)\b", t):
+        plan.append(("frigate_stats", {}))
+    elif front_door_presence_question(text) or re.search(r"\b(front door|camera|detection|motion|alert|alerts|last thing detected|what happened)\b", t):
         plan.append(("frigate_recent_events", {"camera": "front_door", "label": "person", "limit": 10}))
     elif re.search(r"\b(camera|cameras|garage|frigate|person)\b", t):
         plan.append(("frigate_stats", {}))
