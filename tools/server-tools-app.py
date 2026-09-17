@@ -84,10 +84,45 @@ STANDARD_EPISODE_WRITES_ENABLED = os.getenv("STANDARD_EPISODE_WRITES_ENABLED", "
 # acknowledgement path has been validated.  This is independent of the
 # per-capability gates so a stale environment cannot reopen writes.
 STANDARD_MEDIA_BACKEND_READY = os.getenv("STANDARD_MEDIA_BACKEND_READY", "false").casefold() == "true"
+# QA modes are trusted deployment policy, never request/model arguments.  The
+# live lane is read-only even if an operator accidentally enables the normal
+# production write flags.  The isolated lane requires an explicitly named
+# fake executor and a separate state root; missing/ambiguous configuration is
+# a startup error rather than a fallback to production.
+QA_MODE = os.getenv("HOME_AI_QA_MODE", "").strip().casefold()
+QA_EXECUTOR = os.getenv("HOME_AI_QA_EXECUTOR", "").strip().casefold()
+QA_STATE_ROOT = os.getenv("HOME_AI_QA_STATE_ROOT", "").strip()
+QA_ALLOWED_MUTATION_MODES = frozenset({"", "production"})
+
+
+def validate_qa_configuration() -> None:
+    if QA_MODE not in {"", "live_readonly", "isolated_execution"}:
+        raise RuntimeError("invalid HOME_AI_QA_MODE; refusing to start")
+    if QA_MODE == "live_readonly":
+        if QA_EXECUTOR or QA_STATE_ROOT:
+            raise RuntimeError("live_readonly cannot configure an executor or state root")
+    elif QA_MODE == "isolated_execution":
+        if QA_EXECUTOR != "fake":
+            raise RuntimeError("isolated_execution requires HOME_AI_QA_EXECUTOR=fake")
+        if not QA_STATE_ROOT or QA_STATE_ROOT in {"/", "/data", "/config"}:
+            raise RuntimeError("isolated_execution requires a dedicated QA state root")
+        if any(os.getenv(name, "").strip() for name in ("CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE")):
+            raise RuntimeError("isolated_execution refuses production cli_debrid credentials")
+
+
+validate_qa_configuration()
 AUDIT = Path(os.getenv("AUDIT_LOG", "/data/audit.jsonl"))
 LISTS_PATH = Path(os.getenv("LISTS_PATH", "/data/home-ai-lists.json"))
 MEDIA_WORKFLOWS_PATH = Path(os.getenv("MEDIA_WORKFLOWS_PATH", "/data/media-workflows.json"))
 USER_PROFILE_PATH = Path(os.getenv("USER_PROFILE_PATH", "/config/home-ai-user-profile.json"))
+if QA_MODE == "isolated_execution":
+    # Ignore production defaults and force every mutable workflow/audit store
+    # into the operator-supplied dedicated QA root.
+    _qa_root = Path(QA_STATE_ROOT)
+    AUDIT = _qa_root / "audit.jsonl"
+    LISTS_PATH = _qa_root / "home-ai-lists.json"
+    MEDIA_WORKFLOWS_PATH = _qa_root / "media-workflows.json"
+    USER_PROFILE_PATH = _qa_root / "user-profile.json"
 HOME_ASSISTANT_URL = os.getenv("HOME_ASSISTANT_URL", "http://192.168.40.44:8123").rstrip("/")
 HOME_ASSISTANT_TOKEN_FILE = Path(os.getenv(
     "HOME_ASSISTANT_TOKEN_FILE",
@@ -2819,6 +2854,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             "mode": "standard",
             "media_type": "tv" if kind in {"tv", "anime"} else kind,
             "canonical_external_id": identity.get("tmdb_id"),
+            "canonical_title": identity.get("title"),
             "season_scope": parts.get("season_scope", []),
             "episode_scope": [],
         }
@@ -3134,6 +3170,10 @@ def _standard_argument_binding(args: dict[str, Any]) -> dict[str, Any]:
         "mode": "standard",
         "media_type": str(args.get("media_type", "")).casefold(),
         "canonical_external_id": int(args.get("canonical_external_id")),
+        # Bind the displayed subject as well as its external id. Otherwise a
+        # caller could alter the title between planning and approval without
+        # changing the authorization hash.
+        "canonical_title": str(args.get("canonical_title", "")).strip(),
         "season_scope": sorted(set(args.get("season_scope") or [])),
         "episode_scope": [],
     }
@@ -3301,15 +3341,15 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
 
     if args.get("episode_scope"):
         return {"status": "rejected", "reason": "STANDARD_EPISODE_SCOPE_UNSUPPORTED", "write_executed": False}
-    if not STANDARD_MEDIA_BACKEND_READY:
+    if QA_MODE != "isolated_execution" and not STANDARD_MEDIA_BACKEND_READY:
         return {"status": "disabled", "reason": "STANDARD_MEDIA_BACKEND_NOT_READY", "write_executed": False, "request_shape": payload}
-    if not STANDARD_MEDIA_WRITES_ENABLED:
+    if QA_MODE != "isolated_execution" and not STANDARD_MEDIA_WRITES_ENABLED:
         return {"status": "disabled", "reason": "STANDARD_MEDIA_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
-    if payload["mediaType"] == "movie" and not STANDARD_MOVIE_WRITES_ENABLED:
+    if QA_MODE != "isolated_execution" and payload["mediaType"] == "movie" and not STANDARD_MOVIE_WRITES_ENABLED:
         return {"status": "disabled", "reason": "STANDARD_MOVIE_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
-    if payload["mediaType"] == "tv" and not STANDARD_SEASON_WRITES_ENABLED:
+    if QA_MODE != "isolated_execution" and payload["mediaType"] == "tv" and not STANDARD_SEASON_WRITES_ENABLED:
         return {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False, "request_shape": payload}
-    if not _standard_bridge_secret():
+    if QA_MODE != "isolated_execution" and not _standard_bridge_secret():
         return {"status": "disabled", "reason": "BRIDGE_SECRET_MISSING", "write_executed": False, "request_shape": payload}
 
     required_binding = {"confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at", "status"}
@@ -3340,11 +3380,30 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
         return {"status": "rejected", "reason": "PLAN_HASH_MISMATCH", "write_executed": False}
     if workflow.get("canonical_identity", {}).get("tmdb_id") != payload["mediaId"]:
         return {"status": "rejected", "reason": "CANONICAL_ID_MISMATCH", "write_executed": False}
+    requested_title = str(args.get("canonical_title") or "").strip()
+    stored_title = str(workflow.get("canonical_identity", {}).get("title") or "").strip()
+    if requested_title and stored_title and requested_title.casefold() != stored_title.casefold():
+        return {"status": "rejected", "reason": "CANONICAL_TITLE_MISMATCH", "write_executed": False}
     if str(authorization.get("session_id")) != str(binding.get("session_id")):
         return {"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID", "write_executed": False}
     if authorization.get("status") != "PENDING":
         return {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}
     title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
+    if QA_MODE == "isolated_execution":
+        # The real confirmation, binding, canonical-identity and single-use
+        # machinery above is exercised, but the final executor is deliberately
+        # an in-process fake.  No provider evidence lookup, bridge secret,
+        # HTTP request, filesystem media write, or production event source is
+        # reachable from this branch.
+        _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
+        workflow.update({"canonical_state": "REQUESTED", "mode": "standard",
+                         "qa_executor": "fake", "write_executed": False})
+        _save_workflow_update(rows, workflow)
+        log_event_safe(workflow_id=workflow_id, event_type="QA_FAKE_EXECUTION",
+                       canonical_subject_id=str(payload["mediaId"]), source_service="qa_fake")
+        return {"status": "ok", "reason": "QA_FAKE_EXECUTOR", "write_executed": False,
+                "executor": "in_process_fake", "workflow_id": workflow_id,
+                "canonical_identity": workflow.get("canonical_identity", {})}
     # Persisted lifecycle state is correlation/history, not proof of a live
     # request. Revalidate the provider first so stale REQUESTED/SEARCHING
     # records cannot suppress a legitimate retry or authorize a duplicate.
@@ -4286,7 +4345,9 @@ async def health(request: Request):
         authenticated = False
     payload = {"ok": True, "service": "server-tools"}
     if authenticated:
-        payload.update({"tools": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION})
+        payload.update({"tools": len(REGISTRY), "contract_version": TOOL_CONTRACT_VERSION,
+                        "qa_mode": QA_MODE or "production",
+                        "mutation_scope": "read_only" if QA_MODE else "configured"})
     return payload
 
 
@@ -4402,6 +4463,23 @@ async def invoke(request: Request, req: Invoke):
     if not item:
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
+    if QA_MODE in {"live_readonly", "isolated_execution"} and permission in {"confirm", "destructive"}:
+        # This is enforced at the trusted Tools boundary, before confirmation
+        # handling or an adapter can run.  Prompts, dry_run fields, and model
+        # generated arguments cannot override deployment scope.
+        status = "disabled"
+        reason = "QA_LIVE_READONLY" if QA_MODE == "live_readonly" else "QA_ISOLATED_EXECUTOR_REQUIRED"
+        result = {"error": "state-changing operations are disabled in this QA mode",
+                  "error_code": reason, "evidence_available": False,
+                  "write_executed": False}
+        audit({"client_id": req.client_id, "session_id": req.session_id,
+               "trace_id": req.trace_id, "turn_id": req.turn_id,
+               "tool_call_id": req.tool_call_id, "tool": req.name,
+               "service": service, "permission": permission, "status": status,
+               "operation_ok": False, "qa_mode": QA_MODE})
+        return _operation_response(req=req, service=service, permission=permission,
+                                   status=status, result=result, duration_ms=0,
+                                   error={"code": reason, "message": result["error"]})
     invalid = _invalid_arguments(item, req.arguments)
     if invalid:
         result = {"error": invalid["message"], "error_code": invalid["code"],

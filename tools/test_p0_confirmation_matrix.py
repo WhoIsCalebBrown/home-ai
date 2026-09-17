@@ -100,8 +100,11 @@ async def test_matrix_b_identical_prompts_confirm_only_b(harness):
     a, b = await _plan(mod, "openwebui:user:chat-a"), await _plan(mod, "openwebui:user:chat-b")
     result = await mod.media_standard_request(_args(b, "openwebui:user:chat-b"))
     assert result["write_executed"] is True and len(calls) == 1
-    assert (await mod.media_standard_request(_args(a, "openwebui:user:chat-a")))["write_executed"] is True
-    assert len(calls) == 2
+    assert calls[0]["json"]["request"]["media_id"] == 438631
+    workflow = next(r for r in mod._media_workflows() if r["workflow_id"] == a["workflow_id"])
+    states = {item["confirmation_id"]: item["status"] for item in workflow["pending_confirmations"]}
+    assert states[a["confirmation_record"]["confirmation_id"]] == "PENDING"
+    assert states[b["confirmation_record"]["confirmation_id"]] == "CONSUMED"
 
 
 @pytest.mark.asyncio
