@@ -575,6 +575,26 @@ def test_media_diagnosis_is_human_and_stops_at_proven_boundary():
     assert direct_structured_answer("why is it stuck", [{"tool": "media_diagnose", "status": "ok", "result": result}]) == "I couldn't find a suitable copy of Dumb and Dumber."
 
 
+def test_not_requested_status_gives_a_clear_offer_not_a_dead_end():
+    # Real production gap found in a live naive-user sweep: "What's the
+    # status of Arcane?"/"Can I watch Bird Box?" for a title that was
+    # added directly in Sonarr/Radarr (never formally REQUESTED through
+    # Home-AI) used to dead-end with "I don't have a tracked request for
+    # that yet" even when the title was correctly identified live --
+    # media_status's new live-identification fallback returns "found":
+    # True with canonical_state "NOT_REQUESTED" for this exact case, and
+    # the answer must clearly offer to start a request rather than
+    # sounding like a permanent dead end.
+    result = {"found": True, "canonical_state": "NOT_REQUESTED", "canonical_identity": {"title": "Arcane"}}
+    answer = direct_structured_answer("What's the status of Arcane?", [{"tool": "media_status", "status": "ok", "result": result}])
+    assert answer == "I found Arcane, but nothing has been requested for it yet. Want me to start that?"
+
+    diagnose_result = {"title": "Arcane", "canonical_state": "NOT_REQUESTED", "diagnosis": "IDENTIFIED_NOT_REQUESTED",
+                        "canonical_identity": {"title": "Arcane"}}
+    diagnose_answer = direct_structured_answer("why hasn't Arcane started", [{"tool": "media_diagnose", "status": "ok", "result": diagnose_result}])
+    assert diagnose_answer == "I found Arcane, but nothing has been requested for it yet. Want me to start that?"
+
+
 def test_unresolved_media_plan_cannot_claim_request_started():
     result = [{"tool": "media_plan_goal", "status": "ok", "result": {
         "goal": {"media_type": "movie", "title_query": "10th Kingdom"},
@@ -1379,6 +1399,22 @@ def test_media_status_question_positive_regressions_item_9():
         "How is The Hobbit doing?",
     ):
         assert media_status_question(text) is True, text
+
+
+def test_can_i_watch_is_recognized_as_a_status_question_not_a_streaming_refusal():
+    # Real production bug found in a live naive-user sweep: "Can I watch
+    # Bird Box?" -- an extremely natural way for someone with zero
+    # knowledge of Radarr/Plex/cli_debrid to ask "is this available" --
+    # got a pure training-bias refusal from Qwen ("I don't have access to
+    # your TV or streaming services"), with no tool called at all. "watch"
+    # (unlike "get"/"request"/"add") strongly signals an availability
+    # check, not a fresh acquisition request, even with the "can I" modal
+    # frame. Must also outrank _descriptive_media_clue's person-name-shape
+    # suppression -- "Bird Box" looks exactly like a two-word person name.
+    assert media_status_question("Can I watch Bird Box?") is True
+    assert media_status_question("Am I able to watch Arcane?") is True
+    assert media_title_status_signal("Can I watch Bird Box?") is True
+    assert preflight_plan("Can I watch Bird Box?") == [("media_status", {"query": "Can I watch Bird Box?"})]
 
 
 def test_descriptive_media_clue_excludes_imperative_verb_plus_service_name():

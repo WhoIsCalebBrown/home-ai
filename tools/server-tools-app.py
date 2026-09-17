@@ -2087,6 +2087,18 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         before = title
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", title, flags=re.I)
+        # Real production bug found live: "I want to watch Deadpool and
+        # Wolverine" only had "I want" stripped (the request-verb regex
+        # above requires the verb be directly followed by the title, not an
+        # infinitive continuation), leaving "to watch Deadpool and
+        # Wolverine" as the literal query -- "to"/"watch" then diluted
+        # Radarr's own fuzzy title match, returning unrelated results
+        # ("Third Watch", "Don't Watch This") ranked ahead of the real
+        # exact "Deadpool & Wolverine" match (confirmed live: Radarr's own
+        # lookup already returns it as an exact #1 match once the query is
+        # clean). "to watch/see/stream" is the same request framing as
+        # "get me"/"find", just phrased as an infinitive.
+        title = re.sub(r"^\s*to\s+(?:watch|see|stream)\s+", "", title, flags=re.I)
         # Real production bug found live: "Search Sonarr for the show
         # Breaking Bad" only had "the show" stripped, leaving "Search Sonarr
         # for Breaking Bad" as the literal query sent to Sonarr's own
@@ -2115,13 +2127,6 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     elif episode_match:
         title = episode_match.group(2).strip(" .?!")
     title = re.sub(r"\s+and\s+keep(?:\s+it)?\s+permanently\s*$", "", title, flags=re.I).strip(" .?!")
-    # Captured BEFORE the classifier-word-stripping regex below runs, so
-    # callers have the closest available approximation of what the user
-    # actually said the title was (after only request-framing/politeness
-    # stripping, before any word-level cleanup that could itself introduce
-    # drift) -- this is what the query-drift guardrail compares a resolved
-    # candidate's title against.
-    title_hint = title
     if kind in {"movie", "tv", "anime"}:
         # "the" must only be stripped as REQUEST FRAMING ("the movie X", "the
         # whole series") -- stripping it as a bare standalone word destroyed
@@ -2134,6 +2139,23 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
+    # Real production bug found live: "Can you get me the show Silo"
+    # resolved an EXACT title match in Sonarr ("Silo" == "Silo") yet still
+    # produced a spurious "did you mean Silo (2023)?" clarification.
+    # title_hint used to be captured BEFORE the classifier-word-stripping
+    # above, specifically so the query-drift guardrail would compare the
+    # closest approximation of the user's literal words -- but "the show
+    # Silo" vs the resolved "Silo" scores only 0.47 similarity (well below
+    # the 0.7 drift threshold) purely because of the leading "the show"
+    # scaffolding, not because of any real mismatch. Any "the movie/show
+    # X" phrasing -- an extremely common way to ask for something -- would
+    # trip this false positive for an otherwise perfect match. Comparing
+    # the SAME classifier-word-stripped text used for the actual search
+    # query removes this false-positive source while still catching a
+    # genuine drift (a real mismatch between what the user asked for and
+    # what the search returned survives classifier-word stripping just
+    # fine on both sides).
+    title_hint = title
     return {"raw_goal": text, "media_type": kind, "title_query": title, "title_hint": title_hint, "artist_query": artist,
             "action": "ensure_available" if re.search(r"\b(get|give|grab|find|add|request|want|put)\b", lowered) else "inspect",
             "mode": mode, "season_scope": season_scope, "episode_scope": episode_scope,
@@ -2704,7 +2726,7 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         # intentionally lossy for acquisition planning (it removes articles
         # and media-type words), which is unsafe for exact workflow lookup.
         title_query = query
-        title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did|what about|how about)\s+", "", title_query, flags=re.I)
+        title_query = re.sub(r"^\s*(?:how(?:'s| is)|is|where is|did|what about|how about|can\s+i\s+watch|am\s+i\s+able\s+to\s+watch)\s+", "", title_query, flags=re.I)
         title_query = re.sub(r"\s+(?:doing|going|ready|found|find|downloading|downloaded|in plex|there yet)\b.*$", "", title_query, flags=re.I).strip(" .?!")
         requested_year = parts.get("requested_year")
         parenthesized_year = re.search(r"\((?:19|20)\d{2}\)", title_query)
@@ -2761,6 +2783,43 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         elif len(candidates) > 1:
             return {"found": False, "status": "AMBIGUOUS", "query": query,
                     "candidates": [{"workflow_id": x.get("workflow_id"), "canonical_identity": x.get("canonical_identity")} for x in candidates]}
+        # Real production gap found live: "What's the status of Arcane?" /
+        # "Can I watch Bird Box?" both named something already fully
+        # present on the server -- but Arcane/Bird Box were added directly
+        # in Sonarr/Radarr, never REQUESTED through Home-AI, so no
+        # persisted workflow row exists for them. A user with zero
+        # knowledge of how the system works has no reason to know that
+        # distinction; they just want to know if it's there. Fall back to
+        # a real, live, read-only identification (media_plan_goal is
+        # read/plan only -- it never adds, searches for acquisition, or
+        # mutates any provider) before giving up with a false "not found".
+        if not row:
+            live = await media_plan_goal({"goal": query, "media_type": args.get("media_type")})
+            live_identity = live.get("canonical_identity")
+            if live_identity:
+                if live.get("current_state") == "AMBIGUOUS_IDENTITY" and live.get("candidates"):
+                    return {"found": False, "status": "AMBIGUOUS", "query": query, "candidates": live["candidates"]}
+                # Translate media_plan_goal's own lifecycle vocabulary into
+                # media_status's, so the rest of this function (and every
+                # caller's existing canonical_state handling) never has to
+                # know two different sets of state names exist. "WANTED"
+                # (radarr/sonarr already monitors it) is a real, weaker
+                # form of REQUESTED; "IDENTIFIED" is a genuinely new case
+                # this fallback introduces -- we know exactly what the user
+                # means, but nothing has ever been requested for it, which
+                # is not the same claim as NOT_FOUND (we don't know what
+                # this is) or REQUESTED (something is already in motion).
+                live_state = live.get("current_state")
+                synthetic_state = {
+                    "AVAILABLE_IN_PLEX": "AVAILABLE", "IMPORTED": "ACQUIRED_NOT_VISIBLE",
+                    "WANTED": "REQUESTED", "IDENTIFIED": "NOT_REQUESTED",
+                }.get(live_state, live_state)
+                row = {
+                    "workflow_id": "", "canonical_identity": live_identity,
+                    "media_type": live.get("goal", {}).get("media_type"), "mode": live.get("mode", "standard"),
+                    "current_state": synthetic_state, "storage_class": "unknown",
+                    "season_scope": live.get("goal", {}).get("season_scope") or [],
+                }
     if not row:
         return {"found": False, "status": "NOT_FOUND", "workflow_id": workflow_id, "query": args.get("query") or args.get("title")}
     identity = row.get("canonical_identity") or {}
@@ -2851,6 +2910,13 @@ async def media_diagnose(args: dict[str, Any]) -> dict[str, Any]:
         diagnosis, boundary, next_action = "NO_ACCEPTABLE_CANDIDATE", "cli_debrid", "user_decision_required"
     elif state in {"PARTIAL_STATUS", "BACKEND_UNAVAILABLE"}:
         diagnosis, boundary, next_action = "LIVE_STATUS_INCOMPLETE", "status_backend", "retry_read_only_status_later"
+    elif state == "NOT_REQUESTED":
+        # media_status's live-identification fallback: the title was
+        # positively identified (it's a real, known movie/show), but
+        # nothing has ever been requested for it -- distinct from
+        # NOT_FOUND (we don't know what the user means) and from every
+        # in-progress state above (nothing is actually happening yet).
+        diagnosis, boundary, next_action = "IDENTIFIED_NOT_REQUESTED", None, "offer_to_request"
     else:
         diagnosis, boundary, next_action = "UNRESOLVED", "workflow", "inspect_canonical_workflow"
     return {"found": status.get("found", False), "workflow_id": status.get("workflow_id"),

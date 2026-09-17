@@ -41,7 +41,26 @@ def _load_app(tmp_path):
     module._standard_bridge_secret = lambda: "fake-test-token"
 
     async def fake_radarr_search(args):
+        # A more realistic fake: only match when the query is actually
+        # about Dune, empty otherwise -- media_status's live-identification
+        # fallback (added for "what's the status of X" when X was never
+        # formally requested through Home-AI) now calls media_plan_goal
+        # for ANY unmatched title, including genuinely-unknown ones
+        # (test_fresh_session_status_check_for_never_requested_title_is_honest
+        # queries "Interstellar"), so a fixture that always returns "Dune"
+        # regardless of query would falsely manufacture an ambiguous/found
+        # result for a title that should resolve to no match at all.
+        if "dune" not in str(args.get("query", "")).casefold():
+            return {"matches": []}
         return {"matches": [{"title": "Dune", "year": "2021", "tmdbId": 438631}]}
+
+    async def fake_sonarr_search(args):
+        # media_plan_goal's "unknown"-media-type branch (an unclassified
+        # title with no "movie"/"show" word) searches Radarr AND Sonarr in
+        # parallel -- mocked here purely so media_status's live-
+        # identification fallback never makes a real network call when
+        # testing a title with no explicit media type.
+        return {"matches": []}
 
     async def fake_arr_get(service, path, args=None):
         return []
@@ -50,6 +69,7 @@ def _load_app(tmp_path):
         return {"matched": False, "candidates": []}
 
     module.radarr_search = fake_radarr_search
+    module.sonarr_search = fake_sonarr_search
     module.arr_get = fake_arr_get
     module.plex_match_canonical_media = fake_plex_match_canonical_media
     return module, workflow_events

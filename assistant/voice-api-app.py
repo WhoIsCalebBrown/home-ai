@@ -1242,6 +1242,13 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             return f"The request for {title} did not make it into the media queue."
         if state == "NO_CANDIDATE":
             return f"I couldn't find a suitable copy of {title}."
+        if state == "NOT_REQUESTED":
+            # media_status's live-identification fallback: found is True
+            # (we know exactly what this is -- Radarr/Sonarr/Plex evidence
+            # positively identified it), but nothing has ever been
+            # requested for it. Distinct from the "found is False" branch
+            # above (we don't even know what the user means).
+            return f"I found {title}, but nothing has been requested for it yet. Want me to start that?"
         return f"I don't have a confirmed current status for {title} yet."
     if tool == "media_diagnose":
         state = str(result.get("canonical_state") or "UNKNOWN")
@@ -1259,6 +1266,8 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             return f"{title} is ready in Plex."
         if diagnosis == "LIVE_STATUS_INCOMPLETE":
             return f"I can't get a complete live status for {title} right now."
+        if diagnosis == "IDENTIFIED_NOT_REQUESTED":
+            return f"I found {title}, but nothing has been requested for it yet. Want me to start that?"
         return f"I don't have a confirmed diagnosis for {title} yet."
     # Weather is intentionally synthesized by Qwen from the enriched forecast
     # evidence below; natural_weather_summary remains a data-grounded fallback.
@@ -1843,9 +1852,24 @@ def media_status_question(text: str) -> bool:
         r"|\bwas\b.{0,30}\bever\s+requested\b",
         routed_text, re.I,
     )
-    if _descriptive_media_clue(routed_text) and not (strong_status_marker or past_request_status):
+    # Real production bug found live: "Can I watch Bird Box?" -- an
+    # extremely natural way for a user with zero knowledge of Radarr/Plex/
+    # cli_debrid to ask "is this available" -- was never even routed to a
+    # live check; it got a pure training-bias refusal from Qwen ("I don't
+    # have access to your TV or streaming services"), no tool called at
+    # all. "watch" as the verb (unlike "get"/"request"/"add") strongly
+    # signals an availability check, not a fresh acquisition request, even
+    # with the "can I" modal frame that was deliberately excluded from the
+    # generic question_frame/status_word combination below (to avoid
+    # conflating "Can I request X?" with a status question). Also outranks
+    # _descriptive_media_clue's person-name-shape suppression, the same way
+    # strong_status_marker/past_request_status already do -- a two-
+    # capitalized-word movie title ("Bird Box") looks exactly like a
+    # person's name to that heuristic.
+    can_i_watch_status = re.search(r"\bcan\s+i\s+watch\b|\bam\s+i\s+able\s+to\s+watch\b", routed_text, re.I)
+    if _descriptive_media_clue(routed_text) and not (strong_status_marker or past_request_status or can_i_watch_status):
         return False
-    if past_request_status:
+    if past_request_status or can_i_watch_status:
         return True
     if re.search(r"\bwhere(?:'s|\s+is|\s+it(?:'s|\s+is))\b", routed_text, re.I) and media_title_status_signal(routed_text):
         return True
@@ -1883,6 +1907,19 @@ def media_title_status_signal(text: str) -> bool:
         return False
     if re.search(r"\b(?:happening|going\s+on)\s+with\s+(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}[a-z0-9]+\b", text, re.I):
         return True
+    # "Can I watch <title>?"/"Am I able to watch <title>?" names a title
+    # directly after the verb, with no media noun ("movie"/"show") at all --
+    # the most naive, common way a user with zero knowledge of Radarr/Plex/
+    # cli_debrid would ask whether something is available. Real production
+    # bug: "Can I watch Bird Box?" reached media_status_question() (once
+    # that recognized the "can I watch" frame) but still never routed to
+    # the real capability because this function -- the OTHER required
+    # OR-branch -- had no matching shape for a bare title with no leading
+    # media noun.
+    can_watch_title = re.search(r"\b(?:can\s+i\s+watch|am\s+i\s+able\s+to\s+watch)\s+(.+?)\s*[?.!]*$", text, re.I)
+    if can_watch_title:
+        subject_tokens = re.findall(r"[a-z0-9]+", can_watch_title.group(1).casefold())
+        return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 1
     if re.search(r"\b(?:the|a)\s+(?:[a-z0-9]+\s+){1,5}(?:doing|ready|found|finish(?:ed)?|download(?:ing|ed)?|stuck|taking|happening|going on|in\s+plex|import(?:ed)?|there\s+yet|watch|pipeline)\b", text, re.I):
         return True
     # A possessive "my/our <title> request <status>" frame names a KNOWN,
