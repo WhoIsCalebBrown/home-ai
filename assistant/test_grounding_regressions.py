@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "web_recovery_queries"}
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -69,6 +69,8 @@ fresh_title_restatement = namespace["fresh_title_restatement"]
 media_intent = namespace["media_intent"]
 media_library_query = namespace["media_library_query"]
 _descriptive_media_clue = namespace["_descriptive_media_clue"]
+web_search_query_from_text = namespace["web_search_query_from_text"]
+web_recovery_queries = namespace["web_recovery_queries"]
 
 
 def test_download_followup_uses_recorded_sources():
@@ -234,7 +236,7 @@ def test_recent_front_door_events_are_local_history_not_web():
     assert preflight_plan("Show me recent front door events.")[0][0] == "frigate_recent_activity"
     assert preflight_plan("Can you check the camera right now?") == [("frigate_snapshot", {"camera": "front_door"})]
     assert preflight_plan("What is happening at the front door?") == [("frigate_snapshot", {"camera": "front_door"})]
-    assert preflight_plan("What happened today in Canada?") == [("web_search", {"query": "What happened today in Canada?"})]
+    assert preflight_plan("What happened today in Canada?") == [("web_search", {"query": "What happened today in Canada"})]
 
 
 def test_plex_recency_repairs_are_bounded_to_explicit_library_context():
@@ -276,13 +278,13 @@ def test_camera_stats_cannot_ground_visual_claims():
 
 
 def test_current_external_questions_prefer_research():
-    assert preflight_plan("What are Donald Trump's latest trade policies?") == [("web_search", {"query": "What are Donald Trump's latest trade policies?"})]
-    assert preflight_plan("What's the newest version of Ollama?") == [("web_search", {"query": "What's the newest version of Ollama?"})]
+    assert preflight_plan("What are Donald Trump's latest trade policies?") == [("web_search", {"query": "What are Donald Trump's latest trade policies"})]
+    assert preflight_plan("What's the newest version of Ollama?") == [("web_search", {"query": "What's the newest version of Ollama"})]
 
 
 def test_politics_today_is_web_not_camera():
     assert current_external_question("Can you give me a rundown of what happened today in American politics?")
-    assert preflight_plan("Can you give me a rundown of what happened today in American politics?") == [("web_search", {"query": "Can you give me a rundown of what happened today in American politics?"})]
+    assert preflight_plan("Can you give me a rundown of what happened today in American politics?") == [("web_search", {"query": "what happened today in American politics"})]
 
 
 def test_explicit_web_search_retries_unresolved_topic():
@@ -696,7 +698,24 @@ def test_plex_acquisition_followup_uses_download_investigation():
 def test_current_news_followup_about_ai_uses_web():
     conversation_context.clear()
     turn_context("scenario", "What's the biggest news story in Canada today?")
-    assert preflight_plan("Anything interesting with AI specifically?") == [("web_search", {"query": "Anything interesting with AI specifically?"})]
+    assert preflight_plan("Anything interesting with AI specifically?") == [("web_search", {"query": "Anything interesting with AI specifically"})]
+
+
+def test_conversational_news_request_becomes_a_clean_search_query():
+    # A verbose, conversational phrasing must not be sent to the search
+    # backend verbatim: request-verb scaffolding and literal "today"/"now"
+    # tokens reliably return zero results even though the underlying topic
+    # has live coverage, since recency is already carried by recency_days.
+    assert web_search_query_from_text(
+        "can you give me an in depth review on the canadian news for today"
+    ) == "canadian news"
+    assert web_search_query_from_text("what is happening in canada today") == "what is happening in canada"
+    assert preflight_plan("can you give me an in depth review on the canadian news for today") == [
+        ("web_search", {"query": "canadian news"})
+    ]
+    recovery = web_recovery_queries("can you give me an in depth review on the canadian news for today")
+    assert recovery[0] == "canadian news"
+    assert all("2026" not in query and "September" not in query for query in recovery)
 
 
 def test_media_correction_keeps_media_intent():

@@ -873,6 +873,35 @@ def explicit_web_search_request(text: str) -> bool:
     return bool(re.search(r"\b(?:search|look)\b.{0,24}\b(?:web|online|internet)\b|\bweb\s+search\b", text, re.I))
 
 
+_WEB_QUERY_LEADING_SCAFFOLDING = re.compile(
+    r"^\s*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?:give\s+me|tell\s+me|show\s+me|provide\s+me\s+with)?\s*"
+    r"(?:an?\s+)?(?:in[\s-]?depth|detailed|full|quick|brief)?\s*"
+    r"(?:review|rundown|summary|overview|report|update)?\s*"
+    r"(?:on|of|about|regarding|for)?\s*",
+    re.I,
+)
+_WEB_QUERY_TRAILING_FILLER = re.compile(r"\b(?:for\s+)?(?:today|right\s+now|currently|now)\b\s*[?.!]*\s*$", re.I)
+
+
+def web_search_query_from_text(text: str) -> str:
+    """Turn a conversational request into a search-engine-friendly query.
+
+    A raw sentence like "can you give me an in depth review on the canadian
+    news for today" reliably returns zero results from SearXNG even though
+    the underlying topic ("canadian news") has plenty of live coverage -- the
+    request-verb scaffolding and literal "today"/"now" tokens don't match
+    article text. Strip that framing generically rather than special-casing
+    any one topic.
+    """
+    stripped = text.strip()
+    cleaned = _WEB_QUERY_LEADING_SCAFFOLDING.sub("", stripped, count=1)
+    cleaned = _WEB_QUERY_TRAILING_FILLER.sub("", cleaned).strip(" ?.!")
+    cleaned = re.sub(r"^\s*the\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or stripped
+
+
 def historical_camera_question(text: str) -> bool:
     return bool(
         re.search(r"\b(?:ago|earlier|yesterday|last\s+(?:night|hour|evening)|this\s+(?:morning|afternoon)|at\s+\d|around\s+\d|about\s+\d|over\s+\d)\b", text, re.I)
@@ -2243,8 +2272,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # events" cannot be mistaken for public news, but before any inherited
     # domain can influence the model.
     if explicit_web_search_request(text) or current_external_question(text):
-        query = context.get("unresolved_request") if explicit_web_search_request(text) else text.strip()
-        return [("web_search", {"query": query or text.strip()})]
+        query = context.get("unresolved_request") if explicit_web_search_request(text) else web_search_query_from_text(text)
+        return [("web_search", {"query": query or web_search_query_from_text(text)})]
     list_match = re.search(r"\b(?:grocery|shopping|packing|todo|to-do)\s+list\b", text, re.I)
     list_name = (list_match.group(0).rsplit(" ", 1)[0].casefold() if list_match else "grocery")
     if re.search(r"\b(?:what(?:'s| is)|show|read)\b.*\blist\b", text, re.I):
@@ -2401,7 +2430,7 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         offset = 1 if re.search(r"\btomorrow\b", t) else 0
         return [("weather_forecast", {"location": location, "days_from_now": offset})]
     if re.search(r"\b(news|headlines?|technology|tech|ai|artificial intelligence|current events|politics?|government|congress)\b", t):
-        return [("web_search", {"query": text.strip()})]
+        return [("web_search", {"query": web_search_query_from_text(text)})]
     if re.search(r"\b(?:last|most recent|newest|recently)\b.*\b(?:add|added|in plex|to plex|addition)\b|\bwhat(?:'s| is) the last thing added\b|\b(?:what(?:'s| is)\s+new|latest|newest)\s+(?:in|on)\s+(?:my\s+)?plex\b|\bplex\b.*\b(?:latest|newest|addition|add|added)\b", t):
         return [("plex_recently_added", {"limit": 1})]
     if re.search(r"\b(lidarr|lidar)\b", t) and re.search(r"\b(plex|plexium|added|adding|going|coming|download|music)\b", t):
@@ -2516,11 +2545,15 @@ def web_result_useful(item: dict) -> bool:
 
 
 def web_recovery_queries(user_text: str) -> list[str]:
-    today = datetime.now().strftime("%B %-d %Y")
+    # recency_days already carries the freshness signal to the search
+    # backend; appending a literal date/"today" to the query text just makes
+    # it less likely to match real article text, so recovery variants stay
+    # topic-based instead.
+    base = web_search_query_from_text(user_text)
     return [
-        f"{user_text} {today}",
-        f"{user_text} major developments",
-        f"{user_text} politics economy provincial news",
+        base,
+        f"{base} major developments",
+        f"{base} politics economy provincial news",
     ]
 
 
