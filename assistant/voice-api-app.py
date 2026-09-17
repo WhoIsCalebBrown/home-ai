@@ -2308,6 +2308,8 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
         category = library_category_followup(text)
         if category:
             scope["category"] = category
+    elif "plex_artist_library" in names:
+        operation = "PLEX_MUSIC_ARTIST_INVENTORY"
     elif "unraid_storage_status" in names:
         arguments = next((args for name, args in planned if name == "unraid_storage_status"), {})
         operation = "STORAGE_CAPACITY"
@@ -2979,6 +2981,20 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
                 "goal": retained_media_goal(identity, request=True),
                 "media_type": identity.get("media_type"),
             })]
+    named_library_match = re.fullmatch(
+        r"\s*is\s+(.+?)\s+(?:in|on)\s+(?:my\s+)?(?:plex\s+)?library\s*[?!.,]*\s*",
+        text,
+        re.I,
+    )
+    # A named-item library question is only safely deterministic here when
+    # the immediately preceding successful operation established a Plex Music
+    # artist inventory. Treating every "Is X in my library?" as a generic
+    # Plex lookup intercepted established media workflow conversations whose
+    # canonical identity and status belong in media_plan_goal.
+    if named_library_match and context.get("latest_operation") == "PLEX_MUSIC_ARTIST_INVENTORY":
+        query = named_library_match.group(1).strip(" .?!")
+        if query.casefold() not in {"it", "that", "this", "the one"}:
+            return [("plex_library_lookup", {"query": query, "library": "Music"})]
     # A collective inventory question is read-only and intentionally broad:
     # search the configured Plex libraries for the family query, then group
     # only the returned evidence.  A request such as "Get Avengers" does
@@ -3685,6 +3701,7 @@ _REFERENT_ARGUMENT_KEYS = {
     "media_status": "title",
     "media_diagnose": "title",
     "plex_search": "query",
+    "plex_artist_library": "query",
     "plex_match_canonical_media": "title",
 }
 

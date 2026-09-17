@@ -2542,6 +2542,25 @@ def _plot_description_hint(text: str) -> bool:
     return len(clauses) >= 2 and len(re.findall(r"[a-zA-Z']+", clauses[-1])) >= 3
 
 
+def _descriptive_discovery_query(text: str) -> str:
+    """Remove conversational memory framing from an accumulated clue query.
+
+    UnresolvedSubject intentionally retains every user clue, but the web
+    resolver should search those clues rather than the sentence saying the
+    user is trying to remember something. Media type, genre, people, plot,
+    year, and creator words all remain intact.
+    """
+    query = re.sub(r"\s+", " ", str(text or "").strip())
+    query = re.sub(
+        r"^\s*(?:i(?:'m|\s+am)\s+trying\s+to\s+remember|i\s+(?:can't|cannot)\s+remember)"
+        r"\s+(?:a|an|the)?\s*",
+        "",
+        query,
+        flags=re.I,
+    )
+    return query.strip(" .?!") or str(text or "").strip()
+
+
 def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | None:
     """Extract a plausible title from the top web_search result -- never
     canonical identity on its own (natural-language text is NOT canonical
@@ -2558,6 +2577,8 @@ def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | No
     candidate = str(ordered[0].get("title") or "").strip()
     if not candidate:
         return None
+    candidate = re.sub(r"\s*\(\d{4}\)\s+(?:official\s+)?(?:trailer|clip|scene|review)\b.*$", "", candidate, flags=re.I)
+    candidate = re.split(r"\s*[-|:]\s*(?:official\s+)?(?:trailer|clip|scene|review|watch)\b", candidate, maxsplit=1, flags=re.I)[0]
     candidate = re.split(r"\s*[-|:]\s*(?:imdb|rotten tomatoes|wikipedia|the movie database|tmdb|plex)\b", candidate, flags=re.I)[0]
     candidate = re.sub(r"\s*\(\d{4}\)\s*$", "", candidate).strip()
     return candidate or None
@@ -2684,7 +2705,8 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
         person_hint = artist or _person_mention_hint(parts["raw_goal"], artist)
         descriptive_hint = bool(person_hint or _plot_description_hint(parts["raw_goal"]))
         if not identity and not ambiguous and descriptive_hint:
-            discovered_title = await _web_discover_title(title, person_hint, "movie")
+            discovery_query = _descriptive_discovery_query(parts["raw_goal"])
+            discovered_title = await _web_discover_title(discovery_query, person_hint, "movie")
             if discovered_title and discovered_title.casefold() != title.casefold():
                 web_lookup = await radarr_search({"query": discovered_title})
                 web_matches = web_lookup.get("matches", [])

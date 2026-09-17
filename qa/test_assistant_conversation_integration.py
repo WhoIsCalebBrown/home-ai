@@ -286,6 +286,21 @@ class FakeToolsBackend:
             # is no fixture to provide here because there is nothing to
             # fake: the real tool does not exist.
             return {"tool": name, "status": "error", "result": {"error": "That tool is not enabled."}}
+        if name == "plex_artist_library":
+            query = str(arguments.get("query", ""))
+            albums = []
+            artist = query
+            for entry in self.library.values():
+                candidate = entry["identity"]
+                if candidate.get("media_type") != "album":
+                    continue
+                candidate_artist = str(candidate.get("artist") or "")
+                if query.casefold() in candidate_artist.casefold():
+                    artist = candidate_artist
+                    albums.append({"title": candidate.get("title"), "year": candidate.get("year")})
+            return {"tool": name, "status": "ok", "result": {
+                "found": bool(albums), "query": query, "artist": artist, "albums": albums,
+            }}
         if name in {"plex_search", "plex_library_lookup"}:
             query = str(arguments.get("query", ""))
             matches = []
@@ -2293,6 +2308,27 @@ async def test_knowledge_to_request_handoff(session):
     action = session.app.pending.get(session.client_id)
     assert action is not None, "a request following identity resolution must stop at a real confirmation prompt"
     assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_music_inventory_operation_persists_for_named_album_followup(session):
+    session.backend.seed_library(
+        "OK Computer", media_type="album", state="AVAILABLE_IN_PLEX",
+        foreign_album_id="album-ok-computer", artist="Radiohead", year=1997,
+    )
+
+    reply1 = await session.turn("What Radiohead music do I have?")
+    assert "OK Computer" in reply1
+    state = session.app.conversation_context[session.client_id]
+    assert state["latest_operation"] == "PLEX_MUSIC_ARTIST_INVENTORY"
+    assert state["latest_resolved_referent"] == "Radiohead"
+
+    calls_before = len(session.backend.call_log)
+    reply2 = await session.turn("Is OK Computer in my library?")
+    calls = session.backend.call_log[calls_before:]
+    assert ("plex_library_lookup", {"query": "OK Computer", "library": "Music"}) in calls
+    assert "OK Computer" in reply2
+    assert not any(name == "media_plan_goal" for name, _ in calls)
 
 
 # --- Structural unreachability of media_standard_request from Qwen's own --

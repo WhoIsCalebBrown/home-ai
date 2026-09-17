@@ -554,6 +554,13 @@ def test_collective_library_inventory_is_read_only_while_acquisition_stays_canon
         ("plex_artist_library", {"query": "Radiohead"})
     ]
     assert preflight_plan("How many films are in my library?") == [("plex_library_counts", {})]
+    assert preflight_plan("Is OK Computer in my library?", {
+        "latest_operation": "PLEX_MUSIC_ARTIST_INVENTORY",
+        "latest_resolved_referent": "Radiohead",
+    }) == [
+        ("plex_library_lookup", {"query": "OK Computer", "library": "Music"})
+    ]
+    assert preflight_plan("Is Cowboy Bebop in my library?") == []
     assert preflight_plan("Do I have all the Avengers movies?") == [
         ("plex_library_lookup", {"query": "Avengers"})
     ]

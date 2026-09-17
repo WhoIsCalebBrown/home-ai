@@ -28,6 +28,8 @@ spec = importlib.util.spec_from_file_location("server_tools_app_title_test", Pat
 _module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(_module)
 _media_goal_parts = _module._media_goal_parts
+_descriptive_discovery_query = _module._descriptive_discovery_query
+_web_discovery_title_from_results = _module._web_discovery_title_from_results
 _normalize_identity_title = _module._normalize_identity_title
 _evaluate_plex_candidate = _module._evaluate_plex_candidate
 
@@ -73,6 +75,22 @@ def test_descriptive_question_and_infinitive_request_frames_are_not_title_text()
         "I want to add the movie about a linguist communicating with aliens.", None
     )["title_query"] == "about a linguist communicating with aliens"
     assert _media_goal_parts("Name of the Rose", None)["title_query"] == "Name of the Rose"
+
+
+def test_accumulated_memory_clues_build_a_clean_discovery_query():
+    assert _descriptive_discovery_query(
+        "I'm trying to remember a Brad Pitt movie. He does fly fishing. I think it's in Montana."
+    ) == "Brad Pitt movie. He does fly fishing. I think it's in Montana"
+    assert _descriptive_discovery_query(
+        "I'm trying to remember a science-fiction movie. A soldier keeps reliving the same battle."
+    ) == "science-fiction movie. A soldier keeps reliving the same battle"
+
+
+def test_web_discovery_extracts_title_from_trailer_result():
+    assert _web_discovery_title_from_results([{
+        "title": "A River Runs Through It (1992) Trailer #1 - YouTube",
+        "domain": "youtube.com",
+    }]) == "A River Runs Through It"
 
 
 def test_naive_user_request_phrasings_strip_cleanly_to_a_bare_title():
