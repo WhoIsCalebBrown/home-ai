@@ -97,10 +97,16 @@ model-reachable.
 
 ## New Unraid MCP Adapter Tools (added this session)
 
+Final status after the definitive live 13-query acceptance sweep (run
+after 5 real routing/data bugs found and fixed -- see commits 99e9588,
+daaeade, b2dad56, bda46d5, and the fifth-instance fix in b2dad56/bda46d5).
+All 13 acceptance queries now return correct, natural, mutually-consistent
+answers verified against the real Unraid MCP's live data.
+
 | Tool | Status | Live Result |
 |---|---|---|
-| `unraid_storage_status` | see final report | live-tested this session |
-| `unraid_disk_health` | see final report | live-tested this session |
-| `unraid_container_status` | see final report | live-tested this session |
-| `unraid_container_metrics` | see final report | live-tested this session |
-| `unraid_system_health` | see final report | live-tested this session |
+| `unraid_storage_status` | VALIDATED_LIVE | "How full is the cache drive?" / "How much space is left on the array?" / "Which disk is fullest?" all answered correctly with real byte-accurate percentages, cross-checked against a direct MCP call |
+| `unraid_disk_health` | VALIDATED_LIVE | "Is the array healthy?" / "Are any disks having errors?" correctly identified the one real disabled parity disk without false-flagging virtual devices (flash/Docker vDisk/Log) as unhealthy |
+| `unraid_container_status` | VALIDATED_LIVE (after a real bug fix) | Initially reported "Plex isn't running" while Plex was plainly running (CONTAINER_DISPLAY_NAMES "Plex" != real Docker name "Plex-Media-Server", an exact-match miss) -- fixed with a case-insensitive substring fallback against the live container list (bda46d5); "Is Plex running?", "How long has Plex been running?", "How much memory is Home-AI using?" all now correct and cross-consistent with unraid_container_metrics' own numbers |
+| `unraid_container_metrics` | VALIDATED_LIVE for its designed questions; KNOWN GAP for storage-breakdown follow-ups | "What's using the most RAM/CPU?", "Are any containers unhealthy?" all correct. NOT valid evidence for a referential storage/cache "what's using it" follow-up -- see capability-gap.md's "Live Continuity-Test Finding" for a case where its CPU/RAM numbers were presented as disk-space consumption; this is a discovery/candidate-filtering gap, not a data-correctness bug in the tool itself |
+| `unraid_system_health` | VALIDATED_LIVE | "Give me a quick server status." / "Is anything wrong with the server?" both produced accurate, evidence-backed summaries (array state, CPU/temp, container count, zero fabricated health score) |
