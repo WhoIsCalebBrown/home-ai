@@ -2526,7 +2526,18 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         return [("investigate_downloads", {})]
     if re.search(r"what(?:'s| is) (?:currently )?downloading|anything (?:stalled|stuck)|what(?:'s| is) stuck", t):
         return [("investigate_downloads", {})]
-    if re.search(r"(why|isn't|is not).*(plex|episode|show|movie).*(there|showing|visible|missing)|why.*in plex", t):
+    # Real production bug: the previous version of this check required the
+    # why/negation, media-word, and absence-word groups to appear in that
+    # fixed left-to-right order ("why...movie...missing"). The overwhelmingly
+    # natural phrasing "Why isn't The Matrix showing up in my Plex library?"
+    # puts the absence word ("showing") BEFORE the media word ("Plex"), so it
+    # never matched at all and fell through to a generic plex_library_counts
+    # answer instead of the tool built specifically to explain a missing
+    # title (investigate_plex_missing, which also checks Sonarr/Radarr/
+    # qBittorrent). Match each concept independently of order instead.
+    if (re.search(r"\bwhy\b|\bisn't\b|\bis not\b", t)
+            and re.search(r"\b(plex|episode|show|movie)\b", t)
+            and re.search(r"\b(there|showing|visible|missing)\b", t)):
         return [("investigate_plex_missing", {"query": investigation_query_from_speech(text)})]
     if re.search(r"\b(travis|utopia|album|artist|music|import|quarantine|processed|my eyes)\b", t):
         return [("investigate_media_pipeline", {"entity_type": "auto", "query": investigation_query_from_speech(text)})]

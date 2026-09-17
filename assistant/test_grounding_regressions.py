@@ -719,6 +719,20 @@ def test_conversational_news_request_becomes_a_clean_search_query():
     assert all("2026" not in query and "September" not in query for query in recovery)
 
 
+def test_natural_why_isnt_it_in_plex_phrasing_reaches_investigate_plex_missing():
+    # Real production bug found by the user directly inspecting a live
+    # Open WebUI transcript: "Why isn't The Matrix showing up in my Plex
+    # library?" fell through to a generic plex_library_counts answer
+    # ("you have 1600 movies, might not be imported") instead of the tool
+    # built specifically to explain a missing title (investigate_plex_missing,
+    # which also checks Sonarr/Radarr/qBittorrent). The old regex required
+    # its why/negation, media-word, and absence-word groups to appear in a
+    # fixed left-to-right order, but this overwhelmingly natural phrasing
+    # puts the absence word ("showing") BEFORE the media word ("Plex").
+    assert preflight_plan("Why isn't The Matrix showing up in my Plex library?")[0][0] == "investigate_plex_missing"
+    assert preflight_plan("Why is the movie missing from Plex?")[0][0] == "investigate_plex_missing"
+
+
 def test_sentence_initial_capitalization_is_not_mistaken_for_a_person_name():
     # "Any Sonarr health issues?" and "Search Radarr for the movie Inception."
     # both start with an ordinary capitalized word followed by a capitalized
