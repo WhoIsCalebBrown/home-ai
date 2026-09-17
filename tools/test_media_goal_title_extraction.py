@@ -65,6 +65,36 @@ def test_search_service_for_scaffolding_is_stripped_from_the_title_query():
     assert _media_goal_parts("Search Lidarr for Rodeo by Travis Scott", None)["title_query"] == "Rodeo"
 
 
+def test_naive_user_request_phrasings_strip_cleanly_to_a_bare_title():
+    # Real production bugs found in a live naive-user sweep: several
+    # extremely common, zero-jargon ways to ask for or ask about media
+    # left request-framing words in the literal query sent to Radarr/
+    # Sonarr's own fuzzy lookup, diluting or breaking the match.
+    assert _media_goal_parts("I want to watch Deadpool and Wolverine", None)["title_query"] == "Deadpool and Wolverine"
+    assert _media_goal_parts("I want to see the movie Inception", None)["title_query"] == "Inception"
+    assert _media_goal_parts("Can I watch Bird Box?", None)["title_query"] == "Bird Box"
+    assert _media_goal_parts("Am I able to watch Arcane?", None)["title_query"] == "Arcane"
+
+
+def test_ampersand_and_and_are_treated_as_the_same_connecting_word():
+    # Real production bug found live: "I want to watch Deadpool and
+    # Wolverine" failed to resolve as an exact match against Radarr's own
+    # "Deadpool & Wolverine" -- a real title using "&" is exactly how a
+    # person would naturally say the same title with "and" out loud, but
+    # bare token comparison drops "&" as punctuation entirely, so the
+    # connecting word only survives on the user's side, producing a false
+    # ambiguity between the real movie and two unrelated titles that also
+    # merely contain "wolverine".
+    matches = [
+        {"title": "Deadpool & Wolverine", "year": "2024", "tmdbId": 533535},
+        {"title": "Wolverine and the X-Men", "year": "2009", "tmdbId": 1},
+        {"title": "Wolverine", "year": "2011", "tmdbId": 2},
+    ]
+    identity, ambiguous, _candidates = _module._pick_match(matches, "Deadpool and Wolverine")
+    assert ambiguous is False
+    assert identity["title"] == "Deadpool & Wolverine"
+
+
 def test_similarly_named_titles_are_never_conflated_by_normalization():
     """Spec item #5: "The Room", "Room", "A Room", "Room 104", "The
     Roommate", "Room (2015)" must never collapse into the same normalized

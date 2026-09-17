@@ -1941,6 +1941,23 @@ def media_title_status_signal(text: str) -> bool:
     # blind, with no shared conversation_context, would naturally use.
     if re.search(r"\b(?:did|have|has)\s+(?:i|we)\b.{0,25}\b(?:request(?:ed)?|ask(?:ed)?(?:\s+for)?)\b", text, re.I):
         return True
+    # Real production bug found live: "What's the status of Arcane?" (a
+    # bare single-word title, no "request"/"movie"/"show" noun, no prior
+    # conversational referent) reached media_status_question() (its own
+    # strong_status_marker already recognizes "status of") but never
+    # routed to the real capability -- the generic fallback at the bottom
+    # of this function splits the subject on the word "status" itself
+    # assuming it comes at the END of the phrase ("the movie X doing" ->
+    # split on "doing" -> keep "the movie X"), but "status OF X" has the
+    # status word in the MIDDLE with the title AFTER it, so splitting on
+    # "status" discarded "of Arcane" entirely and kept only "the". A
+    # "status of" frame is unambiguous enough that even a single
+    # distinctive title word is trusted (unlike "where's X", which
+    # requires >=2 words to avoid false positives on "where's my keys").
+    status_of_match = re.search(r"\bstatus\s+of\s+(?:the\s+|my\s+|our\s+)?(.+?)\s*[?.!]*$", text, re.I)
+    if status_of_match:
+        subject_tokens = re.findall(r"[a-z0-9]+", status_of_match.group(1).casefold())
+        return len([token for token in subject_tokens if token not in {"the", "a", "an"}]) >= 1
     # A standalone "where's <title>?" is a read-only lifecycle question when
     # the subject is title-shaped. Keep this bounded to multi-token subjects
     # and reject common non-media/location nouns.
@@ -4066,7 +4083,27 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             elif status == "failed_ingestion":
                 full = "I couldn't hand that off to your media queue."
             elif status in {"rejected", "disabled"}:
-                full = "I couldn't hand that off to your media system."
+                # Real production gap found live: "Can you get me the show
+                # Silo" -> confirmed -> "I couldn't hand that off to your
+                # media system." -- technically honest (this server has TV
+                # show requests deliberately turned off,
+                # STANDARD_SEASON_WRITES_ENABLED=false), but gave the user
+                # zero explanation why, which reads as a broken/opaque
+                # failure rather than a real, nameable limitation. A user
+                # with zero knowledge of the system's internals has no way
+                # to know movies work but shows don't, or that a session
+                # simply expired, unless told directly.
+                reason = execution_reason
+                if reason in {"STANDARD_SEASON_WRITES_DISABLED", "STANDARD_EPISODE_SCOPE_UNSUPPORTED"}:
+                    full = "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
+                elif reason == "STANDARD_MOVIE_WRITES_DISABLED":
+                    full = "Movie requests aren't turned on for me yet."
+                elif reason in {"STANDARD_MEDIA_WRITES_DISABLED", "STANDARD_MEDIA_BACKEND_NOT_READY", "BRIDGE_SECRET_MISSING"}:
+                    full = "The media request system isn't available right now, so nothing was requested."
+                elif reason in {"CONFIRMATION_BINDING_REQUIRED", "CONFIRMATION_SESSION_OR_STATUS_INVALID"}:
+                    full = "That confirmation expired or didn't match up -- go ahead and ask again."
+                else:
+                    full = "I couldn't hand that off to your media system."
             else:
                 full = "I couldn't confirm that media request was accepted."
         else:

@@ -125,6 +125,7 @@ class FakeToolsBackend:
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
+        self.media_standard_request_override: dict | None = None
         self.person_index: dict[str, str] = {}  # casefold(person name) -> title, mirrors the real web-discovery fallback's person-hint -> title resolution (tools/server-tools-app.py's _web_discover_title), tested there directly against real functions -- this fake only proves the ASSISTANT-side handoff after identity resolves, not the discovery mechanism itself.
 
     def seed_person(self, person: str, title: str) -> None:
@@ -309,6 +310,10 @@ class FakeToolsBackend:
             workflow_id = arguments.get("workflow_id")
             confirmation_context = arguments.get("confirmation_context") or {}
             confirmation_id = confirmation_context.get("confirmation_id")
+            if self.media_standard_request_override is not None:
+                if confirmation_id:
+                    self.consumed_confirmations.add(confirmation_id)
+                return {"tool": name, "status": "ok", "result": dict(self.media_standard_request_override)}
             if confirmation_id in self.consumed_confirmations:
                 return {"tool": name, "status": "ok", "result": {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}}
             if confirmation_id:
@@ -586,6 +591,28 @@ async def test_full_discover_offer_accept_write_conversation(session):
 
     reply5 = await session.turn("Go for it.")
     assert len(session.backend.submitted_writes) == 1, "a stale/replayed confirmation must never submit twice"
+
+
+@pytest.mark.asyncio
+async def test_disabled_tv_writes_gives_a_clear_reason_not_a_dead_end(session):
+    # Real production bug found in a live naive-user sweep: "Can you get
+    # me the show Silo" -> confirmed -> "I couldn't hand that off to your
+    # media system." This server has TV show requests deliberately turned
+    # off (STANDARD_SEASON_WRITES_ENABLED=false) -- a real, nameable
+    # limitation -- but the old message gave zero explanation, reading
+    # like a broken/opaque failure instead of "shows aren't enabled yet."
+    session.backend.seed_library("Silo", media_type="tv", state="ABSENT", tvdb_id="371980")
+    await session.turn(
+        "Can you get me the show Silo",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get the show Silo", "media_type": "tv"}}},
+        ]}}],
+    )
+    assert session.app.pending.get(session.client_id) is not None, "must have staged a real confirmation"
+    session.backend.media_standard_request_override = {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False}
+    reply = await session.turn("yes")
+    assert reply == "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
+    assert not session.backend.submitted_writes
 
 
 # --- Offer decline (#9) ------------------------------------------------

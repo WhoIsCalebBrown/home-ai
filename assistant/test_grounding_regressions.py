@@ -1417,6 +1417,21 @@ def test_can_i_watch_is_recognized_as_a_status_question_not_a_streaming_refusal(
     assert preflight_plan("Can I watch Bird Box?") == [("media_status", {"query": "Can I watch Bird Box?"})]
 
 
+def test_status_of_bare_title_is_recognized_with_no_media_noun_or_referent():
+    # Real production bug found live: "What's the status of Arcane?" (a
+    # bare single-word title, no "request"/"movie"/"show" noun, no prior
+    # conversational referent) never routed to media_status at all --
+    # Qwen answered from pure training bias with no tool called. Root
+    # cause: media_title_status_signal's generic fallback splits the
+    # subject on the word "status" itself, assuming it comes at the END
+    # of the phrase ("the movie X doing" -> split on "doing" -> keep "the
+    # movie X"), but "status OF X" has the status word in the MIDDLE with
+    # the title AFTER it, so splitting on "status" discarded "of Arcane"
+    # entirely and kept only "the".
+    assert media_title_status_signal("What's the status of Arcane?") is True
+    assert preflight_plan("What's the status of Arcane?") == [("media_status", {"query": "What's the status of Arcane?"})]
+
+
 def test_descriptive_media_clue_excludes_imperative_verb_plus_service_name():
     """Regression: a bare two-capitalized-word shape alone is not enough
     signal for a person mention -- "Restart Lidarr" must not be mistaken

@@ -2087,6 +2087,15 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         before = title
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", title, flags=re.I)
+        # Real production bug found live: "Can I watch Bird Box?" -- an
+        # availability-check question, not an acquisition request -- kept
+        # "Can I watch" as part of the literal query sent to Radarr's own
+        # fuzzy lookup (this function also backs media_status's live-
+        # identification fallback, so a status QUESTION reaches this same
+        # parser, not just an acquisition command). Same request-framing
+        # class as "can you"/"want", just with the "I" pronoun and "watch"
+        # verb.
+        title = re.sub(r"^\s*(?:can\s+i\s+watch|am\s+i\s+able\s+to\s+watch)\s+", "", title, flags=re.I)
         # Real production bug found live: "I want to watch Deadpool and
         # Wolverine" only had "I want" stripped (the request-verb regex
         # above requires the verb be directly followed by the title, not an
@@ -2175,9 +2184,21 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
     """
     if not matches:
         return None, False, []
-    title_cf = title.casefold()
+    # Real production bug found live: "I want to watch Deadpool and
+    # Wolverine" failed to resolve as an exact match against Radarr's own
+    # "Deadpool & Wolverine" -- a real title using "&" is exactly how a
+    # person would naturally say the same title with "and" out loud, but
+    # bare casefold/token comparison treats them as entirely different
+    # words ("&" isn't a word character at all, so it vanishes from
+    # tokens, dropping the connecting word entirely on the candidate side
+    # while the user's own natural "and" survives on the query side).
+    # Normalizing "&" to "and" before every comparison below makes both
+    # sides agree.
+    def _amp(value: str) -> str:
+        return re.sub(r"\s*&\s*", " and ", value)
+    title_cf = _amp(title).casefold()
     artist_cf = (artist or "").casefold()
-    exact = [m for m in matches if str(m.get("title") or m.get("artistName") or "").casefold() == title_cf
+    exact = [m for m in matches if _amp(str(m.get("title") or m.get("artistName") or "")).casefold() == title_cf
               and (not artist_cf or artist_cf in json.dumps(m).casefold())]
     if len(exact) == 1:
         return exact[0], False, []
@@ -2213,7 +2234,7 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
             return kai_matches[0], False, []
     scored = []
     for row in matches:
-        candidate = str(row.get("title") or row.get("artistName") or "").casefold()
+        candidate = _amp(str(row.get("title") or row.get("artistName") or "")).casefold()
         tokens = set(re.findall(r"[a-z0-9]+", candidate))
         score = len(wanted & tokens) / max(len(wanted), 1)
         if artist_cf and artist_cf in json.dumps(row).casefold():
