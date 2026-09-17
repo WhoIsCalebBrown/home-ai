@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -2485,7 +2486,7 @@ async def _web_discover_title(description_hint: str, person_hint: str | None, me
     return _web_discovery_title_from_results(result.get("results") or [])
 
 
-async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
+async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
     """Read/plan only. It never adds, searches, downloads, imports, or mutates a provider."""
     parts = _media_goal_parts(args.get("goal", ""), args.get("media_type"))
     kind, title, artist = parts["media_type"], parts["title_query"], parts["artist_query"]
@@ -2700,7 +2701,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
             # drift, and canonical identity all get the SAME real logic the
             # movie/tv branches already use -- no duplicated availability
             # code, no second parallel resolution path.
-            return await media_plan_goal({**args, "media_type": identity["_domain"]})
+            return await _media_plan_goal_locked({**args, "media_type": identity["_domain"]})
         if ambiguous and near_candidates:
             summaries = []
             for row in near_candidates[:3]:
@@ -2880,7 +2881,7 @@ async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
         ][-19:]
         pending_confirmations.append({
             key: plan["confirmation_record"].get(key)
-            for key in ("confirmation_id", "session_id", "plan_version_hash", "expires_at", "status")
+            for key in ("confirmation_id", "session_id", "plan_version_hash", "arguments_hash", "expires_at", "status")
         })
         workflow.update({"plan_version_hash": plan["confirmation_record"]["plan_version_hash"],
                          "confirmation_id": plan["confirmation_record"]["confirmation_id"],
@@ -3276,9 +3277,10 @@ def _invalidate_confirmation(workflow: dict[str, Any], confirmation_id: str, rea
     """Retire only the invoking chat's approval after a proven no-op."""
     for item in workflow.get("pending_confirmations", []):
         if (isinstance(item, dict) and item.get("confirmation_id") == confirmation_id
-                and item.get("status") == "PENDING"):
+                and item.get("status") in {"PENDING", "VALIDATING"}):
             item.update({"status": "INVALIDATED", "reason": reason, "updated_at": now()})
-    if workflow.get("confirmation_id") == confirmation_id and workflow.get("confirmation_status") == "PENDING":
+    if (workflow.get("confirmation_id") == confirmation_id
+            and workflow.get("confirmation_status") in {"PENDING", "VALIDATING"}):
         workflow.update({"confirmation_status": "INVALIDATED",
                          "confirmation_invalidated_reason": reason,
                          "confirmation_invalidated_at": now()})
@@ -3290,22 +3292,14 @@ def _workflow_confirmation(workflow: dict[str, Any], binding: dict[str, Any]) ->
     A media workflow is globally idempotent by canonical title, while an
     approval belongs to one frontend conversation. Multiple chats may plan
     the same title; neither may replace or consume the other's authorization.
-    The legacy singleton fields remain a bounded rollout fallback for records
-    created by the previous deployed image.
+    Old singleton-only records are deliberately not executable: they did not
+    persist session ownership or the full argument/expiry binding and cannot
+    safely authorize a write.
     """
     confirmation_id = binding.get("confirmation_id")
     match = next((item for item in workflow.get("pending_confirmations", [])
                   if isinstance(item, dict) and item.get("confirmation_id") == confirmation_id), None)
-    if match:
-        return match
-    if confirmation_id == workflow.get("confirmation_id"):
-        return {
-            "confirmation_id": confirmation_id,
-            "session_id": binding.get("session_id"),
-            "plan_version_hash": workflow.get("plan_version_hash"),
-            "status": workflow.get("confirmation_status"),
-        }
-    return None
+    return match
 
 
 def _set_workflow_confirmation_status(workflow: dict[str, Any], confirmation_id: str, status: str) -> None:
@@ -3317,7 +3311,33 @@ def _set_workflow_confirmation_status(workflow: dict[str, Any], confirmation_id:
         workflow["confirmation_status"] = status
 
 
+_MEDIA_EXECUTION_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _media_execution_lock() -> asyncio.Lock:
+    """One confirmation executor at a time per event loop/store snapshot."""
+    loop = asyncio.get_running_loop()
+    return _MEDIA_EXECUTION_LOCKS.setdefault(loop, asyncio.Lock())
+
+
+async def media_plan_goal(args: dict[str, Any]) -> dict[str, Any]:
+    # Planning appends/replaces confirmation records in the same bounded JSON
+    # document as execution. It must not save a stale snapshot while an
+    # approval is awaiting provider preflight.
+    async with _media_execution_lock():
+        return await _media_plan_goal_locked(args)
+
+
 async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
+    # The JSON workflow store is rewritten as one bounded document. Holding
+    # this lock across preflight awaits prevents one approval from restoring
+    # another approval's stale confirmation snapshot. Production runs one
+    # uvicorn worker; the per-loop key also keeps isolated tests independent.
+    async with _media_execution_lock():
+        return await _media_standard_request_locked(args)
+
+
+async def _media_standard_request_locked(args: dict[str, Any]) -> dict[str, Any]:
     """Bounded standard/watch-first bridge; execution is disabled by default."""
     allowed_keys = {"workflow_id", "media_type", "canonical_external_id", "canonical_title", "season_scope",
                     "episode_scope", "confirmation_context", "session_id", "mode"}
@@ -3382,6 +3402,10 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
         return {"status": "rejected", "reason": "CONFIRMATION_ID_MISMATCH", "write_executed": False}
     if str(authorization.get("plan_version_hash")) != str(binding.get("plan_version_hash")):
         return {"status": "rejected", "reason": "PLAN_HASH_MISMATCH", "write_executed": False}
+    if str(authorization.get("arguments_hash")) != str(binding.get("arguments_hash")):
+        return {"status": "rejected", "reason": "PERSISTED_ARGUMENT_HASH_MISMATCH", "write_executed": False}
+    if str(authorization.get("expires_at")) != str(binding.get("expires_at")):
+        return {"status": "rejected", "reason": "PERSISTED_EXPIRY_MISMATCH", "write_executed": False}
     if workflow.get("canonical_identity", {}).get("tmdb_id") != payload["mediaId"]:
         return {"status": "rejected", "reason": "CANONICAL_ID_MISMATCH", "write_executed": False}
     requested_title = str(args.get("canonical_title") or "").strip()
@@ -3393,12 +3417,20 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     if authorization.get("status") != "PENDING":
         return {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}
     title = str(args.get("canonical_title") or workflow.get("canonical_identity", {}).get("title") or "").strip()
+
+    # Claim before the first await or external preflight. The deployed Tools
+    # service is a single-worker uvicorn process, so persisting VALIDATING here
+    # makes concurrent async approvals observe a non-PENDING authorization.
+    _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "VALIDATING")
+    _save_workflow_update(rows, workflow)
     if QA_MODE == "isolated_execution":
         # The real confirmation, binding, canonical-identity and single-use
         # machinery above is exercised, but the final executor is deliberately
         # an in-process fake.  No provider evidence lookup, bridge secret,
         # HTTP request, filesystem media write, or production event source is
         # reachable from this branch.
+        # Prove the shared claim across a scheduling boundary in the matrix.
+        await asyncio.sleep(0)
         _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
         fake_execution_count = int(workflow.get("qa_execution_count") or 0) + 1
         workflow.update({"canonical_state": "REQUESTED", "mode": "standard",
@@ -3417,6 +3449,8 @@ async def media_standard_request(args: dict[str, Any]) -> dict[str, Any]:
     webhook_payload = _build_cli_debrid_overseerr_webhook(args, workflow_id)
     live_evidence = _cli_debrid_exact_item_evidence(webhook_payload)
     if live_evidence.get("error"):
+        _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "PENDING")
+        _save_workflow_update(rows, workflow)
         return {"status": "unavailable", "reason": "CLIDEBRID_STATE_UNAVAILABLE",
                 "write_executed": False, "workflow_id": workflow_id,
                 "evidence": live_evidence}
