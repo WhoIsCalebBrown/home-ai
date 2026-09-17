@@ -615,6 +615,38 @@ async def test_disabled_tv_writes_gives_a_clear_reason_not_a_dead_end(session):
     assert not session.backend.submitted_writes
 
 
+@pytest.mark.asyncio
+async def test_no_op_confirmation_does_not_claim_false_progress(session):
+    # Real production bug found in a 65-conversation live sweep: "I want
+    # to watch Whiplash" -> "You already have Whiplash in Plex." ->
+    # confirmed with a plain "yes" -> "It's already on the way." --
+    # misleading; cli_debrid's "no_op" status here means the opposite of
+    # "in progress" (ALREADY_AVAILABLE_IN_BOTH_LIBRARIES/_PERMANENTLY/
+    # _STANDARD -- see media_standard_request), i.e. it is already fully
+    # done, not "on its way."
+    session.backend.seed_library("Whiplash", media_type="movie", state="AVAILABLE_IN_PLEX", tmdb_id="244786")
+    await session.turn(
+        "I want to watch Whiplash",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Whiplash", "media_type": "movie"}}},
+        ]}}],
+    )
+    session.backend.media_standard_request_override = {"status": "no_op", "reason": "ALREADY_AVAILABLE_IN_BOTH_LIBRARIES", "write_executed": False}
+    import time as _time
+    session.app.pending[session.client_id] = {
+        "name": "media_standard_request",
+        "arguments": {"workflow_id": "wf-244786", "canonical_external_id": "244786", "media_type": "movie",
+                       "confirmation_context": {"confirmation_id": "conf-1", "session_id": session.client_id,
+                                                 "plan_version_hash": "hash-1", "expires_at": 9999999999, "status": "PENDING"}},
+        "action_id": "conf-1", "conversation_id": session.client_id, "session_id": session.client_id,
+        "expires": _time.time() + 120, "workflow_id": "wf-244786", "canonical_external_id": "244786",
+        "plan_version_hash": "hash-1",
+    }
+    reply = await session.turn("yes")
+    assert reply == "You already have that -- no need to request it again."
+    assert not session.backend.submitted_writes
+
+
 # --- Offer decline (#9) ------------------------------------------------
 
 @pytest.mark.asyncio

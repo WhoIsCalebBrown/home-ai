@@ -89,6 +89,23 @@ def test_status_question_framing_strips_cleanly_for_the_identification_fallback(
     assert _media_goal_parts("What is going on with Silo?", None)["title_query"] == "Silo"
 
 
+def test_100_conversation_sweep_phrasings_strip_cleanly_to_a_bare_title():
+    # Real production bugs found in a 65-conversation, 124-turn live sweep
+    # of naive request phrasing. Each of these polluted the literal query
+    # sent to Radarr/Sonarr/Lidarr's own fuzzy lookup with request-framing
+    # words, diluting or breaking the match.
+    assert _media_goal_parts("Can I get the show Severance", None)["title_query"] == "Severance"
+    assert _media_goal_parts("Add The Last of Us to my server", None)["title_query"] == "The Last of Us"
+    assert _media_goal_parts("Can you find the anime Frieren", None)["title_query"] == "Frieren"
+    assert _media_goal_parts("yo can you snag me the show Slow Horses", None)["title_query"] == "Slow Horses"
+    assert _media_goal_parts("Get the anime Starlight Requiem Chronicles", None)["title_query"] == "Starlight Requiem Chronicles"
+    assert _media_goal_parts("Get me the album Rodeo by Travis Scott", None)["title_query"] == "Rodeo"
+    assert _media_goal_parts("Download Shogun for me", None)["title_query"] == "Shogun"
+    assert _media_goal_parts("Queue up Everything Everywhere All at Once", None)["title_query"] == "Everything Everywhere All at Once"
+    assert _media_goal_parts("uhh can you like maybe get me interstellar or whatever", None)["title_query"] == "interstellar"
+    assert _media_goal_parts("do i have avengers on my plex server?", "movie")["title_query"] == "avengers"
+
+
 def test_ampersand_and_and_are_treated_as_the_same_connecting_word():
     # Real production bug found live: "I want to watch Deadpool and
     # Wolverine" failed to resolve as an exact match against Radarr's own
@@ -106,6 +123,42 @@ def test_ampersand_and_and_are_treated_as_the_same_connecting_word():
     identity, ambiguous, _candidates = _module._pick_match(matches, "Deadpool and Wolverine")
     assert ambiguous is False
     assert identity["title"] == "Deadpool & Wolverine"
+
+
+def test_pick_match_rejects_fabricated_candidates_below_a_real_relevance_floor():
+    # Real production bug found in a 65-conversation live sweep: a
+    # genuinely fictional/obscure title ("Nebula's Last Whisper", "Quantum
+    # Butterfly Kingdom") returned zero real candidates from Sonarr/
+    # Radarr's own fuzzy lookup, but _pick_match always offered the top 3
+    # scored rows regardless of how low that score was -- surfacing
+    # completely unrelated titles ("St. Urbain's Horseman", "The 10th
+    # Kingdom") as if they were plausible "did you mean X?" choices.
+    nonsense_matches = [
+        {"title": "Whisper (2017)", "year": 2017},
+        {"title": "Mischievous Twins: The Tales of St. Clare's", "year": 1991},
+        {"title": "St. Urbain's Horseman", "year": 2007},
+    ]
+    identity, ambiguous, candidates = _module._pick_match(nonsense_matches, "Nebula's Last Whisper")
+    assert identity is None and ambiguous is False and candidates == []
+
+    kingdom_matches = [
+        {"title": "Animal Kingdom (2016)", "year": 2016},
+        {"title": "Criminal: United Kingdom", "year": 2019},
+        {"title": "The 10th Kingdom", "year": 2000},
+    ]
+    identity, ambiguous, candidates = _module._pick_match(kingdom_matches, "Quantum Butterfly Kingdom")
+    assert identity is None and ambiguous is False and candidates == []
+
+    # A genuine multi-title tie (real overlap on every candidate) must
+    # still surface as a real disambiguation choice, not get swept into
+    # the same "no match" bucket.
+    mcu_matches = [
+        {"title": "The Avengers", "year": "2012", "tmdbId": 24428},
+        {"title": "Avengers: Endgame", "year": "2019", "tmdbId": 299534},
+        {"title": "Avengers: Infinity War", "year": "2018", "tmdbId": 299536},
+    ]
+    identity, ambiguous, candidates = _module._pick_match(mcu_matches, "avengers")
+    assert identity is None and ambiguous is True and len(candidates) == 3
 
 
 def test_similarly_named_titles_are_never_conflated_by_normalization():

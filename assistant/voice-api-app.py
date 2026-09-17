@@ -4092,7 +4092,21 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             elif status == "submitted" and details.get("ingestion_confirmed"):
                 full = "Done. It's looking for it now."
             elif status == "no_op":
-                full = "It's already on the way."
+                # Real production bug found in a 65-conversation live sweep:
+                # "You already have Whiplash in Plex" -> confirmed with a
+                # plain "yes" -> "It's already on the way." -- misleading;
+                # "no_op" here almost always means the opposite of "in
+                # progress" (ALREADY_AVAILABLE_IN_BOTH_LIBRARIES/
+                # _PERMANENTLY/_STANDARD -- see tools/server-tools-app.py's
+                # media_standard_request), i.e. it's already fully done,
+                # not "on its way." Only the genuinely ambiguous reason
+                # (an active workflow that could be either in-progress or
+                # already satisfied) keeps neutral wording.
+                no_op_reason = execution_reason
+                if no_op_reason and no_op_reason.startswith("ALREADY_AVAILABLE"):
+                    full = "You already have that -- no need to request it again."
+                else:
+                    full = "That's already been taken care of, no action needed."
             elif status == "failed_ingestion":
                 full = "I couldn't hand that off to your media queue."
             elif status in {"rejected", "disabled"}:

@@ -2085,8 +2085,36 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     # title words, before identity lookup.
     for _ in range(5):
         before = title
+        # A leading casual interjection ("yo can you snag me the show X")
+        # blocks every request-framing pattern below, which all anchor to
+        # the very start of the string -- real production bug found in a
+        # 65-conversation live sweep.
+        title = re.sub(r"^\s*(?:yo|hey|hi|so|well|okay|ok|uhh?|umm?|hmm?)[,\s]+", "", title, flags=re.I)
+        # Casual filler words ("like", "maybe", "kind of") in the MIDDLE of
+        # a request also block the request-framing patterns below from
+        # ever reaching the real title -- real production bug found in a
+        # 65-conversation live sweep: "uhh can you like maybe get me
+        # interstellar or whatever" only had "uhh" and "can you" stripped,
+        # leaving "like maybe get me interstellar or whatever" as the
+        # literal query, which polluted Radarr's own fuzzy match into
+        # returning three completely unrelated titles.
+        title = re.sub(r"^\s*(?:like|maybe|kind\s+of|sort\s+of)\s+", "", title, flags=re.I)
+        title = re.sub(r"\s+or\s+(?:whatever|something)\s*[.!?]*$", "", title, flags=re.I)
         title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+you\s+", "", title, flags=re.I)
-        title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want)(?:\s+me)?\s+", "", title, flags=re.I)
+        # Real production bug found in a 65-conversation live sweep: "Can I
+        # get the show Severance" kept "Can I get" as part of the literal
+        # query -- the pattern above only handles "Can YOU", not "Can I",
+        # even though both are exactly the same request-framing shape.
+        # Sonarr's own fuzzy lookup then ranked two completely unrelated
+        # titles above the real, otherwise-exact "Severance" match, purely
+        # because "Can I get" diluted the query with three extra common
+        # words. Real Sonarr search confirmed live: "Severance" alone
+        # returns the correct show as the #1 result.
+        title = re.sub(r"^\s*(?:please\s+)?(?:a[\s,]+)?(?:can|could|would)\s+i\s+(?:get|give|grab|find|add|request|want|watch)(?:\s+me)?\s+", "", title, flags=re.I)
+        title = re.sub(r"^\s*(?:please\s+)?(?:i\s+)?(?:get|give|grab|find|add|request|want|download|snag)(?:\s+me)?\s+", "", title, flags=re.I)
+        # "Queue up X" is the same acquisition framing as "get me X", just
+        # phrased as a verb + particle.
+        title = re.sub(r"^\s*queue\s+up\s+", "", title, flags=re.I)
         # Real production bug found live: "Can I watch Bird Box?" -- an
         # availability-check question, not an acquisition request -- kept
         # "Can I watch" as part of the literal query sent to Radarr's own
@@ -2133,7 +2161,20 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     title = re.sub(r"^\s*(?:do i have|is there)\s+", "", title, flags=re.I)
     title = re.sub(r"^\s*put\s+", "", title, flags=re.I)
     title = title.strip(" .?!")
-    title = re.sub(r"\s+(?:on|in)\s+(?:my\s+)?plex\s*[.!?]*$", "", title, flags=re.I)
+    # Real production regression found while fixing the sweep above: "do i
+    # have avengers on my plex server?" only stripped "on my plex", never
+    # accounting for a trailing "server" word after "plex" -- "server"
+    # survived into the query, diluting the token-overlap score for every
+    # real "Avengers"-titled candidate below the floor added for the
+    # nonsense-candidate fix, turning a genuine multi-title tie into a
+    # false "no match at all".
+    title = re.sub(r"\s+(?:on|in)\s+(?:my\s+)?plex(?:\s+server)?\s*[.!?]*$", "", title, flags=re.I)
+    # Real production bug found in a 65-conversation live sweep: "Add The
+    # Last of Us to my server" only had the leading "Add" verb stripped,
+    # leaving "The Last of Us to my server" as the literal query -- "to my
+    # server" is the same trailing destination framing as "on/in my plex"
+    # just phrased generically.
+    title = re.sub(r"\s+to\s+my\s+(?:server|library)\s*[.!?]*$", "", title, flags=re.I)
     title = re.sub(r"\s+for\s+me\s*[.!?]*$", "", title, flags=re.I)
     title = re.sub(r"\b(?:and )?(?:get|give|grab|add|request) (?:it|that)\b", "", title, flags=re.I).strip(" .?!")
     if requested_year:
@@ -2147,7 +2188,16 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
     elif episode_match:
         title = episode_match.group(2).strip(" .?!")
     title = re.sub(r"\s+and\s+keep(?:\s+it)?\s+permanently\s*$", "", title, flags=re.I).strip(" .?!")
-    if kind in {"movie", "tv", "anime"}:
+    # Real production bug found in a 65-conversation live sweep: "Get the
+    # anime Starlight Requiem Chronicles" and "Get me the album Rodeo"
+    # both kept their classifier noun ("anime"/"album") in the literal
+    # search query -- this block never covered them at all ("anime" was
+    # missing from the word list below even though "anime" IS one of the
+    # three kinds this block claims to handle; "album" wasn't in the kind
+    # set at all, so an album request never got classifier-word stripping
+    # of any kind), diluting Sonarr/Lidarr's own fuzzy match the same way
+    # "the movie"/"the show" already do for movie/tv.
+    if kind in {"movie", "tv", "anime", "album"}:
         # "the" must only be stripped as REQUEST FRAMING ("the movie X", "the
         # whole series") -- stripping it as a bare standalone word destroyed
         # a real leading article that is part of the actual title itself
@@ -2155,8 +2205,8 @@ def _media_goal_parts(goal: str, media_type: str | None = None) -> dict[str, Any
         # wrong film). Only remove "the" when immediately followed by one of
         # the classifier/scope words below; a "the" anywhere else in the
         # string (including a title's own leading article) is left alone.
-        title = re.sub(r"\bthe\s+(?=(?:original|animated|version|movie|film|series|show|whole|entire)\b)", "", title, flags=re.I)
-        title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|whole|entire|all)\b", " ", title, flags=re.I)
+        title = re.sub(r"\bthe\s+(?=(?:original|animated|version|movie|film|series|show|anime|album|whole|entire)\b)", "", title, flags=re.I)
+        title = re.sub(r"\b(?:original|animated|version|movie|film|series|show|anime|album|whole|entire|all)\b", " ", title, flags=re.I)
         title = re.sub(r"\bof\b", " ", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!") or text
     # Real production bug found live: "Can you get me the show Silo"
@@ -2268,7 +2318,20 @@ def _pick_match(matches: list[dict[str, Any]], title: str, artist: str | None = 
     margin = scored[0][0] - scored[1][0]
     if scored[0][0] >= 0.75 and margin >= 0.25:
         return scored[0][1], False, []
-    top_candidates = [row for _, row in scored[:3]]
+    # Real production bug found in a 65-conversation live sweep: a
+    # genuinely fictional/obscure title ("Nebula's Last Whisper", "Quantum
+    # Butterfly Kingdom") returned zero real candidates from Sonarr/
+    # Radarr's own fuzzy lookup, but this always offered the top 3 scored
+    # rows regardless of how low that score was -- surfacing completely
+    # unrelated titles ("St. Urbain's Horseman", "The 10th Kingdom") as if
+    # they were plausible "did you mean X?" choices. A candidate sharing
+    # less than a third of the wanted title's own words is noise, not a
+    # real disambiguation option; report a clean, honest "no match" (the
+    # same shape as an empty search) instead of a fabricated choice.
+    plausible = [(score, row) for score, row in scored if score >= 0.34]
+    if not plausible:
+        return None, False, []
+    top_candidates = [row for _, row in plausible[:3]]
     return None, True, top_candidates
 
 
