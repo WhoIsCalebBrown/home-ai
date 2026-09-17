@@ -950,6 +950,11 @@ async def plex_library_lookup(args: dict[str, Any]) -> dict[str, Any]:
     matches = []
     for item in root:
         attrs = item.attrib
+        # Newer Plex search responses can contain provider/category rows
+        # alongside actual library items. They have neither a title nor a
+        # rating key and are navigation metadata, not positive matches.
+        if not attrs.get("title") or not attrs.get("ratingKey"):
+            continue
         library = attrs.get("librarySectionTitle") or attrs.get("librarySectionName") or ""
         if wanted_library and wanted_library not in library.casefold() and not (wanted_library == "music" and attrs.get("type") in {"artist", "album", "track"}):
             continue
@@ -2525,12 +2530,16 @@ def _plot_description_hint(text: str) -> bool:
     words = re.findall(r"[a-zA-Z']+", text)
     if len(words) < 7:
         return False
-    return bool(re.search(
+    relational = bool(re.search(
         r"\b(?:about|where|in which|set in|takes place|who)\b|"
         r"\b(?:he|she|they|it)\b.{0,40}\b(?:does|is|was|has|goes|lives|works|travels|grows|fishes)\b",
         text,
         re.I,
     ))
+    if relational:
+        return True
+    clauses = [clause for clause in re.split(r"[.!?]+", text) if clause.strip()]
+    return len(clauses) >= 2 and len(re.findall(r"[a-zA-Z']+", clauses[-1])) >= 3
 
 
 def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | None:
@@ -2540,7 +2549,13 @@ def _web_discovery_title_from_results(results: list[dict[str, Any]]) -> str | No
     Radarr/Sonarr lookup; nothing here resolves or confirms anything."""
     if not results:
         return None
-    candidate = str(results[0].get("title") or "").strip()
+    authoritative_domains = ("imdb.com", "wikipedia.org", "themoviedb.org", "tmdb.org")
+    ordered = sorted(
+        results,
+        key=lambda row: 0 if any(domain in str(row.get("domain") or row.get("url") or "").casefold()
+                                 for domain in authoritative_domains) else 1,
+    )
+    candidate = str(ordered[0].get("title") or "").strip()
     if not candidate:
         return None
     candidate = re.split(r"\s*[-|:]\s*(?:imdb|rotten tomatoes|wikipedia|the movie database|tmdb|plex)\b", candidate, flags=re.I)[0]
@@ -2586,12 +2601,11 @@ async def _media_plan_goal_locked(args: dict[str, Any]) -> dict[str, Any]:
         plan["ambiguous"] = False
         plan["message"] = "I didn't catch a specific title -- what would you like me to look for?"
         return plan
-    person_only_description = bool(
-        _person_mention_hint(parts["raw_goal"], parts.get("artist_query"))
-        and not _plot_description_hint(parts["raw_goal"])
-        and re.search(r"\b(?:trying\s+to\s+remember|remember|which|what(?:'s|\s+is))\b", parts["raw_goal"], re.I)
+    low_information_memory_prompt = bool(
+        not _plot_description_hint(parts["raw_goal"])
+        and re.search(r"\b(?:trying\s+to\s+remember|can't\s+remember|cannot\s+remember)\b", parts["raw_goal"], re.I)
     )
-    if person_only_description:
+    if low_information_memory_prompt:
         plan["current_state"] = "NEEDS_MORE_CLUES"
         plan["ambiguous"] = False
         plan["message"] = "I need one more clue, such as part of the plot, the year, or another cast member."

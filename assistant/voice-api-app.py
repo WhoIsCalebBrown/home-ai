@@ -1386,6 +1386,8 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
                 if title:
                     grouped.setdefault(group, []).append(f"{title} ({year})" if year not in (None, "") else title)
             evidence = "; ".join(f"{group}: {', '.join(titles)}" for group, titles in grouped.items())
+            if not evidence:
+                return "I couldn't find usable matching entries in Plex."
             if completeness:
                 return f"In Plex, I found {evidence}. I can't verify that this is the complete franchise set without an authoritative expected-title list."
             return f"In Plex, I found {evidence}."
@@ -1402,6 +1404,16 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
         is_music = any(str(match.get("media_type") or "").casefold() in {"artist", "album", "track"} for match in matches)
         prefix = "In Plex Music, I found: " if is_music else "In Plex, I found: "
         return prefix + "; ".join(labels) + "." if labels else "I couldn't find usable matching Plex entries."
+    if tool == "plex_artist_library":
+        if not result.get("found"):
+            return f"I couldn't find {result.get('query') or 'that artist'} in Plex Music."
+        artist = result.get("artist") or result.get("query") or "that artist"
+        albums = [album for album in result.get("albums", []) if isinstance(album, dict) and album.get("title")]
+        if not albums:
+            return f"I found {artist} in Plex Music, but no album entries were returned."
+        labels = [f"{album['title']} ({album['year']})" if album.get("year") else str(album["title"])
+                  for album in albums[:20]]
+        return f"In Plex Music, you have {artist}: " + ", ".join(labels) + "."
     if tool == "plex_search" and re.fullmatch(
         r"\s*(?:what|which)\s+(?:of\s+my\s+)?(.+?)\s+"
         r"(?:stuff|content|media|movies?\s+and\s+shows?)\s+do\s+(?:i|we)\s+have"
@@ -2134,7 +2146,10 @@ def referential_media_library_question(text: str, context: dict | None = None) -
     context = context or {}
     if not isinstance(context.get("canonical_identity"), dict):
         return False
-    return bool(re.fullmatch(r"\s*(?:do|did)\s+(?:i|we)\s+have\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*", text, re.I))
+    return bool(
+        re.fullmatch(r"\s*(?:do|did)\s+(?:i|we)\s+have\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*", text, re.I)
+        or re.fullmatch(r"\s*is\s+(?:it|that|this|the\s+one)\s+(?:in|on)\s+(?:my\s+)?(?:plex\s+)?library\s*[?!.,]*\s*", text, re.I)
+    )
 
 
 def referential_media_request(text: str, context: dict | None = None) -> bool:
@@ -2943,6 +2958,12 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     category = library_category_followup(text)
     if category and context.get("latest_operation") == "PLEX_LIBRARY_COUNT":
         return [("plex_library_counts", {})]
+    if re.fullmatch(
+        r"\s*how\s+many\s+(?:movies?|films?|shows?|series|tv\s+(?:shows?|series)|albums?|artists?)\s+(?:do\s+(?:i|we)\s+have|are\s+in\s+(?:my\s+)?(?:plex\s+)?library)\s*[?!.,]*\s*",
+        text,
+        re.I,
+    ):
+        return [("plex_library_counts", {})]
     # "Do I have it?" after identification is a library query for the
     # canonical subject, not a literal-pronoun Plex search or a new request.
     if referential_media_library_question(text, context):
@@ -2962,6 +2983,13 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # search the configured Plex libraries for the family query, then group
     # only the returned evidence.  A request such as "Get Avengers" does
     # not match this shape and continues through canonical resolution.
+    artist_inventory = re.fullmatch(
+        r"\s*what\s+(.+?)\s+music\s+do\s+(?:i|we)\s+have(?:\s+in\s+(?:my\s+)?(?:plex\s+)?library)?\s*[?!.,]*\s*",
+        text,
+        re.I,
+    )
+    if artist_inventory:
+        return [("plex_artist_library", {"query": artist_inventory.group(1).strip()})]
     collective_query = collective_library_query(text)
     if collective_query:
         return [("plex_library_lookup", {"query": collective_query})]
@@ -2979,6 +3007,8 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     music_query = music_query_fn(text) if callable(music_query_fn) else None
     if music_query:
         return [("plex_library_lookup", {"query": music_query, "library": "Music"})]
+    if re.search(r"\b(?:trying\s+to\s+remember|can't\s+remember|cannot\s+remember)\b", text, re.I) and media_identity_signal(text):
+        return [("media_plan_goal", {"goal": text})]
     # A bare "Is it running?" can safely remain a storage question only
     # when the preceding capacity turn named the storage target.  This keeps
     # it from degenerating into a container-status invocation without a name.
@@ -3703,12 +3733,15 @@ def descriptive_clue_followup(text: str, subject: "UnresolvedSubject | None") ->
     """Recognize a short plot/location clue that refines an unresolved item."""
     if subject is None or len(re.findall(r"[a-z0-9']+", text.casefold())) > 16:
         return False
-    if re.search(r"\b(?:yes|yeah|no|cancel|approve|confirm|get|request|add|weather|camera|container|storage)\b", text, re.I):
+    if (media_acquisition_language(text)
+            or re.search(r"\b(?:yes|yeah|no|cancel|approve|confirm|weather|camera|container|storage)\b", text, re.I)):
         return False
-    return bool(
-        re.search(r"\b(?:he|she|they|it)\b", text, re.I)
-        or re.search(r"\b(?:takes place|set|happens)\s+(?:in|on|near|around)\b", text, re.I)
-    )
+    if (re.search(r"\b(?:he|she|they|it)\b", text, re.I)
+            or re.search(r"\b(?:takes place|set|happens)\s+(?:in|on|near|around)\b", text, re.I)):
+        return True
+    content = [word for word in re.findall(r"[a-z0-9']+", text.casefold())
+               if word not in {"a", "an", "the", "i", "think", "maybe", "movie", "film", "show", "one", "in", "on", "of"}]
+    return len(content) >= 3
 
 
 def guess_media_title(text: str) -> str:
@@ -4633,11 +4666,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             year = resolved.get("year")
             media_type = resolved.get("media_type")
             type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
-            disambiguated_goal = f"{disambiguation.get('original_goal', '')} {title} {year or ''} {type_word}".strip()
+            original_goal = str(disambiguation.get("original_goal") or "")
+            action_prefix = "get " if media_acquisition_language(original_goal) else ""
+            disambiguated_goal = f"{action_prefix}{title}{f' from {year}' if year else ''} {type_word}".strip()
             result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": client_id}, client_id, request_id)
             live_results_resolved = [result]
             resolved_text = media_plan_response(user_text, live_results_resolved)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if plan_result.get("canonical_identity"):
+                record_tool_referent(client_id, "media_plan_goal", {"goal": disambiguated_goal}, result)
             if resolved_text is None:
                 post_direct_resolved = direct_structured_answer(user_text, live_results_resolved)
                 resolved_text = post_direct_resolved or f"I found {title}."
@@ -4663,7 +4700,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 candidate_year = candidate.get("year")
                 if candidate_title:
                     labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
-            full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
+            creator_hint = bool(re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", user_text))
+            has_people_evidence = any(candidate.get("people") for candidate in candidates)
+            if creator_hint and not has_people_evidence:
+                full = ("These catalog candidates don't include cast or creator evidence, so I can't safely use that hint yet: "
+                        + ", ".join(labels) + ".") if labels else "The catalog results don't include cast or creator evidence, so I can't safely use that hint yet."
+            else:
+                full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="disambiguation_reprompt")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -4677,6 +4720,19 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if action and action.get("conversation_id") != client_id:
         pending.pop(client_id, None)
         action = None
+    if (action and not is_confirmation(user_text)
+            and re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", user_text)
+            and re.search(r"\b(?:movie|film|one|version)\b", user_text, re.I)):
+        identity = conversation_context.get(client_id, {}).get("canonical_identity") or {}
+        title = identity.get("title") or action.get("title") or "the selected item"
+        year = identity.get("year")
+        label = f"{title} ({year})" if year else str(title)
+        full = (f"The pending plan is bound to {label}. This plan doesn't include cast or creator evidence to verify that new hint, "
+                "so I haven't changed or approved anything.")
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="pending_media_identity_hint")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
     offer_entry = pending_offers.get(client_id)
     if offer_entry:
         offer: PendingOffer = offer_entry["offer"]

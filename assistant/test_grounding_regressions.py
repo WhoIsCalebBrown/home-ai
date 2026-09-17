@@ -529,6 +529,9 @@ def test_referential_media_operations_preserve_subject_while_source_changes():
     assert preflight_plan("Do I have it?", context) == [
         ("media_plan_goal", {"goal": "Cast Away from 2000", "media_type": "movie"})
     ]
+    assert preflight_plan("Is it in my library?", context) == [
+        ("media_plan_goal", {"goal": "Cast Away from 2000", "media_type": "movie"})
+    ]
     assert referential_web_query("Can you look it up on the internet?", context) == "Cast Away"
     assert preflight_plan("Can you look it up on the internet?", context) == [
         ("web_search", {"query": "Cast Away"})
@@ -548,8 +551,9 @@ def test_collective_library_inventory_is_read_only_while_acquisition_stays_canon
     assert acquisition == [("media_plan_goal", {"goal": "Get Galactic Saga."})]
     assert collective_library_query("What Star Trek content do I have?") == "Star Trek"
     assert preflight_plan("What Radiohead music do I have?") == [
-        ("plex_library_lookup", {"query": "Radiohead"})
+        ("plex_artist_library", {"query": "Radiohead"})
     ]
+    assert preflight_plan("How many films are in my library?") == [("plex_library_counts", {})]
     assert preflight_plan("Do I have all the Avengers movies?") == [
         ("plex_library_lookup", {"query": "Avengers"})
     ]
