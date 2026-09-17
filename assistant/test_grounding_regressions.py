@@ -719,6 +719,58 @@ def test_conversational_news_request_becomes_a_clean_search_query():
     assert all("2026" not in query and "September" not in query for query in recovery)
 
 
+def test_sentence_initial_capitalization_is_not_mistaken_for_a_person_name():
+    # "Any Sonarr health issues?" and "Search Radarr for the movie Inception."
+    # both start with an ordinary capitalized word followed by a capitalized
+    # service name -- the person-name heuristic misread that as a two-word
+    # person name (a descriptive media clue), routing both into
+    # media_plan_goal, which then fuzzy-matched the whole sentence as a Plex
+    # title and returned nonsense disambiguation candidates.
+    assert not _descriptive_media_clue("Any Sonarr health issues?")
+    assert not _descriptive_media_clue("Any Radarr health issues?")
+    assert not _descriptive_media_clue("Search Radarr for the movie Inception.")
+    assert not _descriptive_media_clue("Search Lidarr for the artist Radiohead.")
+    # A genuine person-named descriptive clue must still be recognized.
+    assert _descriptive_media_clue("What's that Tom Hanks movie where he's stuck on an island?")
+
+
+def test_explicit_manager_search_is_left_to_discovery_not_hijacked_to_plex():
+    # "Search Radarr/Lidarr for X" names its own manager service; the
+    # generic Plex/pipeline catch-alls have no way to express that and
+    # previously answered with the wrong tool (plex_search,
+    # investigate_media_pipeline) instead of leaving it to discovery/Qwen,
+    # which now ranks the real radarr_search_movie/lidarr_search_artist tool
+    # decisively first.
+    assert preflight_plan("Search Radarr for the movie Inception.") == []
+    assert preflight_plan("Search Lidarr for the artist Radiohead.") == []
+
+
+def test_plex_library_count_question_is_not_a_media_goal():
+    # "How many movies and shows do I have in Plex?" contains "do i have"
+    # (matched by the acquisition-goal regex) and "plex" (a media noun), so
+    # it was sent whole to media_plan_goal, which fuzzy-matched the literal
+    # sentence as a Plex title and returned unrelated disambiguation
+    # candidates instead of a real library count.
+    assert preflight_plan("How many movies and shows do I have in Plex?") == [("plex_library_counts", {})]
+
+
+def test_bare_service_status_questions_are_not_media_workflow_status():
+    # "What's the Torbox status?" mentioning a backend service name made
+    # explicit_domain() classify the turn as media, which combined with
+    # media_status_question()==True to trip the "no matching live workflow"
+    # deterministic shortcut before discovery/Qwen ever got a chance to call
+    # the real torbox_status tool. These are backend-service health checks,
+    # not a movie/show lifecycle question, the same way lidarr/sonarr/radarr
+    # were already excluded above.
+    assert not media_status_question("What is the Torbox status?")
+    assert not media_status_question("What is the Overseerr status?")
+    assert not media_status_question("Any active Soulseek downloads?")
+    assert not media_status_question("What is currently downloading in qBittorrent?")
+    # A real title-lifecycle question must still be recognized.
+    assert media_status_question("How is my Cast Away request going?")
+    assert media_status_question("Did I already request The Room?")
+
+
 def test_media_correction_keeps_media_intent():
     conversation_context.clear()
     turn_context("scenario", "Is there anything in lidar going to Plex?")

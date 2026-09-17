@@ -1754,10 +1754,20 @@ def _descriptive_media_clue(text: str) -> bool:
     keeps a capitalized TITLE ("The Hobbit", "The Room") from being
     mistaken for a person's name.
     """
+    # Sentence-initial capitalization of an ordinary word ("Any", "Search",
+    # "Look") followed by a capitalized service/product name ("Sonarr",
+    # "Radarr", "Wikipedia") looks exactly like a two-word person name to
+    # this heuristic -- real production bug: "Any Sonarr health issues?"
+    # and "Search Radarr for the movie Inception." were both misread as a
+    # descriptive person-named media clue and routed to media_plan_goal,
+    # which then fuzzy-matched the whole sentence as a Plex title. Guard
+    # both ends: exclude more sentence-initial verbs/determiners from the
+    # first word, and never let a known non-person service name satisfy
+    # the second word of the pair.
     has_person = bool(re.search(
-        r"\b(?!(?:The|This|That|These|Those|Is|What|Did|How|Has|Can|Will|A|An"
-        r"|Restart|Reboot|Reload|Get|Give|Add|Request|Play|Stop|Start|Check|Show|Send|Grab|Find|Please)\b)"
-        r"[A-Z][a-z]+ [A-Z][a-z]+\b", text))
+        r"\b(?!(?:The|This|That|These|Those|Is|What|Did|How|Has|Can|Will|A|An|Any"
+        r"|Restart|Reboot|Reload|Get|Give|Add|Request|Play|Stop|Start|Check|Show|Send|Grab|Find|Please|Search|Look)\b)"
+        r"[A-Z][a-z]+ (?!(?:Sonarr|Radarr|Lidarr|Plex|Docker|Frigate|Torbox|Overseerr|Wikipedia|Netdata|Beets|Slskd|Soulseek|Qbittorrent|Plexium)\b)[A-Z][a-z]+\b", text))
     has_plot_clause = bool(re.search(r"\b(?:where|about)\b(?!(?:'s|\s+is|\s+it))", text, re.I))
     return has_person or has_plot_clause
 
@@ -1767,7 +1777,7 @@ def media_status_question(text: str) -> bool:
     # predicate is for a concrete media item's lifecycle, not questions such
     # as "Is anything in Lidarr going to Plex?".
     routed_text = routing_aliases(text)
-    if re.search(r"\b(?:anything|lidarr|sonarr|radarr)\b", routed_text, re.I):
+    if re.search(r"\b(?:anything|lidarr|sonarr|radarr|torbox|overseerr|slskd|soulseek|qbittorrent)\b", routed_text, re.I):
         return False
     # An unambiguous "my/our <title> request <status>" or "<title>
     # download(ed)? yet" frame names a KNOWN, already-requested item's
@@ -2360,7 +2370,13 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     if media_status_question(text) and (media_nouns or media_title_status_signal(text)) and (not media_acquisition_language(text) or status_request_noun or re.search(r"\bget\s+found\b", t)):
         return [("media_status", {"query": text})]
     media_goal = re.search(r"\b(get|give|grab|find|add|request|want|do i have|is it in plex|did it import|is it downloading|where is)\b", t)
-    if media_goal and media_nouns:
+    # "How many movies and shows do I have in Plex?" contains "do i have" but
+    # is a library-count question, not a single-item request -- real
+    # production bug: it was sent whole to media_plan_goal, which fuzzy-
+    # matched the literal sentence as a Plex title and returned unrelated
+    # disambiguation candidates. Same count-question shape already excluded
+    # from the browse_shaped Plex fallback further below.
+    if media_goal and media_nouns and not re.search(r"\bhow many|counts?|libraries\b", t):
         return [("media_plan_goal", {"goal": text})]
     # An explicit request verb with NO type word at all ("Can you request
     # Sagwa The Chinese Siamese Cat") must still reach media_plan_goal --
@@ -2482,6 +2498,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         if re.search(r"\b(state|status|adding|coming along|finish|finished|downloading|missing|albums?|music|stuff|pipeline)\b", t):
             focus = "missing" if re.search(r"\bmissing\b", t) else "status"
             return [("investigate_media_pipeline", {"entity_type": "artist", "query": artist, "focus": focus})]
+    # An explicit "search Sonarr/Radarr/Lidarr for X" imperative names its own
+    # manager service; it must not fall through to the generic Plex/pipeline
+    # catch-alls below, which have no way to express "search this specific
+    # manager" and previously produced a wrong tool (plex_search for a Radarr
+    # movie search, investigate_media_pipeline for a Lidarr artist search).
+    # Discovery/Qwen now ranks the real sonarr_search_series/
+    # radarr_search_movie/lidarr_search_artist tool decisively first for this
+    # phrasing, so leaving it unrouted here is the correct, precise answer.
+    if re.search(r"\bsearch\b", t) and re.search(r"\b(sonarr|radarr|lidarr)\b", t):
+        return []
     if re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", t) and (context.get("referent_type") in {"plex_movies", "plex_library"} or re.search(r"\b(movie|movies|plex|radarr|media)\b", t)):
         return [("investigate_downloads", {})]
     if re.search(r"what(?:'s| is) (?:currently )?downloading|anything (?:stalled|stuck)|what(?:'s| is) stuck", t):
