@@ -569,6 +569,20 @@ def test_simple_structured_reads_bypass_synthesis_pass():
     assert direct_structured_answer("What music is Lidarr looking for?", [{"tool": "lidarr_missing_tracks", "status": "ok", "result": {"count": 143}}]) == "Lidarr is currently looking for 143 albums."
 
 
+def test_single_weak_candidate_is_not_announced_as_more_than_one():
+    # Real production bug found live: after _pick_match's relevance-floor
+    # fix (added to stop offering fabricated candidates for a fictional
+    # title), a query can legitimately resolve to exactly ONE plausible-
+    # but-not-confident candidate -- "I found more than one possible
+    # match: Frieren: Beyond Journey's End (2023)." is grammatically wrong
+    # and confusing with only one title listed.
+    result = {"canonical_identity": None, "ambiguous": True, "ambiguity_reason": "NO_CONFIDENT_MATCH",
+              "candidates": [{"title": "Frieren: Beyond Journey's End", "year": "2023"}],
+              "goal": {"media_type": "tv", "title_query": "Frieren"}}
+    answer = media_plan_response("Can you find the anime Frieren", [{"tool": "media_plan_goal", "status": "ok", "result": result}])
+    assert answer == "I found a possible match: Frieren: Beyond Journey's End (2023). Is that the one you mean?"
+
+
 def test_media_diagnosis_is_human_and_stops_at_proven_boundary():
     result = {"title": "Dumb and Dumber", "canonical_state": "NO_CANDIDATE",
               "diagnosis": "NO_ACCEPTABLE_CANDIDATE", "canonical_identity": {"title": "Dumb and Dumber"}}

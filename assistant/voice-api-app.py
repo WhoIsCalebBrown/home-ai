@@ -1398,6 +1398,16 @@ def media_plan_response(user_text: str, live_results: list[dict]) -> str | None:
                 if result.get("ambiguity_reason") == "CROSS_DOMAIN_CANDIDATE" and len(candidates) == 1:
                     candidate = candidates[0]
                     return f"I found {labels[0]}, but it is a TV series rather than a movie. Do you want that series?"
+                # Real production bug found live: after _pick_match's
+                # relevance-floor fix (added to stop offering fabricated
+                # candidates for a fictional title), a query can now
+                # legitimately resolve to exactly ONE plausible-but-not-
+                # confident candidate -- "I found more than one possible
+                # match: Frieren: Beyond Journey's End (2023)." is
+                # grammatically wrong and confusing with only one title
+                # listed.
+                if len(labels) == 1:
+                    return f"I found a possible match: {labels[0]}. Is that the one you mean?"
                 return "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
         # A genuinely empty candidate list (as opposed to an ambiguous tie)
         # means the lookup ran and found nothing at all -- say so truthfully
@@ -4654,7 +4664,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                                 if candidate_title:
                                     labels.append(f"{candidate_title} ({candidate_year})" if candidate_year else str(candidate_title))
                             if labels:
-                                post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
+                                # Same fix as direct_structured_answer's
+                                # media_plan_goal branch: a single weak
+                                # candidate (post score-floor) must not be
+                                # announced as "more than one".
+                                if len(labels) == 1:
+                                    post_direct = f"I found a possible match: {labels[0]}. Is that the one you mean?"
+                                else:
+                                    post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
                 store_provenance(client_id, live_results)
                 await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")
