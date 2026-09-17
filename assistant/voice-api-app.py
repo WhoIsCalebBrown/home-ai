@@ -2505,7 +2505,21 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     # movie search, investigate_media_pipeline for a Lidarr artist search).
     # Discovery/Qwen now ranks the real sonarr_search_series/
     # radarr_search_movie/lidarr_search_artist tool decisively first for this
-    # phrasing, so leaving it unrouted here is the correct, precise answer.
+    # phrasing, but a real production run showed Qwen still sometimes picks
+    # the wrong tool (or the wrong argument name) even with the correct
+    # candidate ranked first -- an unambiguous imperative like this one is
+    # exactly the class of high-confidence route the deterministic planner
+    # exists to remove from the model's discretion entirely, so it is
+    # resolved to the real tool directly instead of merely leaving it
+    # unrouted for Qwen to choose.
+    manager_search = re.search(r"\bsearch\b\s+(sonarr|radarr|lidarr)\b\s+for\b\s+(?:the\s+)?(?:movie|series|show|artist|album)?\s*(.+?)\s*[.?!]*$", t)
+    if manager_search and manager_search.group(2).strip():
+        manager, remainder = manager_search.group(1), manager_search.group(2).strip()
+        if manager == "sonarr":
+            return [("sonarr_search_series", {"query": remainder})]
+        if manager == "radarr":
+            return [("radarr_search_movie", {"query": remainder})]
+        return [("lidarr_search_artist", {"query": remainder})]
     if re.search(r"\bsearch\b", t) and re.search(r"\b(sonarr|radarr|lidarr)\b", t):
         return []
     if re.search(r"\b(added|adding|looked for|searched|queued|acquir|download|import)\b", t) and (context.get("referent_type") in {"plex_movies", "plex_library"} or re.search(r"\b(movie|movies|plex|radarr|media)\b", t)):
@@ -4525,7 +4539,17 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
         await respond(sink, client_id, request_id, user_text)
     finally:
         tts_suppressed.reset(token)
-    answer = "".join(str(item.get("text", "")) for item in sink.messages if item.get("type") == "text").strip()
+    # Each individual emit_answer() call already collapses an internal
+    # adjacent duplicate, but respond() can emit more than one text message
+    # per turn (e.g. an interim answer followed by the final one); joining
+    # them here can reintroduce the exact same duplicate-sentence shape one
+    # level up, so the same collapse is applied again after the join.
+    # A space separator (not "") between joined messages: each is a
+    # complete sentence-level answer, not a sub-word streaming fragment, and
+    # collapse_repeated_sentences below requires whitespace at a sentence
+    # boundary to split on -- without it, two joined duplicate answers read
+    # as a single run-on sentence ("running.You've") that never collapses.
+    answer = collapse_repeated_sentences(" ".join(str(item.get("text", "")) for item in sink.messages if item.get("type") == "text").strip())
     trace = next((item.get("tools", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
     if not answer:
         raise HTTPException(502, detail="Home-AI produced no assistant response")

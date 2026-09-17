@@ -1120,8 +1120,24 @@ def _lookup_vote_count(row: dict[str, Any]) -> int:
     return 0
 
 
+def _search_term(args: dict, *aliases: str) -> str:
+    """Read the search term regardless of which reasonable key name the model used.
+
+    The registered schema declares "query" as the only parameter, but a model
+    naturally reaches for a more specific name for a named-entity search (a
+    real production request sent {"artist_name": "Radiohead"} to
+    lidarr_search_artist and crashed with KeyError instead of getting a real
+    answer). Accept the documented key first, then the tool-specific aliases.
+    """
+    for key in ("query", *aliases):
+        value = args.get(key)
+        if value:
+            return str(value)
+    raise KeyError("query")
+
+
 async def sonarr_search(args):
-    rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": args["query"]})
+    rows = await arr_get("sonarr", "/api/v3/series/lookup", {"term": _search_term(args, "series_name", "title", "name", "show_name")})
     return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tvdbId": x.get("tvdbId"),
                           "tmdbId": x.get("tmdbId"),
                           "seriesType": x.get("seriesType"), "genres": x.get("genres") or [],
@@ -1129,23 +1145,23 @@ async def sonarr_search(args):
 
 
 async def radarr_search(args):
-    rows = await arr_get("radarr", "/api/v3/movie/lookup", {"term": args["query"]})
+    rows = await arr_get("radarr", "/api/v3/movie/lookup", {"term": _search_term(args, "movie_name", "title", "name")})
     return {"matches": [{"title": x.get("title"), "year": x.get("year"), "tmdbId": x.get("tmdbId"), "overview": x.get("overview", "")[:240],
                           "vote_count": _lookup_vote_count(x)} for x in rows[:20]]}
 
 
 async def lidarr_search(args):
-    rows = await arr_get("lidarr", "/api/v1/artist/lookup", {"term": args["query"]})
+    rows = await arr_get("lidarr", "/api/v1/artist/lookup", {"term": _search_term(args, "artist_name", "artist", "name")})
     return {"matches": [{"artistName": x.get("artistName"), "sortName": x.get("sortName"), "foreignArtistId": x.get("foreignArtistId"), "overview": x.get("overview", "")[:240]} for x in rows[:20]]}
 
 
 async def lidarr_search_album(args):
-    rows = await arr_get("lidarr", "/api/v1/album/lookup", {"term": args["query"]})
+    rows = await arr_get("lidarr", "/api/v1/album/lookup", {"term": _search_term(args, "album_name", "album", "title", "name")})
     return {"matches": [{"title": x.get("title"), "artist": x.get("artist", {}).get("artistName") if isinstance(x.get("artist"), dict) else x.get("artistName"), "release_date": x.get("releaseDate"), "foreign_album_id": x.get("foreignAlbumId"), "album_type": x.get("albumType")} for x in rows[:20]]}
 
 
 async def lidarr_artist_status(args):
-    query = args["query"].casefold().strip()
+    query = _search_term(args, "artist_name", "artist", "name").casefold().strip()
     rows = await arr_get("lidarr", "/api/v1/artist")
     matches = []
     for x in rows if isinstance(rows, list) else []:

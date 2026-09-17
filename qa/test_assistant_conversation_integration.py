@@ -1670,6 +1670,27 @@ async def test_genuine_chat_message_through_gateway_still_uses_the_real_pipeline
     assert answer == "It is sunny today."
 
 
+@pytest.mark.asyncio
+async def test_gateway_join_collapses_duplicate_text_messages_across_emits(app, monkeypatch):
+    """Real production bug: a real OpenWebUI request for
+    'List the docker containers running right now.' came back as "You've
+    got 50 containers running. You've got 50 containers running." --
+    emit_answer() already collapses an adjacent duplicate WITHIN one call,
+    but respond() emitted the same sentence as two SEPARATE text messages in
+    one turn, and the gateway's naive "".join() reintroduced the exact same
+    duplicate one level up. The join must apply the same collapse."""
+    async def fake_respond(sink, client_id, request_id, user_text):
+        await sink.send_json({"type": "text", "text": "You've got 50 containers running.", "request_id": request_id})
+        await sink.send_json({"type": "text", "text": "You've got 50 containers running.", "request_id": request_id})
+
+    monkeypatch.setattr(app, "respond", fake_respond)
+
+    body = {"messages": [{"role": "user", "content": "List the docker containers running right now."}]}
+    answer, client_id, trace = await app._openai_chat_turn(body, _FakeGatewayRequest())
+
+    assert answer == "You've got 50 containers running."
+
+
 # --- Generalized replay of a live production transcript (real bug: a stale --
 # --- garbled title survived a fresh restatement, and a bare clarification ---
 # --- answer got hijacked by an unrelated capability) -----------------------

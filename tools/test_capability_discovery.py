@@ -82,6 +82,25 @@ def test_media_diagnosis_outranks_broad_download_in_media_context():
     assert module.discover_capabilities("what is downloading", 8)[0]["metadata"]["canonical_name"] == "investigate_downloads"
 
 
+def test_arr_search_tools_accept_the_natural_argument_name_a_model_would_use():
+    # The registered schema only declares "query", but a real production
+    # request sent {"artist_name": "Radiohead"} to lidarr_search_artist and
+    # crashed with KeyError instead of getting a real answer -- the
+    # documented key must still work, and so must the natural alternative.
+    import asyncio
+
+    async def fake_arr_get(service, path, params=None):
+        return [{"artistName": "Radiohead", "sortName": "Radiohead", "foreignArtistId": "x", "overview": ""}]
+
+    original = module.arr_get
+    module.arr_get = fake_arr_get
+    try:
+        assert asyncio.run(module.lidarr_search({"artist_name": "Radiohead"}))["matches"]
+        assert asyncio.run(module.lidarr_search({"query": "Radiohead"}))["matches"]
+    finally:
+        module.arr_get = original
+
+
 def test_manager_admin_queries_rank_their_own_dedicated_tool_first():
     # These tools previously had no CAPABILITY_METADATA entry at all, so a
     # natural admin question scored near zero against them and lost to a

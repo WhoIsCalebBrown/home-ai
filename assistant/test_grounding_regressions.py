@@ -734,15 +734,17 @@ def test_sentence_initial_capitalization_is_not_mistaken_for_a_person_name():
     assert _descriptive_media_clue("What's that Tom Hanks movie where he's stuck on an island?")
 
 
-def test_explicit_manager_search_is_left_to_discovery_not_hijacked_to_plex():
+def test_explicit_manager_search_resolves_directly_to_its_own_tool():
     # "Search Radarr/Lidarr for X" names its own manager service; the
     # generic Plex/pipeline catch-alls have no way to express that and
     # previously answered with the wrong tool (plex_search,
-    # investigate_media_pipeline) instead of leaving it to discovery/Qwen,
-    # which now ranks the real radarr_search_movie/lidarr_search_artist tool
-    # decisively first.
-    assert preflight_plan("Search Radarr for the movie Inception.") == []
-    assert preflight_plan("Search Lidarr for the artist Radiohead.") == []
+    # investigate_media_pipeline). Discovery/Qwen now ranks the real
+    # radarr_search_movie/lidarr_search_artist tool decisively first for
+    # this phrasing, but a real production run showed Qwen still sometimes
+    # picks the wrong tool (or the wrong argument name) even then -- this
+    # unambiguous imperative is resolved deterministically instead.
+    assert preflight_plan("Search Radarr for the movie Inception.") == [("radarr_search_movie", {"query": "inception"})]
+    assert preflight_plan("Search Lidarr for the artist Radiohead.") == [("lidarr_search_artist", {"query": "radiohead"})]
 
 
 def test_plex_library_count_question_is_not_a_media_goal():
