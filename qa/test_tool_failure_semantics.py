@@ -139,6 +139,7 @@ def _qa_startup(tmp_path, **settings):
     env = os.environ.copy()
     for name in (
         "HOME_AI_QA_MODE", "HOME_AI_QA_EXECUTOR", "HOME_AI_QA_STATE_ROOT",
+        "HOME_AI_CAMERA_READS_ENABLED",
         "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
         "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_TOKEN_FILE",
     ):
@@ -161,6 +162,7 @@ def test_isolated_mode_startup_is_fail_closed(tmp_path):
         HOME_AI_QA_MODE="isolated_execution",
         HOME_AI_QA_EXECUTOR="fake",
         HOME_AI_QA_STATE_ROOT=valid_root,
+        HOME_AI_CAMERA_READS_ENABLED="false",
     )
     assert valid.returncode == 0, valid.stderr
 
@@ -178,7 +180,11 @@ def test_isolated_mode_startup_is_fail_closed(tmp_path):
 
 
 def test_live_readonly_mode_refuses_mutation_credentials(tmp_path):
-    valid = _qa_startup(tmp_path, HOME_AI_QA_MODE="live_readonly")
+    valid = _qa_startup(
+        tmp_path,
+        HOME_AI_QA_MODE="live_readonly",
+        HOME_AI_CAMERA_READS_ENABLED="false",
+    )
     assert valid.returncode == 0, valid.stderr
     for settings in (
         {"CLIDEBRID_BRIDGE_TOKEN": "must-refuse"},
@@ -186,5 +192,10 @@ def test_live_readonly_mode_refuses_mutation_credentials(tmp_path):
         {"HOME_ASSISTANT_TOKEN": "must-refuse"},
         {"HOME_ASSISTANT_TOKEN_FILE": "/run/secrets/production-home"},
     ):
-        result = _qa_startup(tmp_path, HOME_AI_QA_MODE="live_readonly", **settings)
+        result = _qa_startup(
+            tmp_path,
+            HOME_AI_QA_MODE="live_readonly",
+            HOME_AI_CAMERA_READS_ENABLED="false",
+            **settings,
+        )
         assert result.returncode != 0, settings

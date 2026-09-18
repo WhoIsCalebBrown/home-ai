@@ -7,6 +7,10 @@ The templates are not applied automatically.
 The stack is fail-closed:
 
 - QA Tools runs with `HOME_AI_QA_MODE=live_readonly`.
+- QA Tools sets `HOME_AI_CAMERA_READS_ENABLED=false`; it cannot discover or
+  directly invoke Frigate event, metadata, snapshot, clip, or live-camera
+  capabilities. The application refuses QA startup if that privacy setting is
+  absent or enabled.
 - QA Assistant talks only to `home-ai-qa-tools:8090` and exposes model ID
   `home-ai-qa`.
 - QA Open WebUI has its own persistent data directory and provider URL.

@@ -12,6 +12,7 @@
   <Category>AI:Tools</Category>
   <Config Name="Host Port" Target="8090" Default="8090" Mode="tcp" Description="Optional LAN port; keep unexposed unless required by the QA runner." Type="Port" Display="advanced" Required="true" Mask="false">18090</Config>
   <Config Name="QA mode" Target="HOME_AI_QA_MODE" Default="live_readonly" Mode="" Description="Server-enforced read-only scope. Any other value is rejected by the image." Type="Variable" Display="always" Required="true" Mask="false">live_readonly</Config>
+  <Config Name="Camera data reads" Target="HOME_AI_CAMERA_READS_ENABLED" Default="false" Mode="" Description="Trusted privacy boundary: QA cannot discover or invoke Frigate camera/event/media capabilities. The image refuses QA startup unless this is false." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
   <Config Name="Media workflow state" Target="MEDIA_WORKFLOWS_PATH" Default="/data/media-workflows.json" Mode="" Description="Dedicated QA workflow store." Type="Variable" Display="advanced" Required="true" Mask="false">/data/media-workflows.json</Config>
   <Config Name="Standard media writes" Target="STANDARD_MEDIA_WRITES_ENABLED" Default="false" Mode="" Description="Explicit defense in depth; live_readonly also denies mutations." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
   <Config Name="Movie writes" Target="STANDARD_MOVIE_WRITES_ENABLED" Default="false" Mode="" Description="Explicitly disabled in QA." Type="Variable" Display="always" Required="true" Mask="false">false</Config>

@@ -10,6 +10,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 spec = importlib.util.spec_from_file_location("server_tools_app", Path(__file__).with_name("server-tools-app.py"))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -23,6 +25,7 @@ def _install_fake_mcp(monkeypatch, tool_results: dict[str, object]):
     """tool_results maps MCP tool_name -> the python object that tool
     should appear to return (already JSON-serializable)."""
     _json = json  # alias captured before `post(..., json=None)` shadows the name below
+    requests = []
 
     class FakeResponse:
         def __init__(self, text="", headers=None):
@@ -43,6 +46,7 @@ def _install_fake_mcp(monkeypatch, tool_results: dict[str, object]):
             return False
 
         async def post(self, url, headers=None, json=None, **kwargs):
+            requests.append({"url": url, "headers": dict(headers or {}), "json": json})
             method = (json or {}).get("method")
             if method == "initialize":
                 return FakeResponse(headers={"Mcp-Session-Id": "fake-session-1"})
@@ -58,6 +62,43 @@ def _install_fake_mcp(monkeypatch, tool_results: dict[str, object]):
             raise AssertionError(f"unexpected MCP method: {method}")
 
     monkeypatch.setattr(module, "httpx", type("FakeHttpxModule", (), {"AsyncClient": FakeAsyncClient}))
+    return requests
+
+
+def test_unraid_mcp_configured_bearer_secret_is_used_for_every_protocol_step(monkeypatch, tmp_path):
+    token_file = tmp_path / "unraid-mcp.token"
+    token_file.write_text("test-unraid-mcp-token\n", encoding="utf-8")
+    monkeypatch.setattr(module, "UNRAID_MCP_TOKEN_FILE", str(token_file))
+    requests = _install_fake_mcp(monkeypatch, {"get_array_status": {"state": "STARTED"}})
+
+    result = asyncio.run(module.unraid_mcp_call("get_array_status"))
+
+    assert result == {"state": "STARTED"}
+    assert [request["json"]["method"] for request in requests] == [
+        "initialize", "notifications/initialized", "tools/call",
+    ]
+    assert all(request["headers"]["Authorization"] == "Bearer test-unraid-mcp-token" for request in requests)
+
+
+@pytest.mark.parametrize("contents", ["", "  \n", "has whitespace\n"])
+def test_unraid_mcp_configured_empty_or_malformed_secret_fails_before_network(monkeypatch, tmp_path, contents):
+    token_file = tmp_path / "unraid-mcp.token"
+    token_file.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(module, "UNRAID_MCP_TOKEN_FILE", str(token_file))
+    requests = _install_fake_mcp(monkeypatch, {"get_array_status": {"state": "STARTED"}})
+
+    with pytest.raises(RuntimeError, match="authentication credential"):
+        asyncio.run(module.unraid_mcp_call("get_array_status"))
+    assert requests == []
+
+
+def test_unraid_mcp_configured_missing_secret_fails_before_network(monkeypatch, tmp_path):
+    monkeypatch.setattr(module, "UNRAID_MCP_TOKEN_FILE", str(tmp_path / "missing.token"))
+    requests = _install_fake_mcp(monkeypatch, {"get_array_status": {"state": "STARTED"}})
+
+    with pytest.raises(RuntimeError, match="authentication credential"):
+        asyncio.run(module.unraid_mcp_call("get_array_status"))
+    assert requests == []
 
 
 def test_storage_status_array_and_named_disk(monkeypatch):
