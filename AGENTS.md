@@ -8,12 +8,15 @@ These repository rules apply whenever Home-AI changes can affect shared Unraid s
 2. Capture the live configuration and a state-aware rollback; preserve P0 session, confirmation, authentication, and credential protections.
 3. Produce a pre-deployment diff for image/digest, networks/aliases, ports/bind addresses, mounts/modes, capabilities/devices, entrypoint/command, health/restart, secret references, and exposed routes.
 4. Serialize changes affecting the same container, template, network, alias, port, or shared state. Never let QA removal/recreation detach production dependencies.
+5. Check Docker image-filesystem headroom independently from application/media storage. Do not pull or build when the image filesystem lacks safe rollback/startup headroom.
+6. Update the authoritative `[[Server-Wide Remediation Register]]` disposition; a passing guardrail closes only the checks it actually performs.
 
 ## Privacy and authorization
 
 - Indoor camera images, clips, audio, thumbnails, stream URLs, event metadata, and household activity descriptions are sensitive. Never put them in Git, CI, logs, QA fixtures, external model context, or documentation.
 - Camera access is an explicit server-side capability, separate from ordinary read-only status access. QA has no camera-media access unless a deliberately scoped, tested policy grants it.
 - Never expose privileged Tools/MCP credentials to models or browsers. Treat Docker socket access, broad appdata mounts, host networking, and proxy-header trust as security-sensitive even when marked read-only.
+- Before changing Frigate retention or mounts, resolve the container path through the Unraid user share to the physical pool/disk and verify the intended allocation. Aggregate array free space is not a camera-storage quota.
 
 ## Update compatibility
 

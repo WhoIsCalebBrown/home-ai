@@ -82,6 +82,43 @@ def audit(snapshot: dict[str, Any], policy: dict[str, Any] | None = None) -> lis
                     findings.append(finding("FRIGATE_RESTREAM_HOST_PUBLICATION", "high", name,
                                             f"RTSP/WebRTC-related port {port} is host-published"))
 
+        if name.lower() == "ollama":
+            for binding in ports_for(item):
+                if binding["container_port"] == "11434" and is_all_interfaces(binding):
+                    findings.append(finding("OLLAMA_ALL_INTERFACE_PUBLICATION", "high", name,
+                                            "unauthenticated model API port is bound on all host interfaces"))
+
+        if name.lower() == "netdata":
+            host_config = item.get("host_config") or {}
+            caps = {str(value).upper() for value in host_config.get("cap_add") or []}
+            socket_mount = any(str(mount.get("source") or "") == "/var/run/docker.sock"
+                               or str(mount.get("destination") or "") == "/var/run/docker.sock"
+                               for mount in item.get("mounts") or [])
+            if str(host_config.get("network_mode") or "") == "host" and (socket_mount or caps & {"CAP_SYS_ADMIN", "CAP_SYS_PTRACE"}):
+                findings.append(finding("NETDATA_HOST_PRIVILEGE_SURFACE", "high", name,
+                                        "host networking combined with Docker socket or host-administration capabilities"))
+
+        if name.lower() in {"binhex-qbittorrentvpn", "qbittorrentvpn"}:
+            host_config = item.get("host_config") or {}
+            if host_config.get("privileged") is True:
+                findings.append(finding("QBITTORRENTVPN_PRIVILEGED", "high", name,
+                                        "VPN client is privileged; retain explicit kill-switch and exposure verification"))
+            if any(is_all_interfaces(binding) and binding["container_port"] in {"8080", "8118", "9118"}
+                   for binding in ports_for(item)):
+                findings.append(finding("QBITTORRENTVPN_MANAGEMENT_ALL_INTERFACE_PUBLICATION", "high", name,
+                                        "Web UI or proxy management port is bound on all host interfaces"))
+
+        if name.lower() in {"nginx-proxy-manager-official", "nginx-proxy-manager"}:
+            if any(is_all_interfaces(binding) and binding["container_port"] == "81" for binding in ports_for(item)):
+                findings.append(finding("NPM_ADMIN_ALL_INTERFACE_PUBLICATION", "high", name,
+                                        "Nginx Proxy Manager administration port is bound on all host interfaces"))
+
+        if name == "cli_debrid":
+            if any(str(mount.get("destination") or "") == "/run/home-ai/cli_debrid_startup.sh"
+                   for mount in item.get("mounts") or []):
+                findings.append(finding("CLI_DEBRID_RUNTIME_STARTUP_PATCH", "high", name,
+                                        "owned startup wrapper is mounted into a third-party container; update compatibility is version-coupled"))
+
         if name == "Home-AI-Tools":
             for mount in item.get("mounts") or []:
                 source = str(mount.get("source") or "")
@@ -92,6 +129,23 @@ def audit(snapshot: dict[str, Any], policy: dict[str, Any] | None = None) -> lis
                 if source == "/mnt/cache/appdata" or source.startswith("/mnt/cache/appdata/"):
                     findings.append(finding("TOOLS_BROAD_APPDATA_MOUNT", "high", name,
                                             "mount grants Home-AI Tools access to the broad appdata tree"))
+                if source in {"/mnt/user", "/mnt/cache"}:
+                    findings.append(finding("TOOLS_BROAD_STORAGE_MOUNT", "high", name,
+                                            "mount grants Home-AI Tools access to a broad host storage tree"))
+
+        if name in {"Home-AI-QA-Assistant", "Home-AI-QA-Tools"}:
+            host_config = item.get("host_config") or {}
+            cap_drop = {str(value).upper() for value in host_config.get("cap_drop") or []}
+            security_opt = {str(value).lower() for value in host_config.get("security_opt") or []}
+            if host_config.get("readonly_rootfs") is not True:
+                findings.append(finding("QA_ROOT_FILESYSTEM_WRITABLE", "high", name,
+                                        "QA container root filesystem is writable despite the hardened deployment contract"))
+            if "ALL" not in cap_drop:
+                findings.append(finding("QA_CAPABILITIES_NOT_DROPPED", "high", name,
+                                        "QA container does not explicitly drop all Linux capabilities"))
+            if not any(value.startswith("no-new-privileges") for value in security_opt):
+                findings.append(finding("QA_NO_NEW_PRIVILEGES_MISSING", "high", name,
+                                        "QA container does not enforce no-new-privileges"))
 
     host = snapshot.get("host") or {}
     docker_percent = host.get("docker_filesystem_percent")
@@ -177,6 +231,9 @@ def collect_remote(host: str) -> dict[str, Any]:
       })),
       mounts: [(.Mounts // [])[] | {source: .Source, destination: .Destination, rw: .RW}],
       host_config: {privileged: (.HostConfig.Privileged // false),
+        readonly_rootfs: (.HostConfig.ReadonlyRootfs // false),
+        cap_add: (.HostConfig.CapAdd // []), cap_drop: (.HostConfig.CapDrop // []),
+        security_opt: (.HostConfig.SecurityOpt // []),
         network_mode: (.HostConfig.NetworkMode // ""),
         restart_policy: (.HostConfig.RestartPolicy.Name // "")}
     }]' '''
