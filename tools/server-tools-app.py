@@ -559,14 +559,30 @@ async def storage_status(_: dict[str, Any]) -> dict[str, Any]:
 
 async def gpu_status(_: dict[str, Any]) -> dict[str, Any]:
     try:
-        p = await asyncio.create_subprocess_exec("nvidia-smi", "--query-gpu=name,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await p.communicate()
-        if p.returncode:
-            raise RuntimeError(err.decode(errors="ignore"))
+        # The Tools container deliberately has no host GPU devices or shell
+        # access.  The privileged Unraid Management Agent owns that boundary;
+        # this is a fixed, read-only call rather than a model-directed command.
+        metrics = await unraid_mcp_call("get_gpu_metrics")
+        if not isinstance(metrics, list):
+            raise RuntimeError("Unraid MCP returned an unexpected GPU metrics shape")
         gpus = []
-        for line in out.decode().splitlines():
-            name, uid, mem, total, util, temp, power = [x.strip() for x in line.split(",")]
-            gpus.append({"model": name, "uuid": uid, "vram_used_mib": int(float(mem)), "vram_total_mib": int(float(total)), "utilization_percent": int(float(util)), "temperature_c": int(float(temp)), "power_w": float(power)})
+        for gpu in metrics:
+            if not isinstance(gpu, dict):
+                raise RuntimeError("Unraid MCP returned an invalid GPU metric")
+            # The MCP reports VRAM in bytes while this long-standing public
+            # tool schema reports MiB.  Keep the schema stable for callers
+            # such as voice-api-app's deterministic renderer.
+            used_bytes = gpu.get("memory_used_bytes")
+            total_bytes = gpu.get("memory_total_bytes")
+            gpus.append({
+                "model": gpu.get("name"),
+                "uuid": gpu.get("uuid"),
+                "vram_used_mib": int(used_bytes / (1024 * 1024)) if used_bytes is not None else None,
+                "vram_total_mib": int(total_bytes / (1024 * 1024)) if total_bytes is not None else None,
+                "utilization_percent": gpu.get("utilization_gpu_percent"),
+                "temperature_c": gpu.get("temperature_celsius"),
+                "power_w": gpu.get("power_draw_watts"),
+            })
         return {"gpus": gpus}
     except Exception as exc:
         # Adapter failures are operation failures even though the HTTP handler

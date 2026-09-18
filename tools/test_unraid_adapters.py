@@ -227,6 +227,45 @@ def test_system_health_survives_alerts_call_failing(monkeypatch):
     assert health["firing_alerts"] == []
 
 
+def test_gpu_status_normalizes_two_unraid_mcp_gpus(monkeypatch):
+    _install_fake_mcp(monkeypatch, {
+        "get_gpu_metrics": [
+            {"name": "NVIDIA GeForce RTX 3070", "uuid": "GPU-3070",
+             "memory_used_bytes": 5_199_888_384, "memory_total_bytes": 8_589_934_592,
+             "utilization_gpu_percent": 31, "temperature_celsius": 42,
+             "power_draw_watts": 20.45},
+            {"name": "NVIDIA GeForce GTX 1660 SUPER", "uuid": "GPU-1660",
+             "memory_used_bytes": 1_139_802_112, "memory_total_bytes": 6_442_450_944,
+             "utilization_gpu_percent": 7, "temperature_celsius": 51,
+             "power_draw_watts": 40.21},
+        ],
+    })
+
+    result = asyncio.run(module.gpu_status({}))
+
+    assert result == {"gpus": [
+        {"model": "NVIDIA GeForce RTX 3070", "uuid": "GPU-3070",
+         "vram_used_mib": 4959, "vram_total_mib": 8192,
+         "utilization_percent": 31, "temperature_c": 42, "power_w": 20.45},
+        {"model": "NVIDIA GeForce GTX 1660 SUPER", "uuid": "GPU-1660",
+         "vram_used_mib": 1087, "vram_total_mib": 6144,
+         "utilization_percent": 7, "temperature_c": 51, "power_w": 40.21},
+    ]}
+
+
+def test_gpu_status_returns_operation_failure_when_unraid_mcp_fails(monkeypatch):
+    async def fail_gpu_metrics(*_args, **_kwargs):
+        raise RuntimeError("Unraid MCP unavailable")
+
+    monkeypatch.setattr(module, "unraid_mcp_call", fail_gpu_metrics)
+
+    result = asyncio.run(module.gpu_status({}))
+
+    assert result == {"error": "GPU telemetry unavailable",
+                      "error_code": "GPU_TELEMETRY_UNAVAILABLE",
+                      "detail": "RuntimeError", "evidence_available": False}
+
+
 def test_unraid_tools_are_registered_and_discoverable():
     names = {item[0] for item in module.REGISTRY}
     for tool in ["unraid_storage_status", "unraid_disk_health", "unraid_container_status",
