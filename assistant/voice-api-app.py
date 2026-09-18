@@ -2620,7 +2620,18 @@ def media_status_display_title(result: dict, user_text: str) -> str:
 
 
 def social_acknowledgement(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks|got it|understood|alright|all right)[.!]?\s*", text, re.I))
+    return bool(re.fullmatch(
+        r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks|got it|understood|alright|all right|oh|ah|huh|wow)[.!]?\s*",
+        text,
+        re.I,
+    ))
+
+
+def social_acknowledgement_response(text: str) -> str:
+    """Return a neutral deterministic reply for a contentless social turn."""
+    if re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks)[.!]?\s*", text, re.I):
+        return "You're welcome."
+    return "Okay."
 
 
 def underspecified_read_request(text: str, context: dict | None = None) -> str | None:
@@ -4135,6 +4146,15 @@ def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | No
     return None
 
 
+def plural_disambiguation_reply(text: str) -> bool:
+    """Recognize multi-select wording without creating multiple plans."""
+    return bool(re.fullmatch(
+        r"\s*(?:both|all|all of (?:them|those)|every one|everything)[.!]?\s*",
+        text,
+        re.I,
+    ))
+
+
 def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     """Compute the next-best read-only action for an identified-but-not-yet-
     actionable (or already-available) media plan, stage it as a PendingOffer,
@@ -4754,6 +4774,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if creator_hint and not has_people_evidence:
                 full = ("These catalog candidates don't include cast or creator evidence, so I can't safely use that hint yet: "
                         + ", ".join(labels) + ".") if labels else "The catalog results don't include cast or creator evidence, so I can't safely use that hint yet."
+            elif plural_disambiguation_reply(user_text):
+                count = len(candidates)
+                count_label = {2: "two", 3: "three"}.get(count, str(count))
+                if count == 2:
+                    reason = "I found two choices, but I can only prepare one exact request at a time."
+                else:
+                    reason = f"I found {count_label} choices, so 'both' doesn't identify which two. I can only prepare one exact request at a time."
+                full = reason + (" Which one do you want: " + ", ".join(labels) + "." if labels else " Which one do you want?")
             else:
                 full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="disambiguation_reprompt")
@@ -4976,7 +5004,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         if social_acknowledgement(user_text):
-            full = "You're welcome."
+            full = social_acknowledgement_response(user_text)
             await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})

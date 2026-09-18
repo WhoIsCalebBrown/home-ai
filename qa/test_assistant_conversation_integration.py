@@ -1414,6 +1414,37 @@ async def test_bare_yes_does_not_select_among_candidates(session):
 
 
 @pytest.mark.asyncio
+async def test_plural_reply_to_three_candidates_explains_single_plan_boundary(session):
+    for index, year in enumerate((2001, 2002, 2003), start=1):
+        session.backend.seed_web("Example Story", media_type="movie", year=year, tmdb_id=str(9000 + index))
+    await session.turn(
+        "Get Example Story",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Get Example Story"}}},
+        ]}}],
+    )
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("Both")
+    assert "three" in reply.casefold()
+    assert "one exact request at a time" in reply.casefold()
+    assert len(session.backend.call_log) == calls_before
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_bare_oh_after_media_turn_terminates_without_tool_or_model(session):
+    session.app.conversation_context[session.client_id] = {
+        "domain": "media",
+        "canonical_identity": {"title": "Example Story", "year": 2001, "media_type": "movie", "tmdb_id": "9001"},
+    }
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("Oh")
+    assert reply == "Okay."
+    assert len(session.backend.call_log) == calls_before
+    assert "camera" not in reply.casefold()
+
+
+@pytest.mark.asyncio
 async def test_disambiguation_status_combined(session):
     """Spec item #12: "Do you know Dune?" / "the new one" / "Do I have it?"
     / "How's it doing?" -- the same resolved 2021 subject throughout,
