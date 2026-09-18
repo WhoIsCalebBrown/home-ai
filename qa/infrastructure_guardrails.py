@@ -61,6 +61,25 @@ def audit(snapshot: dict[str, Any], policy: dict[str, Any] | None = None) -> lis
     containers = snapshot.get("containers") or []
     by_name = {str(item.get("name")): item for item in containers}
 
+    frigate_network = "home-ai-frigate"
+    expected_frigate_members = {"frigate", "Home-AI-Tools"}
+    actual_frigate_members = {
+        str(item.get("name")) for item in containers
+        if frigate_network in container_networks(item)
+    }
+    if ((expected_frigate_members & set(by_name)) or actual_frigate_members) and actual_frigate_members != expected_frigate_members:
+        missing = sorted(expected_frigate_members - actual_frigate_members)
+        unexpected = sorted(actual_frigate_members - expected_frigate_members)
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected: " + ", ".join(unexpected))
+        findings.append(finding(
+            "FRIGATE_INTEGRATION_NETWORK_DRIFT", "high", frigate_network,
+            "; ".join(details) or "membership differs from the reviewed contract",
+        ))
+
     for item in containers:
         name = str(item.get("name") or "<unnamed>")
         image = str(item.get("image") or "")

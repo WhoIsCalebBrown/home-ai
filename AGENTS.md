@@ -10,6 +10,7 @@ These repository rules apply whenever Home-AI changes can affect shared Unraid s
 4. Serialize changes affecting the same container, template, network, alias, port, or shared state. Never let QA removal/recreation detach production dependencies.
 5. Check Docker image-filesystem headroom independently from application/media storage. Do not pull or build when the image filesystem lacks safe rollback/startup headroom.
 6. Update the authoritative `[[Server-Wide Remediation Register]]` disposition; a passing guardrail closes only the checks it actually performs.
+7. After recreating Frigate or production Tools, run `deployment/frigate/ensure-network-contract.sh --apply`, then `--check`. The `home-ai-frigate` network must contain exactly `frigate` and `Home-AI-Tools`; never attach QA or general-purpose services.
 
 ## Privacy and authorization
 
