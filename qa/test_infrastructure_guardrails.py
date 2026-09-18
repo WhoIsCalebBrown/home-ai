@@ -22,6 +22,20 @@ def test_flags_camera_publication_without_fetching_media():
     assert "FRIGATE_RESTREAM_HOST_PUBLICATION" in result
 
 
+def test_frigate_integration_network_requires_exact_membership():
+    contained = {"home-ai-frigate": {"aliases": [], "dns_names": []}}
+    frigate = container("frigate", networks=contained)
+    tools = container("Home-AI-Tools", networks=contained)
+    assert "FRIGATE_INTEGRATION_NETWORK_DRIFT" not in ids(
+        audit({"containers": [frigate, tools]})
+    )
+
+    intruder = container("Open-WebUI", networks=contained)
+    assert "FRIGATE_INTEGRATION_NETWORK_DRIFT" in ids(
+        audit({"containers": [frigate, tools, intruder]})
+    )
+
+
 def test_flags_tools_privilege_and_mcp_booleans_without_reporting_values():
     tools = container("Home-AI-Tools", mounts=[
         {"source": "/mnt/cache/appdata", "destination": "/appdata", "rw": False},
