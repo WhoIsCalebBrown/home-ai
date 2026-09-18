@@ -181,6 +181,15 @@ HOME_ENTITY_GROUPS = {
         "switch.neon_light_socket_1",
     },
 }
+HOME_BULK_SAFE_ENTITIES = {value.strip() for value in os.getenv("HOME_BULK_SAFE_ENTITIES", "").split(",") if value.strip()}
+_HOME_EXISTING_WRITE_POLICY = {
+    "light.office_light", "light.bedroom_lamp", "light.music_star_light",
+    "light.light_fixture_1", "light.light_fixture_2", "light.light_fixture_3",
+    "switch.neon_lights_socket_1", "switch.neon_lights_socket_1_2", "switch.neon_light_socket_1",
+}
+HOME_WRITE_ALLOWED_ENTITIES = {value.strip() for value in os.getenv(
+    "HOME_WRITE_ALLOWED_ENTITIES", ",".join(sorted(_HOME_EXISTING_WRITE_POLICY))).split(",") if value.strip()}
+HOME_SCENE_ALLOWED_ENTITIES = {value.strip() for value in os.getenv("HOME_SCENE_ALLOWED_ENTITIES", "").split(",") if value.strip()}
 WEATHER_LOCATION_HINTS = {}
 for _hint in os.getenv("WEATHER_LOCATION_HINTS", "").split(";"):
     if "=" in _hint:
@@ -3850,31 +3859,77 @@ async def _home_assistant_get(path: str) -> Any:
         return response.json()
 
 
+async def _home_assistant_ws(commands: list[str]) -> dict[str, Any]:
+    """Run bounded supported HA WebSocket registry/state reads.
+
+    Registry list commands are WebSocket APIs, not REST routes.  Authentication
+    and results remain server-side and the connection is closed after the
+    snapshot; a long-lived projection can replace this after latency measurement.
+    """
+    import websockets
+
+    ws_url = re.sub(r"^http", "ws", HOME_ASSISTANT_URL) + "/api/websocket"
+    results: dict[str, Any] = {}
+    async with websockets.connect(ws_url, open_timeout=8, close_timeout=2) as socket:
+        hello = json.loads(await asyncio.wait_for(socket.recv(), timeout=8))
+        if hello.get("type") != "auth_required":
+            raise RuntimeError("Home Assistant WebSocket did not request authentication")
+        await socket.send(json.dumps({"type": "auth", "access_token": _home_assistant_token()}))
+        authenticated = json.loads(await asyncio.wait_for(socket.recv(), timeout=8))
+        if authenticated.get("type") != "auth_ok":
+            raise RuntimeError("Home Assistant WebSocket authentication failed")
+        for message_id, command in enumerate(commands, 1):
+            await socket.send(json.dumps({"id": message_id, "type": command}))
+            message = json.loads(await asyncio.wait_for(socket.recv(), timeout=8))
+            if not message.get("success"):
+                raise RuntimeError(f"Home Assistant command {command} failed")
+            results[command] = message.get("result")
+    return results
+
+
 async def _home_assistant_entities() -> tuple[list[dict[str, Any]], dict[str, str]]:
-    states = await _home_assistant_get("/api/states")
+    snapshot = await _home_assistant_ws([
+        "get_states", "config/area_registry/list", "config/floor_registry/list",
+        "config/device_registry/list", "config/entity_registry/list",
+    ])
+    states = snapshot.get("get_states")
     if not isinstance(states, list):
         raise RuntimeError("Home Assistant returned an invalid state list")
-    entities = [item for item in states if isinstance(item, dict)
-                and str(item.get("entity_id", "")).split(".", 1)[0] in HOME_ALLOWED_DOMAINS]
-    area_names: dict[str, str] = {}
-    try:
-        areas = await _home_assistant_get("/api/config/area_registry/list")
-        if isinstance(areas, list):
-            area_names = {str(item.get("area_id")): str(item.get("name"))
-                          for item in areas if item.get("area_id") and item.get("name")}
-        registry = await _home_assistant_get("/api/config/entity_registry/list")
-        if isinstance(registry, list):
-            by_entity = {str(item.get("entity_id")): item for item in registry}
-            for entity in entities:
-                metadata = by_entity.get(str(entity.get("entity_id")), {})
-                entity["_area_id"] = metadata.get("area_id")
-                entity["_aliases"] = [str(alias) for alias in (metadata.get("aliases") or []) if alias]
-    except httpx.HTTPStatusError:
-        # State reads remain useful with a restricted HA user; area targeting
-        # will simply require an entity name until registry access is allowed.
-        pass
-    for entity in entities:
-        entity["_area_name"] = area_names.get(str(entity.get("_area_id")), "")
+    areas = snapshot.get("config/area_registry/list") or []
+    floors = snapshot.get("config/floor_registry/list") or []
+    devices = snapshot.get("config/device_registry/list") or []
+    registry = snapshot.get("config/entity_registry/list") or []
+    area_names = {str(item.get("area_id")): str(item.get("name")) for item in areas
+                  if item.get("area_id") and item.get("name")}
+    floor_names = {str(item.get("floor_id")): str(item.get("name")) for item in floors
+                   if item.get("floor_id") and item.get("name")}
+    area_floors = {str(item.get("area_id")): floor_names.get(str(item.get("floor_id")), "")
+                   for item in areas}
+    by_device = {str(item.get("id")): item for item in devices if item.get("id")}
+    by_entity = {str(item.get("entity_id")): item for item in registry}
+    entities = []
+    for raw in states:
+        entity_id = str(raw.get("entity_id", "")) if isinstance(raw, dict) else ""
+        metadata = by_entity.get(entity_id, {})
+        if (entity_id.split(".", 1)[0] not in HOME_ALLOWED_DOMAINS
+                or metadata.get("disabled_by") is not None
+                or metadata.get("hidden_by") is not None):
+            continue
+        entity = dict(raw)
+        device = by_device.get(str(metadata.get("device_id")), {})
+        area_id = metadata.get("area_id") or device.get("area_id")
+        entity.update({
+            "_area_id": area_id,
+            "_area_name": area_names.get(str(area_id), ""),
+            "_floor_name": area_floors.get(str(area_id), ""),
+            "_aliases": [str(alias) for alias in (metadata.get("aliases") or []) if alias],
+            "_device_id": metadata.get("device_id"),
+            "_device_name": device.get("name_by_user") or device.get("name"),
+            "_manufacturer": device.get("manufacturer"),
+            "_model": device.get("model"),
+            "_integration": metadata.get("platform"),
+        })
+        entities.append(entity)
     return entities, area_names
 
 
@@ -3885,13 +3940,30 @@ def _home_entity_view(entity: dict[str, Any]) -> dict[str, Any]:
         "name": attrs.get("friendly_name") or entity.get("entity_id"),
         "domain": str(entity.get("entity_id", "")).split(".", 1)[0],
         "state": entity.get("state"),
+        "availability": "unavailable" if entity.get("state") == "unavailable" else
+                        "unknown" if entity.get("state") == "unknown" else "available",
         "available": entity.get("state") not in {"unavailable", "unknown"},
+        "connectivity": {"status": "unobserved",
+                         "evidence": "No independent device-connectivity sensor is authorized for this entity."},
         "area": entity.get("_area_name") or None,
+        "floor": entity.get("_floor_name") or None,
         "aliases": list(entity.get("_aliases") or []),
+        "device_id": entity.get("_device_id"),
+        "device_name": entity.get("_device_name"),
+        "manufacturer": entity.get("_manufacturer"),
+        "model": entity.get("_model"),
+        "integration": entity.get("_integration"),
         "supported_features": int(attrs.get("supported_features") or 0),
         "supported_color_modes": list(attrs.get("supported_color_modes") or []),
         "brightness_pct": round(float(attrs["brightness"] or 0) / 255 * 100, 1)
         if attrs.get("brightness") is not None else None,
+        "color_mode": attrs.get("color_mode"),
+        "color_temp_kelvin": attrs.get("color_temp_kelvin"),
+        "last_changed": entity.get("last_changed"),
+        "last_updated": entity.get("last_updated"),
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "observation_source": "home_assistant_live",
+        "freshness": {"source_healthy": True, "cached": False},
     }
 
 
@@ -3950,6 +4022,8 @@ def _home_match_result(query: str, entities: list[dict[str, Any]], *, area_only:
     area_matches = [item for item in entities if str(item.get("_area_name") or "").casefold() == folded]
     if area_matches:
         return {"status": "ok", "matches": area_matches, "candidates": []}
+    if area_only:
+        return {"status": "not_found", "matches": [], "candidates": []}
     named_areas = sorted({str(item.get("_area_name") or "") for item in entities if item.get("_area_name")},
                          key=len, reverse=True)
     embedded_area = next((area for area in named_areas if area.casefold() in folded), None)
@@ -4020,17 +4094,65 @@ async def home_find_device(args: dict[str, Any]) -> dict[str, Any]:
             if domain:
                 matches = [item for item in entities if str(item.get("entity_id", "")).startswith(domain + ".")]
                 status = "ok"
+    physical_ids = {str(item.get("_device_id")) for item in matches if item.get("_device_id")}
     return {"status": status, "devices": [_home_entity_view(item) for item in matches[:25]] if matches else candidates,
             "candidates": candidates if status == "ambiguous" else [], "count": len(matches) if matches else len(candidates),
-            "scope": sorted(HOME_ALLOWED_DOMAINS)}
+            "entity_count": len(matches), "physical_device_count": len(physical_ids),
+            "scope": sorted(HOME_ALLOWED_DOMAINS),
+            "scope_note": "Enabled, non-hidden, authorized light and switch entities only; helpers, updates, diagnostics, and other domains are excluded."}
 
 
 async def home_get_state(args: dict[str, Any]) -> dict[str, Any]:
-    query = str(args.get("entity_or_area", "")).strip()
-    if query.casefold() in {"on", "off", "unavailable", "unknown"}:
+    has_exact_set = isinstance(args.get("entity_ids"), list)
+    requested_ids = [str(value).strip() for value in (args.get("entity_ids") or []) if str(value).strip()]
+    state_selector = str(args.get("state") or "").strip().casefold()
+    domain_selector = str(args.get("domain") or "").strip().casefold().rstrip("s")
+    if domain_selector in {"lamp", "light"}:
+        domain_selector = "light"
+    elif domain_selector in {"outlet", "plug", "socket", "switch"}:
+        domain_selector = "switch"
+    area_selector = str(args.get("area") or "").strip().casefold()
+    floor_selector = str(args.get("floor") or "").strip().casefold()
+    scope_selector = str(args.get("scope") or "").strip().casefold()
+    if has_exact_set or state_selector or domain_selector or area_selector or floor_selector or scope_selector:
         entities, _ = await _home_assistant_entities()
-        matches = [item for item in entities if str(item.get("state", "")).casefold() == query.casefold()]
-        return {"status": "ok", "devices": [_home_entity_view(item) for item in matches], "candidates": [], "count": len(matches)}
+        by_id = {str(item.get("entity_id")): item for item in entities}
+        matches = [by_id[entity_id] for entity_id in requested_ids if entity_id in by_id] if has_exact_set else list(entities)
+        missing = [entity_id for entity_id in requested_ids if entity_id not in by_id] if has_exact_set else []
+        if domain_selector:
+            matches = [item for item in matches if str(item.get("entity_id", "")).startswith(domain_selector + ".")]
+        if area_selector:
+            matches = [item for item in matches if str(item.get("_area_name") or "").casefold() == area_selector]
+        if floor_selector:
+            matches = [item for item in matches if str(item.get("_floor_name") or "").casefold() == floor_selector]
+        if scope_selector:
+            matches = [item for item in matches if scope_selector in {
+                str(item.get("_area_name") or "").casefold(), str(item.get("_floor_name") or "").casefold()}]
+        scoped_matches = list(matches)
+        if state_selector == "available":
+            matches = [item for item in matches if item.get("state") not in {"unavailable", "unknown"}]
+        elif state_selector:
+            matches = [item for item in matches if str(item.get("state") or "").casefold() == state_selector]
+        all_states = [str(item.get("state") or "unknown").casefold() for item in scoped_matches]
+        state_counts = {state: all_states.count(state) for state in sorted(set(all_states))}
+        return {"status": "ok" if not missing else "partial", "devices": [_home_entity_view(item) for item in matches],
+                "candidates": [], "count": len(matches), "missing_or_unauthorized": missing,
+                "query_state": state_selector or None, "domain_filter": domain_selector or None,
+                "area_filter": area_selector or None, "floor_filter": floor_selector or None,
+                "scope_filter": scope_selector or None,
+                "state_counts": state_counts, "scope_count": len(scoped_matches),
+                "aggregate_check": args.get("aggregate_check"),
+                "scope_note": "Authorized Home Assistant snapshot; any exact retained IDs were revalidated before filtering."}
+    query = str(args.get("entity_or_area", "")).strip()
+    if query.casefold() in {"on", "off", "available", "unavailable", "unknown"}:
+        entities, _ = await _home_assistant_entities()
+        if query.casefold() == "available":
+            matches = [item for item in entities if item.get("state") not in {"unavailable", "unknown"}]
+        else:
+            matches = [item for item in entities if str(item.get("state", "")).casefold() == query.casefold()]
+        return {"status": "ok", "devices": [_home_entity_view(item) for item in matches], "candidates": [],
+                "count": len(matches), "query_state": query.casefold(),
+                "scope_note": "Authorized enabled light and switch entities; unavailable and unknown are never counted as off."}
     result = await _home_resolve(query)
     return {"status": result["status"], "devices": [_home_entity_view(item) for item in result["matches"]],
             "candidates": result["candidates"], "count": len(result["matches"])}
@@ -4044,38 +4166,214 @@ async def home_get_area_state(args: dict[str, Any]) -> dict[str, Any]:
             "candidates": result["candidates"], "count": len(result["matches"])}
 
 
+async def home_get_activity(args: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded HA-observed history without inventing attribution."""
+    query = str(args.get("entity_or_area", "")).strip()
+    hours = max(0.25, min(168.0, float(args.get("hours", 24))))
+    requested_ids = [str(value).strip() for value in (args.get("entity_ids") or []) if str(value).strip()]
+    if isinstance(args.get("entity_ids"), list):
+        entities, _ = await _home_assistant_entities()
+        by_id = {str(item.get("entity_id")): item for item in entities}
+        missing = [entity_id for entity_id in requested_ids if entity_id not in by_id]
+        result = {"status": "ok" if not missing else "partial",
+                  "matches": [by_id[entity_id] for entity_id in requested_ids if entity_id in by_id],
+                  "candidates": [], "missing_or_unauthorized": missing}
+    elif query.casefold() in {"everything", "all devices", "all home devices", "home"}:
+        entities, _ = await _home_assistant_entities()
+        result = {"status": "ok", "matches": entities, "candidates": []}
+    else:
+        result = await _home_resolve(query)
+    if result["status"] not in {"ok", "partial"}:
+        return {"status": result["status"], "candidates": result.get("candidates", [])}
+    entity_ids = [str(item.get("entity_id")) for item in result["matches"]]
+    if not entity_ids:
+        return {
+            "status": result["status"], "hours": hours, "devices": [], "changes": [],
+            "history_returned": False, "history_complete": False,
+            "missing_or_unauthorized": result.get("missing_or_unauthorized", []),
+            "history_note": "No authorized entity remained in the requested scope; Home Assistant history was not queried.",
+        }
+    allowed_entity_ids = set(entity_ids)
+    start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    headers = {"Authorization": f"Bearer {_home_assistant_token()}"}
+    params = {"filter_entity_id": ",".join(entity_ids), "minimal_response": "false",
+              "no_attributes": "true", "significant_changes_only": "true"}
+    async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+        response = await client.get(f"{HOME_ASSISTANT_URL}/api/history/period/{start}", params=params)
+        response.raise_for_status()
+        history = response.json()
+    changes = []
+    for series in history if isinstance(history, list) else []:
+        series_entity_id = next((event.get("entity_id") for event in series
+                                 if isinstance(event, dict) and event.get("entity_id")), None)
+        if series_entity_id not in allowed_entity_ids:
+            continue
+        for event in series if isinstance(series, list) else []:
+            if not isinstance(event, dict):
+                continue
+            event_entity_id = event.get("entity_id") or series_entity_id
+            if event_entity_id not in allowed_entity_ids:
+                continue
+            changes.append({"entity_id": event_entity_id, "state": event.get("state"),
+                            "observed_at": event.get("last_changed") or event.get("last_updated"),
+                            "context": event.get("context"),
+                            "attribution_note": "Context identifiers may support correlation but do not by themselves identify a physical operator."})
+    changes.sort(key=lambda item: str(item.get("observed_at") or ""))
+    return {"status": "ok", "hours": hours, "devices": [_home_entity_view(item) for item in result["matches"]],
+            "changes": changes[-100:], "history_returned": bool(changes), "history_complete": False,
+            "missing_or_unauthorized": result.get("missing_or_unauthorized", []),
+            "history_note": "This is retained significant-change history for the requested window, not guaranteed complete provenance. No events does not mean the event never happened."}
+
+
+async def home_list_routines(args: dict[str, Any]) -> dict[str, Any]:
+    """Inventory existing scenes/scripts/automations; never activates them."""
+    requested = str(args.get("kind", "all")).casefold().rstrip("s")
+    allowed_kinds = {"all", "scene", "script", "automation"}
+    if requested not in allowed_kinds:
+        raise ValueError("Unsupported Home Assistant routine kind")
+    snapshot = await _home_assistant_ws(["get_states", "config/entity_registry/list"])
+    registry = {str(item.get("entity_id")): item for item in snapshot.get("config/entity_registry/list") or []}
+    domains = {"scene", "script", "automation"} if requested == "all" else {requested}
+    items = []
+    for state in snapshot.get("get_states") or []:
+        entity_id = str(state.get("entity_id", ""))
+        domain = entity_id.split(".", 1)[0]
+        metadata = registry.get(entity_id, {})
+        if domain not in domains or metadata.get("disabled_by") is not None or metadata.get("hidden_by") is not None:
+            continue
+        attrs = state.get("attributes") or {}
+        items.append({"entity_id": entity_id, "kind": domain,
+                      "name": attrs.get("friendly_name") or entity_id,
+                      "state": state.get("state"), "last_triggered": attrs.get("last_triggered"),
+                      "mode": attrs.get("mode"), "activation_approved": False,
+                      "scope_note": "Effects require separate inspection and policy approval before activation."})
+    return {"status": "ok", "items": items, "count": len(items), "read_only": True}
+
+
 async def home_control(args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action", "")).strip().casefold()
-    if action not in {"turn_on", "turn_off", "set_brightness"}:
-        raise ValueError("Allowed Home Assistant actions are turn_on, turn_off, and set_brightness")
-    result = await _home_resolve(str(args.get("entity_or_area", "")))
+    if action not in {"turn_on", "turn_off", "set_brightness", "adjust_brightness", "set_color", "set_color_temperature"}:
+        raise ValueError("Unsupported bounded Home Assistant action")
+    target_query = str(args.get("entity_or_area", ""))
+    has_exact_set = isinstance(args.get("entity_ids"), list)
+    requested_ids = [str(value).strip() for value in (args.get("entity_ids") or []) if str(value).strip()]
+    if has_exact_set:
+        entities, _ = await _home_assistant_entities()
+        by_id = {str(item.get("entity_id")): item for item in entities}
+        missing = [entity_id for entity_id in requested_ids if entity_id not in by_id]
+        result = {"status": "ok", "matches": [by_id[entity_id] for entity_id in requested_ids if entity_id in by_id],
+                  "candidates": []}
+        if not result["matches"]:
+            return {"status": "not_found", "devices": [], "missing_or_unauthorized": missing}
+    else:
+        missing = []
+        if target_query.casefold() in {"everything", "all devices", "all home devices", "all lights", "all switches", "all outlets"}:
+            entities, _ = await _home_assistant_entities()
+            if target_query.casefold() == "all lights":
+                entities = [item for item in entities if str(item.get("entity_id", "")).startswith("light.")]
+            elif target_query.casefold() in {"all switches", "all outlets"}:
+                entities = [item for item in entities if str(item.get("entity_id", "")).startswith("switch.")]
+            result = {"status": "ok", "matches": entities, "candidates": []}
+        else:
+            result = await _home_resolve(target_query)
     if result["status"] != "ok":
         if result["status"] == "ambiguous":
             names = ", ".join(str(item.get("name") or item.get("entity_id")) for item in result["candidates"])
             return {"status": "ambiguous", "message": f"I found more than one matching device: {names}. Which one did you mean?", "candidates": result["candidates"]}
         return {"status": "not_found", "devices": []}
     matches = result["matches"]
-    brightness = args.get("parameters", {}).get("brightness_pct") if isinstance(args.get("parameters"), dict) else None
-    if action == "set_brightness":
+    requested_scope_count = len(requested_ids) if has_exact_set else len(matches)
+    resolved_scope_count = len(matches)
+    unauthorized = [item for item in matches if str(item.get("entity_id")) not in HOME_WRITE_ALLOWED_ENTITIES]
+    matches = [item for item in matches if item not in unauthorized]
+    if unauthorized and not matches:
+        return {"status": "forbidden", "devices": [_home_entity_view(item) for item in unauthorized],
+                "message": "The target is visible for reads but is not approved for Home-AI control."}
+    parameters = args.get("parameters", {}) if isinstance(args.get("parameters"), dict) else {}
+    setting_actions = {"set_brightness", "adjust_brightness", "set_color", "set_color_temperature"}
+    pre_skipped = [item for item in matches if item.get("state") in {"unavailable", "unknown"}] if action in setting_actions else []
+    if pre_skipped and len(pre_skipped) == len(matches):
+        return {"status": "unavailable", "devices": [_home_entity_view(item) for item in pre_skipped]}
+    if pre_skipped:
+        matches = [item for item in matches if item not in pre_skipped]
+    unsupported_skipped = []
+    if action in {"set_brightness", "adjust_brightness"}:
+        unsupported_skipped = [item for item in matches
+                               if not str(item.get("entity_id", "")).startswith("light.")
+                               or not ((_home_entity_view(item)["supported_features"] & 1)
+                                       or set(_home_entity_view(item)["supported_color_modes"]) - {"onoff"})]
+    elif action == "set_color":
+        unsupported_skipped = [item for item in matches
+                               if not set(_home_entity_view(item)["supported_color_modes"]) & {"hs", "rgb", "rgbw", "rgbww", "xy"}]
+    elif action == "set_color_temperature":
+        unsupported_skipped = [item for item in matches
+                               if "color_temp" not in set(_home_entity_view(item)["supported_color_modes"])]
+    if unsupported_skipped and len(unsupported_skipped) == len(matches):
+        return {"status": "unsupported_capability", "message": "No available target supports that operation.",
+                "devices": [_home_entity_view(item) for item in unsupported_skipped]}
+    if unsupported_skipped:
+        matches = [item for item in matches if item not in unsupported_skipped]
+    # Whole-home writes fail closed for switches/outlets unless an operator has
+    # explicitly classified the entity as safe for bulk power-off.
+    protected = []
+    bulk_target = max(requested_scope_count, resolved_scope_count) > 1 or target_query.casefold() in {
+        "everything", "all devices", "all home devices", "all switches", "all outlets"
+    }
+    if bulk_target:
+        protected = [item for item in matches if str(item.get("entity_id", "")).startswith("switch.")
+                     and str(item.get("entity_id")) not in HOME_BULK_SAFE_ENTITIES]
+        matches = [item for item in matches if item not in protected]
+        if protected and not matches:
+            return {
+                "status": "forbidden", "outcome": "no_action", "target_entity_ids": [],
+                "protected": [_home_entity_view(item) for item in protected],
+                "message": "Bulk control of these switches is not approved; no command was sent.",
+            }
+    brightness = parameters.get("brightness_pct")
+    if action in {"set_brightness", "adjust_brightness"}:
+        if action == "adjust_brightness":
+            delta = parameters.get("brightness_delta_pct")
+            if delta is None or not -100 <= float(delta) <= 100:
+                raise ValueError("brightness_delta_pct must be between -100 and 100")
+            current = [_home_entity_view(item).get("brightness_pct") for item in matches]
+            if any(value is None for value in current):
+                return {"status": "indeterminate", "message": "Current brightness is unknown; no baseline was invented."}
+            brightness_by_entity = {
+                str(item.get("entity_id")): max(0, min(100, float(current[index]) + float(delta)))
+                for index, item in enumerate(matches)
+            }
+            brightness = next(iter(brightness_by_entity.values())) if len(brightness_by_entity) == 1 else 50
         if brightness is None or not 0 <= float(brightness) <= 100:
             raise ValueError("brightness_pct must be between 0 and 100")
+        off = [item for item in matches if item.get("state") == "off"]
+        if off:
+            return {"status": "requires_explicit_power_on",
+                    "message": "Changing brightness would power on an off light; ask to turn it on explicitly.",
+                    "devices": [_home_entity_view(item) for item in off]}
         service = "turn_on"
         service_data = {"brightness_pct": float(brightness)}
-        unsupported = [item for item in matches
-                       if not str(item.get("entity_id", "")).startswith("light.")
-                       or not ((_home_entity_view(item)["supported_features"] & 1)
-                               or set(_home_entity_view(item)["supported_color_modes"]) - {"onoff"})]
-        unavailable = [item for item in matches if item.get("state") in {"unavailable", "unknown"}]
-        if unsupported:
-            return {"status": "unsupported_capability", "message": "Brightness is only supported by available lights.",
-                    "devices": [_home_entity_view(item) for item in unsupported]}
-        if unavailable:
-            return {"status": "unavailable", "devices": [_home_entity_view(item) for item in unavailable]}
+    elif action == "set_color":
+        if any(item.get("state") == "off" for item in matches):
+            return {"status": "requires_explicit_power_on", "message": "Changing colour would power on an off light."}
+        if isinstance(parameters.get("rgb_color"), list) and len(parameters["rgb_color"]) == 3:
+            service_data = {"rgb_color": [int(value) for value in parameters["rgb_color"]]}
+        elif isinstance(parameters.get("hs_color"), list) and len(parameters["hs_color"]) == 2:
+            service_data = {"hs_color": [float(value) for value in parameters["hs_color"]]}
+        else:
+            raise ValueError("set_color requires rgb_color or hs_color")
+        service = "turn_on"
+    elif action == "set_color_temperature":
+        if any(item.get("state") == "off" for item in matches):
+            return {"status": "requires_explicit_power_on", "message": "Changing colour temperature would power on an off light."}
+        kelvin = parameters.get("color_temp_kelvin")
+        if kelvin is None or not 1000 <= int(kelvin) <= 10000:
+            raise ValueError("color_temp_kelvin must be between 1000 and 10000")
+        service, service_data = "turn_on", {"color_temp_kelvin": int(kelvin)}
     else:
         service = action
         service_data = {}
     unavailable = [item for item in matches if item.get("state") in {"unavailable", "unknown"}]
-    skipped = unavailable if len(matches) > 1 else []
+    skipped = list(pre_skipped) + (unavailable if len(matches) > 1 else [])
     if unavailable and not skipped:
         return {"status": "unavailable", "devices": [_home_entity_view(item) for item in unavailable]}
     matches = [item for item in matches if item not in skipped]
@@ -4088,11 +4386,36 @@ async def home_control(args: dict[str, Any]) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {_home_assistant_token()}"}
     async with httpx.AsyncClient(timeout=8, headers=headers) as client:
         for domain, entity_ids in by_domain.items():
-            data = {"entity_id": entity_ids, **service_data}
-            response = await client.post(f"{HOME_ASSISTANT_URL}/api/services/{domain}/{service}", json=data)
-            response.raise_for_status()
-            results.append({"domain": domain, "entity_ids": entity_ids, "action": action})
-    response = {"status": "executed", "outcome": "action_requested", "results": results}
+            if action == "adjust_brightness":
+                for entity_id in entity_ids:
+                    data = {"entity_id": entity_id, "brightness_pct": brightness_by_entity[entity_id]}
+                    response = await client.post(f"{HOME_ASSISTANT_URL}/api/services/{domain}/{service}", json=data)
+                    response.raise_for_status()
+                    results.append({"domain": domain, "entity_ids": [entity_id], "action": action,
+                                    "brightness_pct": brightness_by_entity[entity_id]})
+            else:
+                data = {"entity_id": entity_ids, **service_data}
+                response = await client.post(f"{HOME_ASSISTANT_URL}/api/services/{domain}/{service}", json=data)
+                response.raise_for_status()
+                results.append({"domain": domain, "entity_ids": entity_ids, "action": action})
+    response = {"status": "executed", "outcome": "command_accepted", "results": results,
+                "target_entity_ids": [str(item.get("entity_id")) for item in matches]}
+    if missing:
+        response.update({"status": "partial", "outcome": "partial_action",
+                         "missing_or_unauthorized": missing,
+                         "message": "Some retained targets no longer exist or are no longer authorized."})
+    if unauthorized:
+        response.update({"status": "partial", "outcome": "partial_action",
+                         "unauthorized": [_home_entity_view(item) for item in unauthorized],
+                         "message": "Read-visible targets without explicit write approval were excluded."})
+    if unsupported_skipped:
+        response.update({"status": "partial", "outcome": "partial_action",
+                         "unsupported": [_home_entity_view(item) for item in unsupported_skipped],
+                         "message": "Targets that do not support the requested operation were excluded."})
+    if protected:
+        response.update({"status": "partial", "outcome": "partial_action",
+                         "protected": [_home_entity_view(item) for item in protected],
+                         "message": "Protected or unclassified outlets were excluded from the bulk action."})
     if skipped:
         response["status"] = "partial"
         response["outcome"] = "partial_action"
@@ -4100,13 +4423,20 @@ async def home_control(args: dict[str, Any]) -> dict[str, Any]:
     desired = "off" if action == "turn_off" else "on" if action == "turn_on" else None
     if desired:
         try:
-            latest = await _home_assistant_get("/api/states")
-            states = {str(item.get("entity_id")): str(item.get("state")) for item in latest if isinstance(item, dict)}
             checked = [entity_id for group in by_domain.values() for entity_id in group]
+            states = {}
+            for _ in range(6):
+                latest = await _home_assistant_get("/api/states")
+                states = {str(item.get("entity_id")): str(item.get("state")) for item in latest if isinstance(item, dict)}
+                if checked and all(states.get(entity_id) == desired for entity_id in checked):
+                    break
+                await asyncio.sleep(0.25)
             response["verified"] = bool(checked) and all(states.get(entity_id) == desired for entity_id in checked)
             response["verified_states"] = {entity_id: states.get(entity_id, "unknown") for entity_id in checked}
             if response["verified"]:
-                response["outcome"] = "verified_success"
+                response["outcome"] = "partial_action_verified" if protected or skipped or missing or unauthorized or unsupported_skipped else "home_assistant_reported_target_state"
+            else:
+                response["outcome"] = "partial_action_unverified" if protected or skipped or missing or unauthorized or unsupported_skipped else "target_state_not_observed_before_timeout"
         except Exception:
             response["verified"] = False
     return response
@@ -4129,6 +4459,10 @@ async def home_activate_scene(args: dict[str, Any]) -> dict[str, Any]:
                              "name": (item.get("attributes") or {}).get("friendly_name")} for item in matches[:10]]}
     headers = {"Authorization": f"Bearer {_home_assistant_token()}"}
     entity_id = matches[0]["entity_id"]
+    if entity_id not in HOME_SCENE_ALLOWED_ENTITIES:
+        return {"status": "forbidden", "scene": {"entity_id": entity_id,
+                                                     "name": (matches[0].get("attributes") or {}).get("friendly_name")},
+                "message": "This scene has not been inspected and explicitly approved for Home-AI activation."}
     async with httpx.AsyncClient(timeout=8, headers=headers) as client:
         response = await client.post(f"{HOME_ASSISTANT_URL}/api/services/scene/turn_on",
                                      json={"entity_id": entity_id})
@@ -4303,9 +4637,11 @@ async def unraid_system_health(_: dict[str, Any]) -> dict[str, Any]:
 REGISTRY = [
     ("get_server_overview", "Current host, uptime, RAM/storage summary.", "read", "server", {}, server_overview),
     ("home_find_device", "Find allowed Home Assistant lights and switches by name or area.", "read", "home", {"query": {"type": "string", "required": True}}, home_find_device),
-    ("home_get_state", "Read the current state of an allowed Home Assistant light or switch.", "read", "home", {"entity_or_area": {"type": "string", "required": True}}, home_get_state),
+    ("home_get_state", "Read or filter current state for authorized Home Assistant targets. State, availability, room/floor, type, and exact retained-set filters may be combined.", "read", "home", {"entity_or_area": {"type": "string"}, "entity_ids": {"type": "array"}, "state": {"type": "string"}, "domain": {"type": "string"}, "area": {"type": "string"}, "floor": {"type": "string"}, "scope": {"type": "string"}, "aggregate_check": {"type": "string"}}, home_get_state),
     ("home_get_area_state", "Read allowed Home Assistant lights and switches in an area.", "read", "home", {"area": {"type": "string", "required": True}}, home_get_area_state),
-    ("home_control", "Control allowed Home Assistant lights and switches with turn_on, turn_off, or set_brightness.", "write_low", "home", {"entity_or_area": {"type": "string", "required": True}, "action": {"type": "string", "required": True}, "parameters": {"type": "object"}}, home_control),
+    ("home_get_activity", "Read bounded Home Assistant observed state history for an authorized device, area, whole-home scope, or exact retained set.", "read", "home", {"entity_or_area": {"type": "string"}, "entity_ids": {"type": "array"}, "hours": {"type": "number"}}, home_get_activity),
+    ("home_list_routines", "List existing Home Assistant scenes, scripts, and automations without activating them.", "read", "home", {"kind": {"type": "string"}}, home_list_routines),
+    ("home_control", "Capability-aware control of authorized Home Assistant lights and approved switches, including an exact retained entity set. Actions: turn_on, turn_off, set_brightness, adjust_brightness, set_color, set_color_temperature.", "write_low", "home", {"entity_or_area": {"type": "string"}, "entity_ids": {"type": "array"}, "action": {"type": "string", "required": True}, "parameters": {"type": "object"}}, home_control),
     ("home_activate_scene", "Activate one exact named Home Assistant scene.", "write_low", "home", {"scene": {"type": "string", "required": True}}, home_activate_scene),
     ("get_storage_status", "Current user-share and cache storage usage.", "read", "storage", {}, storage_status),
     ("get_gpu_status", "Current NVIDIA GPU telemetry and VRAM usage.", "read", "gpu", {}, gpu_status),
@@ -4500,6 +4836,8 @@ CAPABILITY_METADATA = {
     "home_find_device": {"aliases": ["find light", "find outlet", "smart home devices", "home devices"], "examples": ["find the office lights", "what home devices are available"], "group": "home", "freshness": "current"},
     "home_get_state": {"aliases": ["home state", "light state", "outlet state", "what is on"], "examples": ["is anything still on downstairs"], "group": "home", "freshness": "current"},
     "home_get_area_state": {"aliases": ["area state", "room state", "what is on in"], "examples": ["what is on downstairs"], "group": "home", "freshness": "current"},
+    "home_get_activity": {"aliases": ["home history", "device history", "what changed", "when did it turn on", "how long has it been on"], "examples": ["when did the office light turn on", "what changed in the bedroom in the last hour"], "group": "home", "freshness": "historical"},
+    "home_list_routines": {"aliases": ["home scenes", "home automations", "home scripts", "light timers", "scheduled home actions"], "examples": ["what scenes do I have", "which automations are active"], "group": "home", "freshness": "current"},
     "home_control": {"aliases": ["control lights", "turn on light", "turn off outlet", "dim lights", "smart home control"], "examples": ["turn the office lights down to 30 percent", "turn everything downstairs off"], "group": "home", "freshness": "current"},
     "home_activate_scene": {"aliases": ["activate scene", "run scene", "bedtime scene"], "examples": ["activate the bedtime scene"], "group": "home", "freshness": "current"},
     "frigate_stats": {"aliases": ["camera health", "camera status", "fps", "detector"], "examples": ["is my camera working", "is the front door camera working", "are my cameras okay"], "freshness": "current", "visual_evidence": False},
