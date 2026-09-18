@@ -1,0 +1,16 @@
+<Container version="2">
+  <Name>homeassistant</Name>
+  <Repository>ghcr.io/home-assistant/home-assistant:stable</Repository>
+  <Registry>https://github.com/home-assistant/core/pkgs/container/home-assistant</Registry>
+  <Network>host</Network>
+  <Privileged>false</Privileged>
+  <Support>https://www.home-assistant.io/help/</Support>
+  <Project>https://www.home-assistant.io/</Project>
+  <Overview>Official Home Assistant Core container. Existing Home Assistant configuration and integrations are persisted under /config.</Overview>
+  <Category>HomeAutomation:</Category>
+  <WebUI>http://[IP]:8123/</WebUI>
+  <Icon>https://raw.githubusercontent.com/home-assistant/assets/master/logo/logo.png</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <Config Name="Appdata" Target="/config" Default="/mnt/cache/appdata/home-assistant" Mode="rw" Description="Persistent Home Assistant configuration." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/home-assistant</Config>
+  <Config Name="Timezone" Target="TZ" Default="America/Toronto" Mode="" Description="Home Assistant timezone." Type="Variable" Display="always" Required="true" Mask="false">America/Toronto</Config>
+</Container>

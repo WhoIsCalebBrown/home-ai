@@ -7,4 +7,4 @@ __pycache__/
 *.wav
 *.mp3
 secrets/
-
+.claude/worktrees/
