@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 TARGET = Path("/app/routes/webhook_routes.py")
-TOKEN_PATH = "/user/config/cli_debrid_bridge_token"
+TOKEN_PATH = "/run/secrets/home_ai_bridge_token"
 MARKER = "# HOME_AI_BRIDGE_AUTH_GUARD"
 
 
