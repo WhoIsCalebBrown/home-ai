@@ -25,6 +25,7 @@ def test_flags_camera_publication_without_fetching_media():
 def test_flags_tools_privilege_and_mcp_booleans_without_reporting_values():
     tools = container("Home-AI-Tools", mounts=[
         {"source": "/mnt/cache/appdata", "destination": "/appdata", "rw": False},
+        {"source": "/mnt/user", "destination": "/mnt/user", "rw": False},
         {"source": "/var/run/docker.sock", "destination": "/var/run/docker.sock", "rw": False},
     ])
     snapshot = {"containers": [tools], "host": {
@@ -32,7 +33,7 @@ def test_flags_tools_privilege_and_mcp_booleans_without_reporting_values():
         "unraid_mcp": {"reachable": True, "api_token_configured": False, "read_only": False},
     }}
     result = ids(audit(snapshot))
-    assert {"TOOLS_BROAD_APPDATA_MOUNT", "TOOLS_DOCKER_SOCKET_MOUNT", "DOCKER_FILESYSTEM_NEAR_FULL",
+    assert {"TOOLS_BROAD_APPDATA_MOUNT", "TOOLS_BROAD_STORAGE_MOUNT", "TOOLS_DOCKER_SOCKET_MOUNT", "DOCKER_FILESYSTEM_NEAR_FULL",
             "UNRAID_MCP_TOKEN_MISSING", "UNRAID_MCP_NOT_READ_ONLY"} <= result
 
 
@@ -66,6 +67,39 @@ def test_rollback_and_mutable_image_checks():
     assert not image_is_mutable("registry.local/home-ai@sha256:" + "a" * 64)
 
 
+def test_flags_model_monitor_vpn_proxy_and_runtime_patch_exposure():
+    ollama = container("Ollama", ports={"11434/tcp": [{"HostIp": "::", "HostPort": "11434"}]})
+    netdata = container("netdata", mounts=[{"source": "/var/run/docker.sock", "destination": "/var/run/docker.sock"}],
+                        host_config={"network_mode": "host", "cap_add": ["CAP_SYS_PTRACE"]})
+    qbit = container("binhex-qbittorrentvpn", ports={"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}]},
+                     host_config={"privileged": True})
+    npm = container("Nginx-Proxy-Manager-Official", ports={"81/tcp": [{"HostIp": "0.0.0.0", "HostPort": "7818"}]})
+    cli = container("cli_debrid", mounts=[{"source": "/safe/wrapper", "destination": "/run/home-ai/cli_debrid_startup.sh"}])
+    result = ids(audit({"containers": [ollama, netdata, qbit, npm, cli]}))
+    assert {"OLLAMA_ALL_INTERFACE_PUBLICATION", "NETDATA_HOST_PRIVILEGE_SURFACE", "QBITTORRENTVPN_PRIVILEGED",
+            "QBITTORRENTVPN_MANAGEMENT_ALL_INTERFACE_PUBLICATION", "NPM_ADMIN_ALL_INTERFACE_PUBLICATION",
+            "CLI_DEBRID_RUNTIME_STARTUP_PATCH"} <= result
+
+
+def test_flags_qa_runtime_hardening_drift():
+    qa_assistant = container(
+        "Home-AI-QA-Assistant",
+        host_config={"readonly_rootfs": False, "cap_drop": [], "security_opt": []},
+    )
+    result = ids(audit({"containers": [qa_assistant]}))
+    assert {"QA_ROOT_FILESYSTEM_WRITABLE", "QA_CAPABILITIES_NOT_DROPPED",
+            "QA_NO_NEW_PRIVILEGES_MISSING"} <= result
+
+    hardened = container(
+        "Home-AI-QA-Assistant",
+        host_config={"readonly_rootfs": True, "cap_drop": ["ALL"],
+                     "security_opt": ["no-new-privileges:true"]},
+    )
+    hardened_result = ids(audit({"containers": [hardened]}))
+    assert not {"QA_ROOT_FILESYSTEM_WRITABLE", "QA_CAPABILITIES_NOT_DROPPED",
+                "QA_NO_NEW_PRIVILEGES_MISSING"} & hardened_result
+
+
 def test_remote_collector_projection_does_not_request_environment_or_commands(monkeypatch):
     captured = {}
 
@@ -82,3 +116,6 @@ def test_remote_collector_projection_does_not_request_environment_or_commands(mo
     assert "Config.Env" not in remote_command
     assert ".Args" not in remote_command
     assert ".Path" not in remote_command
+    assert "ReadonlyRootfs" in remote_command
+    assert "CapDrop" in remote_command
+    assert "SecurityOpt" in remote_command
