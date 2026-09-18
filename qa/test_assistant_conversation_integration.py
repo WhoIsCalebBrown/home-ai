@@ -68,6 +68,104 @@ from typing import Any
 import pytest
 
 APP_PATH = Path("/app/voice-api-app.py")
+
+
+def test_home_followup_plan_keeps_exact_result_set_and_exclusion(app):
+    context = {
+        "referent_type": "home_entities",
+        "home_result_set": [
+            {"entity_id": "light.office", "name": "Office Light", "area": "Office"},
+            {"entity_id": "light.hall", "name": "Hallway Light", "area": "Hallway"},
+            {"entity_id": "switch.office", "name": "Office Plug", "area": "Office"},
+        ],
+    }
+    assert app._home_followup_plan("Which of those are lights?", context) == [
+        ("home_get_state", {"entity_ids": ["light.office", "light.hall"]})
+    ]
+    assert app._home_followup_plan("Turn those off except the hallway.", context) == [
+        ("home_control", {"entity_ids": ["light.office", "switch.office"], "action": "turn_off"})
+    ]
+
+
+def test_home_followup_wrong_room_stays_explicitly_scoped(app):
+    context = {
+        "referent_type": "home_entities",
+        "home_result_set": [{"entity_id": "light.office", "name": "Office Light", "area": "Office"}],
+        "home_result_query": {"entity_or_area": "on"},
+    }
+    assert app._home_followup_plan("What about upstairs?", context) == [
+        ("home_get_state", {"scope": "upstairs", "state": "on"})
+    ]
+
+
+def test_home_followup_explicit_topic_switch_wins(app):
+    context = {
+        "referent_type": "home_entities",
+        "home_result_set": [{"entity_id": "light.office", "name": "Office Light", "area": "Office"}],
+    }
+    assert app._home_followup_plan("What about Plex?", context) == []
+
+
+def test_home_followup_brightness_and_warm_white_bind_exact_set(app):
+    context = {
+        "referent_type": "home_entities",
+        "home_result_set": [
+            {"entity_id": "light.office_a", "name": "Office A", "area": "Office"},
+            {"entity_id": "light.office_b", "name": "Office B", "area": "Office"},
+        ],
+    }
+    assert app._home_followup_plan("Make them a bit dimmer.", context) == [
+        ("home_control", {"entity_ids": ["light.office_a", "light.office_b"],
+                          "action": "adjust_brightness", "parameters": {"brightness_delta_pct": -10}})
+    ]
+    assert app._home_followup_plan("Make them warm white.", context) == [
+        ("home_control", {"entity_ids": ["light.office_a", "light.office_b"],
+                          "action": "set_color_temperature", "parameters": {"color_temp_kelvin": 2700}})
+    ]
+    assert app._home_followup_plan("Can those lights be dimmed?", context) == [
+        ("home_get_state", {"entity_ids": ["light.office_a", "light.office_b"]})
+    ]
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("Are any lights still on?", ("home_get_state", {"domain": "lights", "state": "on"})),
+    ("Which outlets are off?", ("home_get_state", {"domain": "outlets", "state": "off"})),
+    ("Is everything off?", ("home_get_state", {"state": "off", "aggregate_check": "off"})),
+    ("How many lights do I have?", ("home_find_device", {"query": "lights"})),
+    ("Which lights can change colour?", ("home_find_device", {"query": "lights"})),
+    ("When did Light Fixture 1 turn on?", ("home_get_activity", {"entity_or_area": "light fixture 1", "hours": 168})),
+    ("Why didn't Bedroom Lamp respond?", ("home_get_activity", {"entity_or_area": "bedroom lamp", "hours": 168})),
+])
+def test_common_home_questions_are_deterministic_local_reads(app, text, expected):
+    assert app.preflight_plan(text, {}) == [expected]
+
+
+def test_home_tool_result_records_exact_conversational_referent(app):
+    app.conversation_context["home-context"] = {}
+    app.record_tool_referent("home-context", "home_get_state", {"state": "on"}, {
+        "status": "ok", "result": {"devices": [
+            {"entity_id": "light.office", "name": "Office", "area": "Office"},
+            {"entity_id": "light.hall", "name": "Hall", "area": "Hallway"},
+        ]},
+    })
+    context = app.conversation_context["home-context"]
+    assert context["referent_type"] == "home_entities"
+    assert context["referent_ids"] == ["light.office", "light.hall"]
+
+
+def test_home_clarification_reply_binds_one_candidate_and_original_operation(app):
+    app.conversation_context["home-clarify"] = {
+        "pending_home_candidates": [
+            {"entity_id": "light.office", "name": "Office Light", "aliases": []},
+            {"entity_id": "light.bed", "name": "Bedroom Lamp", "aliases": []},
+        ],
+        "pending_home_operation": "home_get_activity",
+    }
+    context = app.turn_context("home-clarify", "Bedroom Lamp")
+    assert context["referent_ids"] == ["light.bed"]
+    assert app.preflight_plan("Bedroom Lamp", context) == [
+        ("home_get_activity", {"entity_ids": ["light.bed"], "hours": 168})
+    ]
 if not APP_PATH.exists():
     APP_PATH = Path(__file__).resolve().parents[1] / "assistant" / "voice-api-app.py"
 
@@ -127,6 +225,12 @@ class FakeToolsBackend:
         self.drift_candidate_year: str | None = None
         self.media_standard_request_override: dict | None = None
         self.person_index: dict[str, str] = {}  # casefold(person name) -> title, mirrors the real web-discovery fallback's person-hint -> title resolution (tools/server-tools-app.py's _web_discover_title), tested there directly against real functions -- this fake only proves the ASSISTANT-side handoff after identity resolves, not the discovery mechanism itself.
+        self.home_entities = {
+            "light.office": {"entity_id": "light.office", "name": "Office Light", "area": "Office", "state": "on", "supported_color_modes": ["hs", "color_temp"], "brightness_pct": 60},
+            "light.hall": {"entity_id": "light.hall", "name": "Hallway Light", "area": "Hallway", "state": "on", "supported_color_modes": ["hs", "color_temp"], "brightness_pct": 80},
+            "switch.router": {"entity_id": "switch.router", "name": "Router", "area": "Office", "state": "on", "supported_color_modes": []},
+            "light.bed": {"entity_id": "light.bed", "name": "Bedroom Light", "area": "Bedroom", "state": "unavailable", "supported_color_modes": ["hs"]},
+        }
 
     def seed_person(self, person: str, title: str) -> None:
         self.person_index[person.casefold()] = title
@@ -159,6 +263,49 @@ class FakeToolsBackend:
 
     async def invoke(self, name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
         self.call_log.append((name, dict(arguments)))
+        if name in {"home_get_state", "home_get_area_state", "home_find_device"}:
+            devices = list(self.home_entities.values())
+            exact_ids = arguments.get("entity_ids")
+            if isinstance(exact_ids, list):
+                devices = [self.home_entities[value] for value in exact_ids if value in self.home_entities]
+            state = arguments.get("state") or (arguments.get("entity_or_area") if arguments.get("entity_or_area") in {"on", "off", "available", "unavailable"} else None)
+            if state == "available":
+                devices = [item for item in devices if item["state"] not in {"unavailable", "unknown"}]
+            elif state:
+                devices = [item for item in devices if item["state"] == state]
+            domain = str(arguments.get("domain") or "").rstrip("s")
+            if domain in {"outlet", "plug", "switch"}:
+                domain = "switch"
+            elif domain in {"lamp", "light"}:
+                domain = "light"
+            if domain:
+                devices = [item for item in devices if item["entity_id"].startswith(domain + ".")]
+            area = arguments.get("area") if name != "home_get_area_state" else arguments.get("area")
+            if area:
+                devices = [item for item in devices if item.get("area", "").casefold() == str(area).casefold()]
+            return {"tool": name, "status": "ok", "result": {"status": "ok", "devices": [dict(item) for item in devices], "count": len(devices), "query_state": state}}
+        if name == "home_control":
+            exact_ids = arguments.get("entity_ids")
+            targets = list(exact_ids) if isinstance(exact_ids, list) else list(self.home_entities)
+            protected = []
+            if arguments.get("entity_or_area") in {"everything", "all devices", "all home devices"}:
+                protected = [dict(item) for item in self.home_entities.values() if item["entity_id"].startswith("switch.")]
+                targets = [value for value in targets if not value.startswith("switch.")]
+            action = arguments.get("action")
+            for entity_id in targets:
+                if entity_id not in self.home_entities or self.home_entities[entity_id]["state"] == "unavailable":
+                    continue
+                if action == "turn_off":
+                    self.home_entities[entity_id]["state"] = "off"
+                elif action == "turn_on":
+                    self.home_entities[entity_id]["state"] = "on"
+                elif action == "set_brightness":
+                    self.home_entities[entity_id]["brightness_pct"] = arguments.get("parameters", {}).get("brightness_pct")
+            self.submitted_writes.append({"name": name, "arguments": dict(arguments)})
+            payload = {"status": "partial" if protected else "executed",
+                       "outcome": "partial_action_verified" if protected else "home_assistant_reported_target_state",
+                       "verified": True, "protected": protected, "target_entity_ids": targets}
+            return {"tool": name, "status": "ok", "result": payload}
         if name == "web_search":
             query = str(arguments.get("query", ""))
             entries = None
@@ -578,6 +725,33 @@ def session(app, backend):
             return await self.turn_for(self.client_id, user_text, ollama_script, final_text)
 
     return Driver()
+
+
+# --- Isolated conversational-home execution (all writes stay in memory). ---
+
+@pytest.mark.asyncio
+async def test_home_result_set_exclusion_control_and_reconciliation(session):
+    first = await session.turn("What's on?")
+    assert "Office Light" in first and "Hallway Light" in first
+    controlled = await session.turn("Turn those off except the hallway.")
+    assert "requested state" in controlled.casefold()
+    assert session.backend.home_entities["light.office"]["state"] == "off"
+    assert session.backend.home_entities["light.hall"]["state"] == "on"
+    checked = await session.turn("Did they all turn off?")
+    assert "Office Light: off" in checked
+    assert "Hallway Light: on" in checked
+
+
+@pytest.mark.asyncio
+async def test_home_exact_brightness_and_bulk_protected_load(session):
+    await session.turn("What's on in the office?")
+    await session.turn("Make those lights 30%.")
+    assert session.backend.home_entities["light.office"]["brightness_pct"] == 30
+    bulk = await session.turn("Turn everything off.", ollama_script=[{"message": {"content": "", "tool_calls": [
+        {"function": {"name": "home_control", "arguments": {"entity_or_area": "everything", "action": "turn_off"}}}
+    ]}}])
+    assert "excluded" in bulk.casefold()
+    assert session.backend.home_entities["switch.router"]["state"] == "on"
 
 
 # --- Scenario: discover -> offer -> accept -> cross-capability -> offer ->
@@ -1411,6 +1585,37 @@ async def test_bare_yes_does_not_select_among_candidates(session):
     assert not session.backend.submitted_writes
     disambiguation = session.app.conversation_context.get(session.client_id, {}).get("pending_disambiguation")
     assert disambiguation and len(disambiguation["candidates"]) == 2, "the candidate set must survive an unresolved reply"
+
+
+@pytest.mark.asyncio
+async def test_plural_reply_to_three_candidates_explains_single_plan_boundary(session):
+    for index, year in enumerate((2001, 2002, 2003), start=1):
+        session.backend.seed_web("Example Story", media_type="movie", year=year, tmdb_id=str(9000 + index))
+    await session.turn(
+        "Get Example Story",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Get Example Story"}}},
+        ]}}],
+    )
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("Both")
+    assert "three" in reply.casefold()
+    assert "one exact request at a time" in reply.casefold()
+    assert len(session.backend.call_log) == calls_before
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.asyncio
+async def test_bare_oh_after_media_turn_terminates_without_tool_or_model(session):
+    session.app.conversation_context[session.client_id] = {
+        "domain": "media",
+        "canonical_identity": {"title": "Example Story", "year": 2001, "media_type": "movie", "tmdb_id": "9001"},
+    }
+    calls_before = len(session.backend.call_log)
+    reply = await session.turn("Oh")
+    assert reply == "Okay."
+    assert len(session.backend.call_log) == calls_before
+    assert "camera" not in reply.casefold()
 
 
 @pytest.mark.asyncio

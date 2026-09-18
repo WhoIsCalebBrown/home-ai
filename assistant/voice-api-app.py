@@ -1458,8 +1458,45 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in candidates[:6])
             return f"I found more than one matching device: {names}. Which one did you mean?"
         devices = [device for device in result.get("devices", []) if isinstance(device, dict)]
+        if result.get("aggregate_check"):
+            wanted = str(result.get("aggregate_check"))
+            scope_count = int(result.get("scope_count") or 0)
+            matching = len(devices)
+            counts = result.get("state_counts") or {}
+            if scope_count == 0:
+                scope = result.get("floor_filter") or result.get("area_filter") or "that scope"
+                return f"I couldn't find any authorized home devices in {scope}."
+            if matching == scope_count:
+                return f"Yes. All {scope_count} authorized devices in that scope are {wanted}."
+            exceptions = scope_count - matching
+            unavailable = int(counts.get("unavailable", 0)) + int(counts.get("unknown", 0))
+            detail = f" {unavailable} are unavailable or unknown." if unavailable else ""
+            return f"No. {matching} of {scope_count} authorized devices in that scope are {wanted}; {exceptions} are not.{detail}"
         if not devices:
+            if result.get("query_state"):
+                return f"No authorized home devices are currently {result['query_state']}."
             return "I couldn't find any Home Assistant lights or outlets matching that request."
+        if re.search(r"\bcan (?:change colou?r|change colou?rs|be dimmed)\b", user_text, re.I):
+            wants_colour = bool(re.search(r"colou?r", user_text, re.I))
+            capable = []
+            for device in devices:
+                modes = set(device.get("supported_color_modes") or [])
+                supported = bool(modes & ({"hs", "rgb", "rgbw", "rgbww", "xy"} if wants_colour else {"brightness", "color_temp", "hs", "rgb", "rgbw", "rgbww", "xy", "white"}))
+                if supported:
+                    capable.append(str(device.get("name") or device.get("entity_id")))
+            feature = "change colour" if wants_colour else "be dimmed"
+            return (f"{len(capable)} of {len(devices)} matching lights can {feature}: " + ", ".join(capable) + ".") if capable else f"None of the matching lights report that they can {feature}."
+        if re.search(r"\bwhat can (?:this|that|the) .+? do\b", user_text, re.I) and len(devices) == 1:
+            device = devices[0]
+            modes = set(device.get("supported_color_modes") or [])
+            capabilities = ["turn on and off"]
+            if modes - {"onoff"}:
+                capabilities.append("change brightness")
+            if modes & {"hs", "rgb", "rgbw", "rgbww", "xy"}:
+                capabilities.append("change colour")
+            if "color_temp" in modes:
+                capabilities.append("change colour temperature")
+            return f"{device.get('name') or device.get('entity_id')} can " + ", ".join(capabilities) + "."
         labels = []
         for device in devices:
             label = str(device.get("name") or device.get("entity_id"))
@@ -1469,24 +1506,80 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
                 labels.append(f"{label}: {state} at {brightness:g} percent")
             else:
                 labels.append(f"{label}: {state}")
-        prefix = f"I found {len(devices)} Home Assistant devices: "
+        query_state = result.get("query_state")
+        if query_state:
+            if not devices:
+                return f"No authorized home devices are currently {query_state}."
+            return f"{len(devices)} authorized home devices are {query_state}: " + "; ".join(labels) + "."
+        prefix = f"I found {len(devices)} authorized Home Assistant entities: "
         return prefix + "; ".join(labels) + "."
+    if tool == "home_get_activity":
+        changes = [item for item in result.get("changes", []) if isinstance(item, dict)]
+        if not changes:
+            devices = [item for item in result.get("devices", []) if isinstance(item, dict)]
+            if devices and (re.search(r"\bhow long\b.*\bunavailable\b", user_text, re.I)
+                            or all(item.get("state") == "unavailable" for item in devices)):
+                unavailable = [item for item in devices if item.get("state") == "unavailable" and item.get("last_changed")]
+                if unavailable:
+                    labels = []
+                    for item in unavailable[:6]:
+                        try:
+                            elapsed = max(0, time.time() - datetime.fromisoformat(str(item["last_changed"]).replace("Z", "+00:00")).timestamp())
+                            duration = f"about {elapsed / 3600:.1f} hours"
+                        except (TypeError, ValueError):
+                            duration = "an unknown duration"
+                        labels.append(f"{item.get('name') or item.get('entity_id')} since {item['last_changed']} ({duration})")
+                    return "Home Assistant has continuously reported unavailable: " + "; ".join(labels) + ". That does not establish which connectivity layer failed."
+            return "Home Assistant returned no retained matching history for that period; that does not prove it never happened."
+        desired = None
+        if re.search(r"\bturn(?:ed)? on\b", user_text, re.I):
+            desired = "on"
+        elif re.search(r"\bturn(?:ed)? off\b", user_text, re.I):
+            desired = "off"
+        elif re.search(r"\bunavailable\b", user_text, re.I):
+            desired = "unavailable"
+        matching = [item for item in changes if item.get("state") == desired] if desired else changes
+        if not matching:
+            return f"Home Assistant returned history, but no retained {desired} transition in that window; that does not prove it never happened."
+        latest = matching[-1]
+        return f"The latest retained matching change was {latest.get('entity_id')} reporting {latest.get('state')} at {latest.get('observed_at')}. Home Assistant context does not independently identify who operated it or prove a cause."
+    if tool == "home_list_routines":
+        items = [item for item in result.get("items", []) if isinstance(item, dict)]
+        if not items:
+            return "I found no enabled Home Assistant scenes, scripts, or automations in the requested scope."
+        grouped: dict[str, list[str]] = {}
+        for item in items:
+            grouped.setdefault(str(item.get("kind") or "routine"), []).append(str(item.get("name") or item.get("entity_id")))
+        return "; ".join(f"{kind.title()}s: {', '.join(names)}" for kind, names in grouped.items()) + ". These are listed read-only until their effects and permissions are reviewed."
     if tool == "home_control":
         if result.get("status") == "not_found":
             return "I couldn't find a matching Home Assistant light or outlet."
         if result.get("status") == "ambiguous":
             return str(result.get("message") or "I found more than one matching device. Which one did you mean?")
+        if result.get("status") == "forbidden":
+            return str(result.get("message") or "That device is available for reads but is not approved for Home-AI control.")
         if result.get("status") == "unsupported_capability":
-            names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("devices", [])[:6])
-            return f"Brightness isn't supported by {names or 'that device'}."
+            return str(result.get("message") or "That operation is not supported by one or more devices.")
+        if result.get("status") in {"requires_explicit_power_on", "indeterminate"}:
+            return str(result.get("message") or "I couldn't safely determine the requested setting.")
         if result.get("status") == "unavailable":
             names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("devices", [])[:6])
             return f"{names or 'That device'} is currently unavailable in Home Assistant."
         if result.get("status") == "partial":
             unavailable = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unavailable", [])[:6])
-            return f"I controlled the available matching devices. These remain unavailable in Home Assistant: {unavailable or 'unknown device'}."
-        return "The Home Assistant command was executed."
+            protected = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("protected", [])[:6])
+            unauthorized = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unauthorized", [])[:6])
+            unsupported = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unsupported", [])[:6])
+            missing = ", ".join(str(value) for value in result.get("missing_or_unauthorized", [])[:6])
+            return f"The permitted devices were handled, but these were excluded or unavailable: {unavailable or protected or unauthorized or unsupported or missing or 'one or more devices'}."
+        if result.get("outcome") == "home_assistant_reported_target_state":
+            return "Home Assistant reports the requested state now."
+        if result.get("outcome") == "target_state_not_observed_before_timeout":
+            return "Home Assistant accepted the command, but the requested state was not observed before the verification timeout."
+        return "Home Assistant accepted the command; physical operation was not independently verified."
     if tool == "home_activate_scene":
+        if result.get("status") == "forbidden":
+            return str(result.get("message") or "That scene has not been approved for Home-AI activation.")
         if result.get("status") != "executed":
             return "I couldn't identify exactly one matching Home Assistant scene."
         return f"Activated {result.get('scene', {}).get('name') or 'the Home Assistant scene'}."
@@ -1772,7 +1865,7 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
     raw_action = str(normalized.get("action") or "").casefold().strip()
     if raw_action in {"on", "off"}:
         normalized["action"] = f"turn_{raw_action}"
-    elif raw_action not in {"turn_on", "turn_off", "set_brightness"}:
+    elif raw_action not in {"turn_on", "turn_off", "set_brightness", "adjust_brightness", "set_color", "set_color_temperature"}:
         # Qwen occasionally emits an invented compound action (for example
         # turn_off_all_lights) or omits the action entirely. Recover only from
         # the user's explicit intent, and preserve that intent through retries.
@@ -1791,6 +1884,73 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
     if target:
         normalized["entity_or_area"] = target
     return normalized
+
+
+def _home_followup_plan(text: str, context: dict) -> list[tuple[str, dict]]:
+    """Bind home pronouns to the exact prior result set, never a fresh broad query."""
+    if context.get("referent_type") != "home_entities":
+        return []
+    devices = [item for item in context.get("home_result_set", [])
+               if isinstance(item, dict) and item.get("entity_id")]
+    lowered = text.casefold().strip()
+    # Explicit domain changes win over a retained home referent.
+    if re.search(r"\b(?:plex|server|docker|container|weather|internet|web|online)\b", lowered):
+        return []
+    selected = list(devices)
+    if re.search(r"\b(?:those|them|these|they|that one|all of them)\b", lowered):
+        if re.search(r"\b(?:light|lights|lamp|lamps)\b", lowered):
+            selected = [item for item in selected if str(item.get("entity_id", "")).startswith("light.")]
+        elif re.search(r"\b(?:outlet|outlets|plug|plugs|switch|switches)\b", lowered):
+            selected = [item for item in selected if str(item.get("entity_id", "")).startswith("switch.")]
+    area_followup = re.fullmatch(r"\s*(?:what|how) about (?:the )?(.+?)\s*[?!.]*\s*", lowered)
+    if area_followup:
+        scope = area_followup.group(1).strip()
+        prior_query = context.get("home_result_query") or {}
+        prior_state = prior_query.get("state")
+        if not prior_state and str(prior_query.get("entity_or_area") or "").casefold() in {"on", "off", "available", "unavailable", "unknown"}:
+            prior_state = str(prior_query["entity_or_area"]).casefold()
+        arguments = {"scope": scope}
+        if prior_state:
+            arguments["state"] = prior_state
+        return [("home_get_state", arguments)]
+    if not devices:
+        return []
+    exclusion = re.search(r"\bexcept\s+(?:the\s+)?(.+?)\s*[?!.]*$", lowered)
+    if exclusion:
+        phrase = exclusion.group(1).strip()
+        selected = [item for item in selected if not (
+            phrase == str(item.get("area") or "").casefold()
+            or phrase in str(item.get("name") or "").casefold()
+            or phrase == str(item.get("entity_id") or "").casefold()
+        )]
+    ids = [str(item["entity_id"]) for item in selected]
+    if re.search(r"\bcan (?:that|it|those|these)(?: lights?)? (?:be dimmed|change colou?r)\b", lowered):
+        return [("home_get_state", {"entity_ids": ids})]
+    if re.search(r"\bcheck again\b", lowered):
+        return [("home_get_state", {"entity_ids": ids})]
+    if re.search(r"\b(?:when did|how long|what changed|why (?:didn't|did not)|last available|been unavailable)\b", lowered):
+        return [("home_get_activity", {"entity_ids": ids, "hours": 168})]
+    if re.search(r"\b(?:how bright|what colou?r|what(?:'s| is) their colou?r)\b", lowered):
+        return [("home_get_state", {"entity_ids": ids})]
+    brightness = re.search(r"\b(?:make|set) (?:them|those|these)(?: lights?)?(?: to)?\s+(\d{1,3})\s*(?:percent\b|%)", lowered)
+    if brightness:
+        return [("home_control", {"entity_ids": ids, "action": "set_brightness",
+                                  "parameters": {"brightness_pct": int(brightness.group(1))}})]
+    if re.search(r"\bmake (?:them|those|these)(?: lights?)? (?:a bit |slightly )?dimmer\b", lowered):
+        return [("home_control", {"entity_ids": ids, "action": "adjust_brightness",
+                                  "parameters": {"brightness_delta_pct": -10}})]
+    if re.search(r"\bmake (?:them|those|these)(?: lights?)? warm white\b", lowered):
+        return [("home_control", {"entity_ids": ids, "action": "set_color_temperature",
+                                  "parameters": {"color_temp_kelvin": 2700}})]
+    if re.search(r"\b(?:did|are) (?:they|them|those|all of them)\b.*\b(?:off|on)\b", lowered):
+        return [("home_get_state", {"entity_ids": ids})]
+    if re.search(r"\b(?:which|what) of (?:those|them|these)\b|\bwhich of those are\b", lowered):
+        return [("home_get_state", {"entity_ids": ids})]
+    action = "turn_off" if re.search(r"\bturn\s+(?:those|them|these|all of them)\s+off\b", lowered) else (
+        "turn_on" if re.search(r"\bturn\s+(?:those|them|these|all of them)\s+on\b", lowered) else None)
+    if action:
+        return [("home_control", {"entity_ids": ids, "action": action})]
+    return []
 
 
 async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: str, confirmed: bool = False, action_id: str | None = None) -> dict:
@@ -2620,7 +2780,25 @@ def media_status_display_title(result: dict, user_text: str) -> str:
 
 
 def social_acknowledgement(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks|got it|understood|alright|all right)[.!]?\s*", text, re.I))
+    return bool(re.fullmatch(
+        r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks|got it|understood|alright|all right|oh|ah|huh|wow)[.!]?\s*",
+        text,
+        re.I,
+    ))
+
+
+def social_acknowledgement_response(text: str) -> str:
+    """Return a neutral deterministic reply for a contentless social turn.
+
+    Bare interjections must terminate before discovery/model routing; otherwise
+    retained context and noisy capabilities can turn an acknowledgement such
+    as "Oh" into an unrelated domain claim. Questions that merely begin with
+    an interjection do not full-match social_acknowledgement() and continue
+    through normal contextual routing.
+    """
+    if re.fullmatch(r"\s*(?:thanks|thank you|thx|cheers|okay thanks|no thanks)[.!]?\s*", text, re.I):
+        return "You're welcome."
+    return "Okay."
 
 
 def underspecified_read_request(text: str, context: dict | None = None) -> str | None:
@@ -2798,6 +2976,8 @@ def turn_context(client_id: str, text: str) -> dict:
         "workflow_id", "media_type", "referent_type", "referent_ids", "query",
         "topic", "unresolved_request", "location", "camera", "subject",
         "latest_operation", "operation_scope",
+        "home_result_set", "home_result_query", "home_result_timestamp", "latest_home_action",
+        "pending_home_candidates", "pending_home_operation",
         "latest_tool_result", "latest_assistant_response", "latest_spoken_response",
         # Pending media-resolution state (a disambiguation question or a
         # missing-title clarification already asked) must survive a turn
@@ -2809,6 +2989,17 @@ def turn_context(client_id: str, text: str) -> dict:
         # them in place. Real gap found while building PendingMediaResolution.
         "pending_disambiguation", "pending_title_clarification",
     ) if key in prior}
+    pending_home = prior.get("pending_home_candidates") if isinstance(prior.get("pending_home_candidates"), list) else []
+    reply = text.strip().casefold().strip(" .!?")
+    resolved_home = [item for item in pending_home if reply in {
+        str(item.get("entity_id") or "").casefold(), str(item.get("name") or "").casefold(),
+        *(str(alias).casefold() for alias in (item.get("aliases") or [])),
+    }]
+    if len(resolved_home) == 1:
+        current.update({"domain": "home", "latest_domain": "home", "kind": "home_state", "group": "home",
+                        "referent_type": "home_entities", "referent_ids": [str(resolved_home[0]["entity_id"])],
+                        "home_result_set": resolved_home, "resolved_home_clarification": True})
+        current.pop("pending_home_candidates", None)
     container_followup = _server_container_followup_target(text, prior)
     domain = "server" if container_followup else explicit_domain(text, prior)
     operation = media_intent(text)
@@ -2977,6 +3168,16 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     deterministic = deterministic_plan(text)
     if deterministic:
         return deterministic
+    if context.get("resolved_home_clarification") and context.get("referent_ids"):
+        operation = context.get("pending_home_operation") or "home_get_state"
+        arguments = {"entity_ids": list(context["referent_ids"])}
+        if operation == "home_get_activity":
+            arguments["hours"] = 168
+        return [(operation, arguments)]
+    home_followup_fn = globals().get("_home_followup_plan")
+    home_followup = home_followup_fn(text, context) if callable(home_followup_fn) else []
+    if home_followup:
+        return home_followup
     # turn_context() already resolved this as a bounded storage-topic
     # continuation naming a known container (see
     # _server_container_followup_target) -- must run before direct_file_request/
@@ -3077,6 +3278,50 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
         if zone:
             args["timezone"] = zone
         return [("current_datetime", args)]
+    # Broad household-state questions have a deterministic local source and
+    # must never fall through to public web search. Keep "online"/"running"
+    # out of this rule because those can intentionally transition to servers.
+    broad_home_state = re.fullmatch(
+        r"\s*(?:what(?:'s| is)|which devices are|are any devices)\s+"
+        r"(on|off|available|unavailable)(?:\s+right now)?\s*[?!.]*\s*", t, re.I)
+    if broad_home_state:
+        return [("home_get_state", {"entity_or_area": broad_home_state.group(1).casefold()})]
+    typed_home_state = re.fullmatch(
+        r"\s*(?:are any|which)\s+(lights?|lamps?|outlets?|plugs?|switch(?:es)?)\s+(?:are\s+)?(?:still\s+)?(on|off|available|unavailable)\s*[?!.]*\s*",
+        t, re.I)
+    if typed_home_state:
+        return [("home_get_state", {"domain": typed_home_state.group(1), "state": typed_home_state.group(2)})]
+    everything_check = re.fullmatch(r"\s*(?:is everything|are all (?:my )?(?:smart |home )?devices)\s+(off|on|available|working)\s*[?!.]*\s*", t, re.I)
+    if everything_check:
+        wanted = "available" if everything_check.group(1) == "working" else everything_check.group(1)
+        return [("home_get_state", {"state": wanted, "aggregate_check": wanted})]
+    scoped_lights = re.fullmatch(r"\s*are all (?:the )?(.+?) lights (off|on)\s*[?!.]*\s*", t, re.I)
+    if scoped_lights:
+        scope = scoped_lights.group(1).strip()
+        return [("home_get_state", {"domain": "light", "floor": scope, "state": scoped_lights.group(2),
+                                    "aggregate_check": scoped_lights.group(2)})]
+    if re.fullmatch(r"\s*how many (?:smart )?(lights?|lamps?|outlets?|plugs?|switches?) (?:do i have|exist)\s*[?!.]*\s*", t, re.I):
+        kind = re.search(r"\b(lights?|lamps?|outlets?|plugs?|switches?)\b", t).group(1)
+        return [("home_find_device", {"query": kind})]
+    capability_query = re.fullmatch(r"\s*which (lights?|lamps?) can (?:change colour|change color|change colours|change colors|be dimmed)\s*[?!.]*\s*", t, re.I)
+    if capability_query:
+        return [("home_find_device", {"query": capability_query.group(1)})]
+    device_capability = re.fullmatch(r"\s*what can (?:this|that|the) (.+?) do\s*[?!.]*\s*", t, re.I)
+    if device_capability:
+        return [("home_find_device", {"query": device_capability.group(1).strip()})]
+    area_home_state = re.fullmatch(
+        r"\s*(?:what(?:'s| is)|what is happening)\s+(?:on\s+)?in\s+(?:the\s+)?(.+?)\s*[?!.]*\s*", t, re.I)
+    if area_home_state:
+        return [("home_get_area_state", {"area": area_home_state.group(1).strip()})]
+    if re.fullmatch(r"\s*(?:what|which)\s+(?:smart\s+|home\s+)?devices\s+(?:do i have|exist|are available)\s*[?!.]*\s*", t, re.I):
+        return [("home_find_device", {"query": ""})]
+    if re.search(r"\bwhat scenes do (?:i|we) have\b|\bwhich (?:home )?automations\b|\bwhat(?:'s| is) scheduled (?:for )?(?:tonight|today)\b", t, re.I):
+        return [("home_list_routines", {"kind": "all"})]
+    named_history = re.fullmatch(
+        r"\s*(?:when did|how long has|why (?:didn't|did not))\s+(?:the\s+)?(.+?)\s+"
+        r"(?:turn (?:on|off)|been (?:on|off|unavailable)|respond)\s*[?!.]*\s*", t, re.I)
+    if named_history:
+        return [("home_get_activity", {"entity_or_area": named_history.group(1).strip(), "hours": 168})]
     # Real production bug: "What's the state of the neon lights?" scored
     # home_get_area_state fractionally higher than home_get_state in
     # discovery (both plausible candidates for generic "state" language),
@@ -3991,10 +4236,23 @@ def record_tool_referent(client_id: str, tool_name: str, arguments: dict, result
     """
     if result.get("status") != "ok":
         return
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    if tool_name in {"home_find_device", "home_get_state", "home_get_area_state"}:
+        devices = [item for item in payload.get("devices", []) if isinstance(item, dict) and item.get("entity_id")]
+        context = dict(conversation_context.get(client_id, {}))
+        context.update({
+            "domain": "home", "latest_domain": "home", "kind": "home_state", "group": "home",
+            "referent_type": "home_entities",
+            "referent_ids": [str(item["entity_id"]) for item in devices],
+            "home_result_set": devices,
+            "home_result_query": dict(arguments) if isinstance(arguments, dict) else {},
+            "home_result_timestamp": time.time(),
+        })
+        conversation_context[client_id] = context
+        return
     argument_key = _REFERENT_ARGUMENT_KEYS.get(tool_name)
     if not argument_key:
         return
-    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
     subject = None
     if isinstance(payload, dict):
         identity = payload.get("canonical_identity")
@@ -4133,6 +4391,20 @@ def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | No
     if len(people_matches) == 1:
         return people_matches[0]
     return None
+
+
+def plural_disambiguation_reply(text: str) -> bool:
+    """Recognize an explicit multi-select reply without executing it.
+
+    Media writes are deliberately planned and confirmed one canonical identity
+    at a time. This signal exists only to produce an honest clarification; it
+    never expands one pending disambiguation into multiple acquisition plans.
+    """
+    return bool(re.fullmatch(
+        r"\s*(?:both|all|all of (?:them|those)|every one|everything)[.!]?\s*",
+        text,
+        re.I,
+    ))
 
 
 def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
@@ -4754,6 +5026,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if creator_hint and not has_people_evidence:
                 full = ("These catalog candidates don't include cast or creator evidence, so I can't safely use that hint yet: "
                         + ", ".join(labels) + ".") if labels else "The catalog results don't include cast or creator evidence, so I can't safely use that hint yet."
+            elif plural_disambiguation_reply(user_text):
+                count = len(candidates)
+                count_label = {2: "two", 3: "three"}.get(count, str(count))
+                if count == 2:
+                    reason = "I found two choices, but I can only prepare one exact request at a time."
+                else:
+                    reason = f"I found {count_label} choices, so 'both' doesn't identify which two. I can only prepare one exact request at a time."
+                full = reason + (" Which one do you want: " + ", ".join(labels) + "." if labels else " Which one do you want?")
             else:
                 full = "I still need to know which one you mean: " + ", ".join(labels) + "." if labels else "I still need to know which one you mean."
             await emit_answer(ws, request_id, full, client_id=client_id, origin="disambiguation_reprompt")
@@ -4966,7 +5246,38 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         previous_home = conversation_context.get(client_id, {}).get("latest_home_action")
+        if isinstance(previous_home, dict) and re.search(r"\b(?:why (?:didn't|did not) (?:it|they|that)|what was the last command)\b", user_text, re.I):
+            arguments = previous_home.get("arguments") or {}
+            if re.search(r"\bwhat was the last command\b", user_text, re.I):
+                target = arguments.get("entity_or_area") or ", ".join(arguments.get("entity_ids") or []) or "the retained devices"
+                full = f"The last Home Assistant command I sent was {arguments.get('action') or 'an unknown action'} for {target}."
+            elif previous_home.get("status") == "confirmation_required":
+                full = "That command was not sent because the existing authorization policy required confirmation."
+            elif isinstance(previous_home.get("result"), dict):
+                rendered = direct_structured_answer(user_text, [{"tool": "home_control", "status": previous_home.get("status"), "result": previous_home["result"]}])
+                full = (rendered or "I have the command record, but Home Assistant did not provide enough evidence to establish a cause.") + " I can't infer a physical or provider cause from timing alone."
+            else:
+                full = "I don't have enough retained command evidence to establish why it failed."
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="home_command_diagnostic")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         if home_retry_intent(user_text) and isinstance(previous_home, dict):
+            previous_args = previous_home.get("arguments") or {}
+            desired = "off" if previous_args.get("action") == "turn_off" else "on" if previous_args.get("action") == "turn_on" else None
+            if desired:
+                read_args = ({"entity_ids": list(previous_args.get("entity_ids") or [])}
+                             if isinstance(previous_args.get("entity_ids"), list)
+                             else {"entity_or_area": previous_args.get("entity_or_area", "")})
+                reconciled = await invoke_tool("home_get_state", read_args, client_id, request_id)
+                current = reconciled.get("result") if isinstance(reconciled.get("result"), dict) else {}
+                devices = [item for item in current.get("devices", []) if isinstance(item, dict)]
+                if devices and all(item.get("state") == desired for item in devices):
+                    full = f"Home Assistant already reports all retained targets {desired}, so I did not resend the command."
+                    await emit_answer(ws, request_id, full, client_id=client_id, origin="home_retry_reconciled")
+                    history.append({"role": "assistant", "content": full})
+                    await ws.send_json({"type": "done", "request_id": request_id})
+                    return
             result = await invoke_tool(previous_home["name"], previous_home["arguments"], client_id, request_id)
             direct = direct_structured_answer(user_text, [result])
             full = direct or "I couldn't retry the previous Home Assistant command."
@@ -4976,7 +5287,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         if social_acknowledgement(user_text):
-            full = "You're welcome."
+            full = social_acknowledgement_response(user_text)
             await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5002,6 +5313,18 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         llm_user_text = routing_aliases(user_text)
         messages = [{"role": "system", "content": SYSTEM}, *model_history, {"role": "user", "content": llm_user_text}]
         context = turn_context(client_id, user_text)
+        if (context.get("referent_type") == "home_entities"
+                and re.search(r"\bthat one\b", user_text, re.I)
+                and len(context.get("home_result_set") or []) > 1):
+            names = [str(item.get("name") or item.get("entity_id")) for item in context["home_result_set"][:6]]
+            conversation_context[client_id] = {**conversation_context.get(client_id, {}),
+                                               "pending_home_candidates": list(context["home_result_set"]),
+                                               "pending_home_operation": "home_get_activity" if re.search(r"\b(?:how long|when did|what changed|why)\b", user_text, re.I) else "home_get_state"}
+            full = "Which one did you mean: " + ", ".join(names) + "?"
+            await emit_answer(ws, request_id, full, client_id=client_id, origin="home_referent_clarification")
+            history.append({"role": "assistant", "content": full})
+            await ws.send_json({"type": "done", "request_id": request_id})
+            return
         known_year = canonical_media_year_answer(context, user_text)
         if known_year:
             await emit_answer(ws, request_id, known_year, client_id=client_id, origin="canonical_media_year")
@@ -5123,6 +5446,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if name == "plex_search" and not args:
                 args = {"query": plex_query_from_speech(user_text)}
             planned_result = await invoke_tool(name, args, client_id, request_id)
+            if name == "home_control":
+                conversation_context.setdefault(client_id, {})["latest_home_action"] = {
+                    "name": name, "arguments": dict(args), "result": planned_result.get("result"),
+                    "status": planned_result.get("status"), "timestamp": time.time()
+                }
             if name == "media_plan_goal" and retained_identity:
                 planned_result = enforce_retained_media_identity(retained_identity, planned_result)
             live_results.append(planned_result)
@@ -5434,7 +5762,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 research_calls += 1
                 if name == "home_control":
                     conversation_context.setdefault(client_id, {})["latest_home_action"] = {
-                        "name": name, "arguments": dict(arguments), "timestamp": time.time()
+                        "name": name, "arguments": dict(arguments), "result": result.get("result"),
+                        "status": result.get("status"), "timestamp": time.time()
                     }
                 live_results.append(result)
                 if name == "web_search" and result.get("status") == "ok" and isinstance(result.get("result"), dict):
