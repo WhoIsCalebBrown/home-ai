@@ -83,6 +83,39 @@ def test_gpu_structured_failure_is_unavailable_not_success(monkeypatch, tmp_path
     assert response["result"]["evidence_available"] is False
 
 
+def test_camera_policy_removes_capabilities_from_discovery_and_denies_direct_invoke(monkeypatch, tmp_path):
+    _configure_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "CAMERA_READS_ENABLED", False)
+
+    discovered = module.discover_capabilities("show recent camera events", 8)
+    assert all(item["service"] != "frigate" for item in discovered)
+    registry_names = {item[0] for item in module._discoverable_registry()}
+    assert "frigate_snapshot" not in registry_names
+    assert "frigate_recent_events" not in registry_names
+
+    response = asyncio.run(module.invoke(
+        Request("test-tools-secret"),
+        module.Invoke(name="frigate_snapshot", arguments={"camera": "indoor"}),
+    ))
+    assert response["transport_ok"] is True
+    assert response["operation_ok"] is False
+    assert response["status"] == "disabled"
+    assert response["error"]["code"] == "CAMERA_READS_DISABLED"
+    assert response["result"]["evidence_available"] is False
+
+
+def test_qa_modes_require_trusted_camera_read_disable(monkeypatch):
+    monkeypatch.setattr(module, "QA_MODE", "live_readonly")
+    monkeypatch.setattr(module, "QA_EXECUTOR", "")
+    monkeypatch.setattr(module, "QA_STATE_ROOT", "")
+    monkeypatch.setattr(module, "CAMERA_READS_ENABLED", True)
+    with pytest.raises(RuntimeError, match="CAMERA_READS_ENABLED=false"):
+        module.validate_qa_configuration()
+
+    monkeypatch.setattr(module, "CAMERA_READS_ENABLED", False)
+    module.validate_qa_configuration()
+
+
 @pytest.mark.parametrize("reported_status", ["rejected", "disabled", "unavailable", "failed_ingestion"])
 def test_negative_adapter_status_is_never_wrapped_as_operation_success(monkeypatch, tmp_path, reported_status):
     _configure_token(monkeypatch, tmp_path)

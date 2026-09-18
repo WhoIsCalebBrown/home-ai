@@ -61,6 +61,12 @@ TOOLS_SERVICE_TOKEN_HEADER = "X-Home-AI-Tools-Token"
 
 TOWER = os.getenv("TOWER_URL", "http://192.168.40.44").rstrip("/")
 UNRAID_MCP_URL = os.getenv("UNRAID_MCP_URL", f"{TOWER}:8043/mcp").rstrip("/")
+# The Management Agent is a privileged host-control boundary.  Its API token
+# is deliberately file-only: putting it in a normal environment variable
+# would make accidental diagnostic/configuration exposure far too easy.  An
+# unset path preserves a deliberately documented compatibility mode while an
+# explicitly configured path *never* falls back to anonymous MCP access.
+UNRAID_MCP_TOKEN_FILE = os.getenv("UNRAID_MCP_TOKEN_FILE", "").strip()
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 # cli_debrid is bound to localhost on the Unraid host.  Home-AI-Tools reaches
@@ -94,10 +100,37 @@ STANDARD_MEDIA_BACKEND_READY = os.getenv("STANDARD_MEDIA_BACKEND_READY", "false"
 QA_MODE = os.getenv("HOME_AI_QA_MODE", "").strip().casefold()
 QA_EXECUTOR = os.getenv("HOME_AI_QA_EXECUTOR", "").strip().casefold()
 QA_STATE_ROOT = os.getenv("HOME_AI_QA_STATE_ROOT", "").strip()
+
+
+def _strict_boolean_setting(name: str, default: bool) -> bool:
+    """Read a deployment-owned boolean without silently accepting typos.
+
+    This policy is a security boundary, so values such as ``flase`` must not
+    accidentally become an enabled camera-data path.
+    """
+    value = os.getenv(name, "").strip().casefold()
+    if not value:
+        return default
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise RuntimeError(f"invalid {name}; refusing to start")
+
+
+# Camera events, snapshots, clips, and even their metadata are sensitive
+# household data.  QA deployments must opt out at the trusted container
+# configuration boundary.  Production retains the existing behavior unless
+# its owner explicitly turns the policy off.
+CAMERA_READS_ENABLED = _strict_boolean_setting("HOME_AI_CAMERA_READS_ENABLED", True)
+
+
 def validate_qa_configuration() -> None:
     if QA_MODE not in {"", "live_readonly", "isolated_execution"}:
         raise RuntimeError("invalid HOME_AI_QA_MODE; refusing to start")
     if QA_MODE == "live_readonly":
+        if CAMERA_READS_ENABLED:
+            raise RuntimeError("live_readonly requires HOME_AI_CAMERA_READS_ENABLED=false")
         if QA_EXECUTOR or QA_STATE_ROOT:
             raise RuntimeError("live_readonly cannot configure an executor or state root")
         if any(os.getenv(name, "").strip() for name in (
@@ -106,6 +139,8 @@ def validate_qa_configuration() -> None:
         )):
             raise RuntimeError("live_readonly refuses production mutation credentials")
     elif QA_MODE == "isolated_execution":
+        if CAMERA_READS_ENABLED:
+            raise RuntimeError("isolated_execution requires HOME_AI_CAMERA_READS_ENABLED=false")
         if QA_EXECUTOR != "fake":
             raise RuntimeError("isolated_execution requires HOME_AI_QA_EXECUTOR=fake")
         if not QA_STATE_ROOT or QA_STATE_ROOT in {"/", "/data", "/config"}:
@@ -350,6 +385,26 @@ def _parse_mcp_sse_line(raw: str) -> dict[str, Any]:
     raise ValueError("no MCP data line in response")
 
 
+def unraid_mcp_authorization_headers() -> dict[str, str]:
+    """Return the private MCP bearer credential, if this deployment uses one.
+
+    A configured credential path is an assertion by the deployment owner that
+    the privileged MCP endpoint must be authenticated.  Therefore a missing,
+    unreadable, empty, or malformed mounted secret is an error before any
+    handshake/call can be sent; it must never silently degrade to anonymous
+    host-management access.
+    """
+    if not UNRAID_MCP_TOKEN_FILE:
+        return {}
+    try:
+        token = Path(UNRAID_MCP_TOKEN_FILE).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError("Unraid MCP authentication credential is unavailable") from exc
+    if not token or any(character.isspace() for character in token):
+        raise RuntimeError("Unraid MCP authentication credential is invalid")
+    return {"Authorization": f"Bearer {token}"}
+
+
 async def unraid_mcp_call(tool_name: str, arguments: dict[str, Any] | None = None, timeout: float = 6) -> Any:
     """Call one read-only tool on the privileged Unraid Management Agent MCP
     server and return its already-parsed JSON result.
@@ -362,7 +417,11 @@ async def unraid_mcp_call(tool_name: str, arguments: dict[str, Any] | None = Non
     call volume here is low (occasional user questions, not a hot path) and
     this avoids any class of stale/expired-session bug entirely.
     """
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **unraid_mcp_authorization_headers(),
+    }
     async with httpx.AsyncClient(timeout=timeout) as client:
         init = await client.post(UNRAID_MCP_URL, headers=headers, json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -4359,7 +4418,15 @@ def _discoverable_registry() -> list:
     (discover_capabilities() and /registry) -- add a new discovery entry
     point on top of this function, never by iterating REGISTRY directly,
     so this exclusion cannot be silently bypassed later."""
-    return [item for item in REGISTRY if item[0] not in MODEL_FACING_EXCLUDED_TOOLS]
+    return [
+        item for item in REGISTRY
+        if item[0] not in MODEL_FACING_EXCLUDED_TOOLS
+        # Frigate service access carries sensitive household visual and event
+        # data.  When a trusted deployment policy disables it (mandatory in
+        # QA), remove every Frigate capability from all model-facing discovery
+        # routes rather than hoping a caller/model elects not to use one.
+        and (CAMERA_READS_ENABLED or item[3] != "frigate")
+    ]
 
 
 GROUP_SERVICES = {
@@ -4680,6 +4747,25 @@ async def invoke(request: Request, req: Invoke):
     if not item:
         raise HTTPException(404, "tool is not enabled")
     _, _, permission, service, _, fn = item
+    if service == "frigate" and not CAMERA_READS_ENABLED:
+        # Direct callers receive the same server-side policy enforcement as
+        # model discovery.  This is intentionally not a client/model argument
+        # and remains effective even if a caller already knows a tool name.
+        result = {
+            "error": "camera data access is disabled in this deployment scope",
+            "error_code": "CAMERA_READS_DISABLED",
+            "evidence_available": False,
+        }
+        audit({"client_id": req.client_id, "session_id": req.session_id,
+               "trace_id": req.trace_id, "turn_id": req.turn_id,
+               "tool_call_id": req.tool_call_id, "tool": req.name,
+               "service": service, "permission": permission, "status": "disabled",
+               "operation_ok": False, "camera_read_policy": "disabled"})
+        return _operation_response(
+            req=req, service=service, permission=permission, status="disabled",
+            result=result, duration_ms=0,
+            error={"code": "CAMERA_READS_DISABLED", "message": result["error"]},
+        )
     isolated_fake_media_executor = QA_MODE == "isolated_execution" and req.name == "media_standard_request"
     qa_denies_mutation = permission != "read" and (
         QA_MODE == "live_readonly"
