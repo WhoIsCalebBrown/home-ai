@@ -104,6 +104,11 @@ def test_camera_policy_removes_capabilities_from_discovery_and_denies_direct_inv
     assert response["result"]["evidence_available"] is False
 
 
+def test_frigate_service_uses_the_bounded_configured_url():
+    assert module.SERVICES["frigate"][0] == module.FRIGATE_URL
+    assert module.FRIGATE_URL == module.FRIGATE_URL.rstrip("/")
+
+
 def test_qa_modes_require_trusted_camera_read_disable(monkeypatch):
     monkeypatch.setattr(module, "QA_MODE", "live_readonly")
     monkeypatch.setattr(module, "QA_EXECUTOR", "")

@@ -205,13 +205,19 @@ try:
 except json.JSONDecodeError:
     FRIGATE_CAMERA_CONTEXTS = {}
 
+# Port 5000 is intentionally unauthenticated, so production points this at a
+# dedicated Frigate/Tools-only Docker network rather than publishing it on the
+# host. Keep the old address only as a compatibility default for installations
+# that have not adopted the contained network yet.
+FRIGATE_URL = os.getenv("FRIGATE_URL", f"{TOWER}:6060").rstrip("/")
+
 SERVICES = {
     "plex": (f"{TOWER}:32400", "Plex-Media-Server/Library/Application Support/Plex Media Server/Preferences.xml"),
     "sonarr": (f"{TOWER}:8989", "sonarr/config.xml"),
     "radarr": (f"{TOWER}:7878", "radarr/config.xml"),
     "lidarr": (f"{TOWER}:8686", "lidarr/config.xml"),
     "qbittorrent": (f"{TOWER}:8080", ""),
-    "frigate": (f"{TOWER}:6060", ""),
+    "frigate": (FRIGATE_URL, ""),
     "netdata": (f"{TOWER}:19999", ""),
     "overseerr": (f"{TOWER}:5055", ""),
     "slskd": (f"{TOWER}:5030", "slskdn/access.json"),
