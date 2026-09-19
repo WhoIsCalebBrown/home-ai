@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -258,13 +261,64 @@ PROBE_TOOL_ERROR = "tool exception fixture"
 PROBE_HOSTILE_TITLE = '<img src="x" onerror="alert(1)"> [spoof](https://evil.example)'
 PROBE_PROMPT = f"Show the QA fixture for {PROBE_RAW_QUERY}."
 PROBE_BLOCK_SECONDS = 3.0
-PROBE_ANSWER = (
-    "Here is the fixture answer.\n\n"
-    "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
-    "- Opened source — complete\n"
-    "  - [Fixture source](https://example.com/news) — example.com\n"
-    r"  - \[spoof\]\(https\:\/\/evil.example\) — example.com"
-)
+PROBE_SAFE_TITLE = "Fixture source"
+PROBE_LIVE_RESULTS = [
+    {
+        "tool": "web_search",
+        "status": "ok",
+        "result": {
+            "query": f"{PROBE_RAW_QUERY} token={PROBE_TOKEN}",
+            "result_count": 1,
+            "results": [{
+                "title": PROBE_HOSTILE_TITLE,
+                "domain": "example.com",
+                "url": PROBE_PRIVATE_URL,
+                "snippet": PROBE_SNIPPET,
+            }],
+        },
+    },
+    {
+        "tool": "web_fetch",
+        "status": "ok",
+        "result": {
+            "url": "https://example.com/news?token=fixture-token-9f1c#section",
+            "title": PROBE_SAFE_TITLE,
+            "content": PROBE_SNIPPET,
+        },
+    },
+    {
+        "tool": "web_fetch",
+        "status": "failed",
+        "operation_ok": False,
+        "result": {"url": PROBE_PRIVATE_URL, "error": PROBE_TOOL_ERROR},
+    },
+]
+
+
+@lru_cache(maxsize=1)
+def _fixture_display_answer() -> str:
+    """Build the fixture response through the real projection/footer boundary."""
+    repository = Path(__file__).resolve().parents[1]
+    assistant_dir = repository / "assistant"
+    if str(assistant_dir) not in sys.path:
+        sys.path.insert(0, str(assistant_dir))
+    from trace_projection import project_trace
+
+    spec = importlib.util.spec_from_file_location(
+        "home_ai_fixture_voice_app", assistant_dir / "voice-api-app.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load the production trace footer")
+    app_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(app_module)
+    trace = project_trace(PROBE_LIVE_RESULTS)
+    rendered = app_module.openai_tool_trace_footer(trace)
+    raw_metadata = (PROBE_PRIVATE_URL, PROBE_SNIPPET, PROBE_TOKEN, PROBE_TOOL_ERROR)
+    if not rendered or any(value in repr(trace) or value in rendered for value in raw_metadata):
+        raise RuntimeError("fixture projection leaked raw tool metadata")
+    if PROBE_HOSTILE_TITLE not in repr(trace):
+        raise RuntimeError("fixture hostile title did not reach projection")
+    return "Here is the fixture answer." + rendered
 
 
 def _probe_sse(delta: dict[str, Any], finish_reason: str | None = None) -> str:
@@ -293,6 +347,7 @@ async def progress_source_chat(request: Request):
     prompt = " ".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
     if body.get("model") != PROBE_MODEL or not body.get("stream") or PROBE_RAW_QUERY not in prompt:
         raise HTTPException(400, "fixture accepts only its streamed QA model")
+    display_answer = _fixture_display_answer()
 
     async def events():
         yield _probe_sse({"role": "assistant"})
@@ -301,7 +356,7 @@ async def progress_source_chat(request: Request):
         # ordinary content above before this source completes.
         await asyncio.sleep(PROBE_BLOCK_SECONDS)
         yield _probe_sse({"content": "\n---\n\n"})
-        yield _probe_sse({"content": PROBE_ANSWER})
+        yield _probe_sse({"content": display_answer})
         yield _probe_sse({}, "stop")
         yield "data: [DONE]\n\n"
 
@@ -315,7 +370,7 @@ async def progress_source_tts(request: Request):
     # The fixture has no synthesizer.  A 204 is the required outcome for
     # progress/source-only text and proves it never asks a speech backend to
     # read browser display diagnostics.
-    if not text or text == PROBE_ANSWER or DISPLAY_TRACE_MARKER in text or text.startswith("**Working**"):
+    if not text or text == _fixture_display_answer() or DISPLAY_TRACE_MARKER in text or text.startswith("**Working**"):
         return Response(status_code=204)
     if text == "Here is the fixture answer.":
         return Response(content=b"fixture-spoken-answer", media_type="audio/wav")

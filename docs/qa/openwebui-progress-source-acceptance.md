@@ -14,10 +14,13 @@ ghcr.io/open-webui/open-webui@sha256:41daa0cf2561a5d4c8d1ff31ee2a98d93ab4d3ac260
 ~~~
 
 The provider is the authenticated QA fixture in qa/openwebui_live_p0.py. It
-requires a sentinel raw query in the UI prompt, retains a private URL, raw
-snippet, token, raw error, and hostile title internally, emits only safe
-progress labels, then holds the fake source for three seconds before producing
-the final answer and safe rich trace.
+requires a sentinel raw query in the UI prompt and feeds a raw tool-result list
+through the actual assistant trace_projection.project_trace function and the
+actual voice-api-app.py openai_tool_trace_footer function. That raw metadata
+contains a private/internal token-bearing URL, raw query, snippet, token, raw
+exception, hostile HTML/Markdown title, and one safe fetched URL. The emitted
+stream contains only the resulting projected footer. It holds the fake source
+for three seconds before sending the final answer and trace.
 
 ## Reproducible browser acceptance
 
@@ -26,7 +29,7 @@ test data, not Home-AI credentials.
 
 ~~~bash
 set -eu
-docker build -t home-ai-progress-source-qa -f qa/Dockerfile qa
+docker build -f qa/Dockerfile.assistant_integration -t home-ai-assistant-sdd-qa .
 export QA_NETWORK=home-ai-progress-source-acceptance
 export QA_DATA="$(mktemp -d /tmp/openwebui-progress-source.XXXXXX)"
 export PLAYWRIGHT_HOME="$(mktemp -d /tmp/openwebui-progress-source-playwright.XXXXXX)"
@@ -35,9 +38,10 @@ docker pull mcr.microsoft.com/playwright:v1.52.0-noble
 docker network create "$QA_NETWORK"
 docker run -d --rm --name home-ai-progress-source-provider \
   --network "$QA_NETWORK" --network-alias progress-source-provider \
-  --mount type=bind,src="$PWD/qa",dst=/workspace/qa,readonly \
-  --workdir /workspace/qa home-ai-progress-source-qa sh -ec \
-  'python -m pip install --no-cache-dir uvicorn==0.35.0 >/dev/null && exec python -m uvicorn openwebui_live_p0:progress_source_probe --host 0.0.0.0 --port 8000'
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -v "$PWD:/repo:ro" -w /repo home-ai-assistant-sdd-qa \
+  python -m uvicorn qa.openwebui_live_p0:progress_source_probe --host 0.0.0.0 --port 8000
 docker run -d --rm --name home-ai-progress-source-webui \
   --network "$QA_NETWORK" -p 127.0.0.1:18094:8080 \
   -e OPENAI_API_BASE_URLS='http://progress-source-provider:8000/v1' \
@@ -90,9 +94,9 @@ The completed browser invocation returned:
   "fixture_delay_ms": 3000,
   "early_progress_visible": true,
   "early_final_visible": false,
-  "early_elapsed_ms": 484,
+  "early_elapsed_ms": 477,
   "completed_progress_line_count": 2,
-  "final_elapsed_ms": 3394,
+  "final_elapsed_ms": 3439,
   "reloaded_progress_line_count": 2,
   "status": "pass"
 }
@@ -125,14 +129,14 @@ docker run --rm --network none --read-only \
   qa/test_assistant_conversation_integration.py
 ~~~
 
-Focused result: 643 passed, 561 warnings in 30.39s. The warnings are the
+Focused result: 643 passed, 561 warnings in 27.53s. The warnings are the
 existing audioop and FastAPI startup-event deprecations; the cache provider was
 disabled so the read-only cache warnings are absent.
 
-The final full run from the reviewed pre-fix commit remains:
+The required full production-shaped suite was run at this fix-round HEAD:
 
 ~~~text
-1087 passed, 563 warnings in 54.65s
+1087 passed, 563 warnings in 53.30s
 ~~~
 
 Its warnings were existing pytest-asyncio/audioop/FastAPI deprecations plus two
