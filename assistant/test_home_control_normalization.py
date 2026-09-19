@@ -41,3 +41,14 @@ def test_explicit_switch_bulk_wording_overrides_model_everything_target(utteranc
     assert normalize_home_tool_arguments("home_control", {
         "action": "turn_off", "entity_or_area": "everything",
     }, utterance) == {"action": "turn_off", "entity_or_area": "all switches"}
+
+
+@pytest.mark.parametrize("utterance", [
+    "Turn off everything except switches.",
+    "Turn off everything except the outlets.",
+    "Turn off everything except the plugs.",
+])
+def test_excluded_switch_category_never_overrides_model_everything_target(utterance):
+    assert normalize_home_tool_arguments("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+    }, utterance) == {"action": "turn_off", "entity_or_area": "everything"}

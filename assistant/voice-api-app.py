@@ -2042,9 +2042,13 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             target = legacy_target.replace("_", " ")
             normalized.pop("device_id", None)
     lowered = user_text.casefold()
-    switch_bulk_request = bool(re.search(
-        r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered,
-    ))
+    switch_bulk_request = (
+        bool(re.search(r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered))
+        and not bool(re.search(
+            r"\b(?:apart\s+from|except|excluding|without|but(?:\s+not)?|not)\s+(?:the\s+)?(?:outlet|outlets|plug|plugs|switch|switches)\b",
+            lowered,
+        ))
+    )
     raw_action = str(normalized.get("action") or "").casefold().strip()
     if raw_action in {"on", "off"}:
         normalized["action"] = f"turn_{raw_action}"
