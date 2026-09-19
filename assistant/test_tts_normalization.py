@@ -20,8 +20,8 @@ def test_media_tool_trace_is_removed_from_speech():
 
 def test_rich_sources_and_persistent_progress_are_never_spoken():
     displayed = (
-        "**Working**\n- Searching recent Canadian headlines…\n"
-        "- Reading CBC News…\n\n---\n\n"
+        "**Working**\n- Searching the web…\n"
+        "- Reading CBC…\n\n---\n\n"
         "Here is the Canadian roundup.\n\n<!-- home-ai-display-trace -->\n"
         "Research activity\n- Opened CBC News\n"
         "Sources\n- [Canada update](https://cbc.ca/news/update)"
@@ -35,7 +35,7 @@ def test_fallback_does_not_delete_ordinary_working_or_separator_text():
 
 
 def test_progress_trace_and_source_only_fragments_are_silent():
-    progress_only = "**Working**\n- Searching recent Canadian headlines…\n\n---\n\n"
+    progress_only = "**Working**\n- Searching the web…\n\n---\n\n"
     trace_only = (
         "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
         "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
@@ -47,6 +47,91 @@ def test_progress_trace_and_source_only_fragments_are_silent():
     assert app.remove_openai_display_metadata(progress_only) == ""
     assert app.remove_openai_display_metadata(trace_only) == ""
     assert app.remove_openai_display_metadata(source_only) == ""
+
+
+def test_truncated_progress_is_silent_but_ordinary_working_markdown_survives(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    truncated = "**Working**\n- Reading CBC…\n"
+    silent = asyncio.run(app.openai_speech(_SpeechRequest({"input": truncated})))
+    assert silent.status_code == 204
+    ordinary = "**Working**\n- This is ordinary answer text.\n---\n\nKeep it."
+    spoken = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary})))
+    assert spoken.status_code == 200
+    assert synthesized == [ordinary]
+
+
+def test_inline_trace_marker_is_ordinary_text_and_markerless_footer_is_silent(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    ordinary = "Answer says <!-- home-ai-display-trace --> literally, then continues."
+    ordinary_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary})))
+    assert ordinary_response.status_code == 200
+    assert synthesized[-1] == ordinary
+
+    flattened_display = (
+        "Here is the answer.\n\n---\n**Research activity**\n"
+        "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
+    )
+    flattened_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": flattened_display})))
+    assert flattened_response.status_code == 200
+    assert synthesized[-1] == "Here is the answer."
+
+    footer_only = asyncio.run(app.openai_speech(_SpeechRequest({"input": flattened_display.split("\n\n", 1)[1]})))
+    assert footer_only.status_code == 204
+
+
+def test_invalid_progress_shape_is_not_silenced(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    ordinary = "**Working**\n- User-authored bullet\n---\n\nThis must remain spoken."
+    response = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary})))
+    assert response.status_code == 200
+    assert synthesized == [ordinary]
+
+
+def test_tts_registry_purges_expired_entries_on_lookup(monkeypatch):
+    app.openai_tts_text_by_display_digest.clear()
+    now = [100.0]
+    monkeypatch.setattr(app.time, "time", lambda: now[0])
+    display = "display-expired"
+    app.register_openai_tts_text(display, "spoken-expired")
+    now[0] += app.OPENAI_TTS_TEXT_TTL + 1
+    assert app.spoken_text_for_openai_display(display) == display
+    assert app.openai_tts_text_by_display_digest == {}
+
+
+def test_tts_registry_evicts_oldest_entry_at_cardinality_bound(monkeypatch):
+    app.openai_tts_text_by_display_digest.clear()
+    monkeypatch.setattr(app, "OPENAI_TTS_MAX_ENTRIES", 2)
+    now = [200.0]
+    monkeypatch.setattr(app.time, "time", lambda: now[0])
+    for index in range(3):
+        display = f"display-{index}"
+        app.register_openai_tts_text(display, f"spoken-{index}")
+        now[0] += 1
+    assert len(app.openai_tts_text_by_display_digest) == 2
+    assert app.spoken_text_for_openai_display("display-0") == "display-0"
+    assert app.spoken_text_for_openai_display("display-1") == "spoken-1"
+    assert app.spoken_text_for_openai_display("display-2") == "spoken-2"
 
 
 class _SpeechRequest:
@@ -98,7 +183,7 @@ def test_openai_speech_does_not_synthesize_progress_or_rich_trace_fragments(monk
 
     monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
     fragments = [
-        "**Working**\n- Reading CBC News…\n\n---\n\n",
+        "**Working**\n- Reading CBC…\n\n---\n\n",
         "<!-- home-ai-display-trace -->\n---\n**Research activity**\n- Opened CBC News",
         "<!-- home-ai-display-trace -->\n---\n**Sources**\n- CBC News",
     ]

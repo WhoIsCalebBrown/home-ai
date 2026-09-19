@@ -250,7 +250,7 @@ def test_rich_footer_escapes_hostile_markdown_labels_and_destinations():
 def test_display_metadata_fallback_removes_only_owned_rich_boundaries():
     module = _load_helpers()
     displayed = (
-        "**Working**\n- Searching recent Canadian headlines…\n\n---\n\n"
+        "**Working**\n- Searching the web…\n\n---\n\n"
         "Here is the answer.\n\n<!-- home-ai-display-trace -->\n"
         "Research activity\n- Opened CBC News\n"
         "Sources\n- [Canada update](https://cbc.ca/news/update)"

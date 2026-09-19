@@ -264,21 +264,37 @@ turn_trace_context = contextvars.ContextVar("turn_trace_context", default={})
 # TTS request does not parse UI/diagnostic markup.
 openai_tts_text_by_display_digest: dict[str, tuple[float, str]] = {}
 OPENAI_TTS_TEXT_TTL = 15 * 60
+OPENAI_TTS_MAX_ENTRIES = 256
 
 
-def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
-    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
-    now = time.time()
-    openai_tts_text_by_display_digest[digest] = (now, spoken_text)
+def _purge_openai_tts_registry(now: float) -> None:
     for key, (created, _) in list(openai_tts_text_by_display_digest.items()):
         if now - created > OPENAI_TTS_TEXT_TTL:
             openai_tts_text_by_display_digest.pop(key, None)
 
 
+def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
+    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
+    now = time.time()
+    _purge_openai_tts_registry(now)
+    if OPENAI_TTS_MAX_ENTRIES <= 0:
+        return
+    if digest not in openai_tts_text_by_display_digest:
+        while len(openai_tts_text_by_display_digest) >= OPENAI_TTS_MAX_ENTRIES:
+            oldest_key = min(
+                openai_tts_text_by_display_digest,
+                key=lambda key: openai_tts_text_by_display_digest[key][0],
+            )
+            openai_tts_text_by_display_digest.pop(oldest_key, None)
+    openai_tts_text_by_display_digest[digest] = (now, spoken_text)
+
+
 def spoken_text_for_openai_display(display_text: str) -> str:
+    now = time.time()
+    _purge_openai_tts_registry(now)
     digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
     entry = openai_tts_text_by_display_digest.get(digest)
-    if entry and time.time() - entry[0] <= OPENAI_TTS_TEXT_TTL:
+    if entry and now - entry[0] <= OPENAI_TTS_TEXT_TTL:
         return entry[1]
     return display_text
 
@@ -6818,18 +6834,91 @@ def remove_openai_display_metadata(text: str) -> str:
     marker was added.
     """
     cleaned = str(text or "")
-    preamble = re.match(
-        r"\A[ \t\r\n]*\*\*Working\*\*[ \t]*\r?\n"
-        r"(?:[ \t]*-[^\r\n]*(?:\r?\n|$))+"
-        r"[ \t]*(?:\r?\n)?---[ \t]*(?:\r?\n|$)",
+
+    def valid_progress_label(label: str) -> bool:
+        fixed = {
+            "Searching the web…",
+            "Reading a source…",
+            "Checking the forecast…",
+            "Checking Plex…",
+            "Checking your home…",
+            "Working…",
+            "Reading CBC…",
+            "Reading Reuters…",
+            "Reading BBC…",
+        }
+        if label in fixed:
+            return True
+        host = label.removeprefix("Reading ").removesuffix("…")
+        if len(host) > 80 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+            host,
+        ):
+            return False
+        return safe_display_url(f"https://{host}/") == f"https://{host}/"
+
+    def strip_progress(value: str) -> str:
+        header = re.match(r"\A[ \t\r\n]*\*\*Working\*\*[ \t]*\r?\n", value)
+        if not header:
+            return value
+        remainder = value[header.end():]
+        consumed = 0
+        labels: list[str] = []
+        separator_end: int | None = None
+        for raw_line in remainder.splitlines(keepends=True):
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
+                consumed += len(raw_line)
+                continue
+            if line.strip() == "---":
+                separator_end = consumed + len(raw_line)
+                break
+            match = re.fullmatch(r"[ \t]*-[ \t]+(.+?)[ \t]*", line)
+            label = match.group(1) if match else ""
+            if len(labels) >= 4 or not match or label in labels or not valid_progress_label(label):
+                return value
+            labels.append(label)
+            consumed += len(raw_line)
+        if not labels:
+            return value
+        if separator_end is not None:
+            return remainder[separator_end:]
+        if remainder[consumed:].strip():
+            return value
+        # A live stream can hand TTS a complete set of server-shaped progress
+        # lines before the separator arrives. It is still display-only.
+        return ""
+
+    cleaned = strip_progress(cleaned)
+
+    marker = re.search(
+        r"(?m)^[ \t]*<!-- home-ai-display-trace -->[ \t]*(?:\r?\n|$)"
+        r"(?=(?:[ \t]*(?:---|\*\*Research activity\*\*|Research activity|\*\*Sources\*\*|Sources)"
+        r"[ \t]*(?:\r?\n|$)|\Z))",
         cleaned,
     )
-    if preamble:
-        cleaned = cleaned[preamble.end():]
-
-    marker = re.search(r"<!-- home-ai-display-trace -->", cleaned)
     if marker:
         cleaned = cleaned[:marker.start()]
+
+    # Some Open WebUI speech requests contain the rich footer after Markdown
+    # comments have been removed. Require the exact separator, heading, and a
+    # bounded activity row so an arbitrary horizontal rule is not destructive.
+    markerless_footer = re.search(
+        r"(?ms)(?:\A|\n\n)[ \t]*---[ \t]*\r?\n"
+        r"[ \t]*\*\*Research activity\*\*[ \t]*\r?\n"
+        r"[ \t]*-[ \t]+[^\r\n]*(?:\r?\n|$)",
+        cleaned,
+    )
+    if markerless_footer:
+        cleaned = cleaned[:markerless_footer.start()]
+
+    # Flattened clients can turn those same boundary newlines into spaces.
+    flattened_footer = re.search(
+        r"(?:\A|\n\n|\s{2,})---\s+\*\*Research activity\*\*\s+-\s+",
+        cleaned,
+    )
+    if flattened_footer:
+        cleaned = cleaned[:flattened_footer.start()]
 
     # Legacy saved messages used an aria-hidden HTML wrapper or a flattened
     # ``Tools used`` footer before the stable trace marker existed.
