@@ -6876,6 +6876,22 @@ async def openai_chat_completions(request: Request):
     )
 
 
+async def _join_openai_cleanup(*tasks: asyncio.Task) -> None:
+    """Finish owned cleanup before propagating additional caller cancellation."""
+    interrupted = False
+    with anyio.CancelScope(shield=True):
+        joined = asyncio.gather(*tasks, return_exceptions=True)
+        while not joined.done():
+            try:
+                # AnyIO shielding alone does not stop direct Task.cancel()
+                # from propagating through an await into an owned task.
+                await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                interrupted = True
+    if interrupted:
+        raise asyncio.CancelledError()
+
+
 class _OpenAIStreamingResponse(StreamingResponse):
     async def __call__(self, scope, receive, send) -> None:
         # ASGI 2.4 send errors only detect disconnects while sending. Keep a
@@ -6895,11 +6911,10 @@ class _OpenAIStreamingResponse(StreamingResponse):
         finally:
             # Own and join both tasks even if the outer request is cancelled.
             # An already-cancelling stream may be awaiting HTTP cleanup.
-            with anyio.CancelScope(shield=True):
-                for task in (streaming, disconnected):
-                    if not task.done() and not task.cancelling():
-                        task.cancel()
-                await asyncio.gather(streaming, disconnected, return_exceptions=True)
+            for task in (streaming, disconnected):
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await _join_openai_cleanup(streaming, disconnected)
         if self.background is not None:
             await self.background()
 
@@ -6984,10 +6999,9 @@ def _openai_stream_response(body: dict, request: Request, session_id: str) -> St
         finally:
             if not responder.done() and not responder.cancelling():
                 responder.cancel()
-            # The outer request can be in a cancelled AnyIO scope. Shield the
-            # join so HTTP cleanup finishes before the request terminates.
-            with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError):
-                await responder
+            # A send error may already be closing this generator when a
+            # disconnect cancels its parent task. Finish HTTP cleanup first.
+            await _join_openai_cleanup(responder)
 
     return _OpenAIStreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "X-Home-AI-Session": session_id,

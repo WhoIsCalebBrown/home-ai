@@ -2786,6 +2786,43 @@ async def test_openai_stream_send_disconnect_awaits_tool_cleanup(app, gateway_to
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+@pytest.mark.parametrize("shutdown", ["disconnect", "cancel", "disconnect_then_cancel"])
+async def test_openai_stream_send_error_then_disconnect_preserves_http_cleanup(
+    app, gateway_tool, spec_version, shutdown,
+):
+    from starlette.requests import ClientDisconnect
+
+    gateway_tool.cleanup["delay"] = 0.05
+    previous_tasks = asyncio.all_tasks()
+    cleanup_complete_at_return = None
+    with contextlib.suppress(asyncio.CancelledError, OSError, ClientDisconnect):
+        async with _GatewayStream(
+            app.app, _openai_stream_body(), spec_version=spec_version, fail_content_send=True,
+        ) as stream:
+            await asyncio.wait_for(gateway_tool.cleanup_started.wait(), 1)
+            assert gateway_tool.entered.is_set()
+            assert not gateway_tool.closed.is_set()
+            assert not gateway_tool.release.is_set()
+            if shutdown == "cancel":
+                stream.task.cancel()
+            else:
+                stream.disconnected.set()
+                if shutdown == "disconnect_then_cancel":
+                    # Let the receive supervisor begin joining the stream,
+                    # then cancel the request while HTTP cleanup still runs.
+                    await asyncio.sleep(0.01)
+                    stream.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, OSError, ClientDisconnect):
+                await asyncio.wait_for(stream.task, 1)
+            cleanup_complete_at_return = gateway_tool.closed.is_set()
+    assert cleanup_complete_at_return is True, "second shutdown signal interrupted send-error HTTP cleanup"
+    assert asyncio.all_tasks() == previous_tasks
+    assert app.progress_sink_context.get() is None
+    assert "[DONE]" not in _stream_frames(stream.messages)
+
+
+@pytest.mark.asyncio
 async def test_openai_stream_coalesces_flood_without_blocking_tool_results(app, gateway_tool, monkeypatch):
     completed = asyncio.Event()
     client_reading = asyncio.Event()
