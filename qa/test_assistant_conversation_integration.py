@@ -232,6 +232,7 @@ class FakeToolsBackend:
         self.call_log: list[tuple[str, dict]] = []
         self.web_search_fixtures: list[list[dict]] = []
         self.web_fetch_failures: set[str] = set()
+        self.web_fetch_final_urls: dict[str, str] = {}
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
@@ -346,9 +347,10 @@ class FakeToolsBackend:
                     "url": url,
                     "error": "fixture fetch failure",
                 }}
+            final_url = self.web_fetch_final_urls.get(url, url)
             return {"tool": name, "status": "ok", "result": {
-                "url": url,
-                "content": f"Fixture article body for {url}.",
+                "url": final_url,
+                "content": f"Fixture article body for {final_url}.",
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
@@ -1814,15 +1816,57 @@ async def test_deep_news_recovery_fetches_results_from_each_search(session):
     profile = session.app.research_profile(user_text)
     search_calls = [arguments for name, arguments in session.backend.call_log if name == "web_search"]
     fetch_calls = [arguments for name, arguments in session.backend.call_log if name == "web_fetch"]
+    assert session.last_stream_payload is not None
+    fetched_results = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+    ]
     fetched_domains = {
-        re.match(r"https?://([^/]+)", str(arguments["url"])).group(1)
-        for arguments in fetch_calls
+        re.match(r"https?://([^/]+)", str(result["url"])).group(1)
+        for result in fetched_results
     }
 
     assert len(search_calls) == 3, "deep recovery must issue all three successful discovery searches"
     assert len(fetch_calls) >= 2, "recovery-search results must be fetched as evidence, not only searched"
     assert len(fetched_domains) >= 2, "deep evidence must include fetched sources from different domains"
     assert len(session.backend.call_log) <= profile["max_calls"]
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_prefers_a_new_final_redirect_domain(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    redirect_url = "https://a.test/redirect"
+    session.backend.web_search_fixtures = [
+        [{"title": "Redirecting source", "url": redirect_url, "snippet": "Initial report."}],
+        [
+            {"title": "First recovery source", "url": "https://d.test/first", "snippet": "First host."},
+            {"title": "Same final domain", "url": "https://b.test/second", "snippet": "Duplicate host."},
+            {"title": "Independent source", "url": "https://c.test/independent", "snippet": "Independent host."},
+        ],
+        [],
+    ]
+    session.backend.web_fetch_final_urls[redirect_url] = "https://b.test/final"
+
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    assert session.last_stream_payload is not None
+    fetched_results = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+    ]
+    final_domains = {
+        re.match(r"https?://([^/]+)", str(result["url"])).group(1)
+        for result in fetched_results
+    }
+    assert final_domains == {"b.test", "c.test", "d.test"}
 
 
 @pytest.mark.asyncio

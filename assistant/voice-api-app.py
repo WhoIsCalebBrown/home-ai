@@ -5882,7 +5882,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     separators=(",", ":"),
                 )})
                 if fetched.get("status") == "ok" and str(fetched_result.get("content") or "").strip():
-                    domain_match = re.match(r"^https?://([^/?#]+)", url, re.I)
+                    fetched_url = str(fetched_result.get("url") or url).strip()
+                    domain_match = re.match(r"^https?://([^/?#]+)", fetched_url, re.I)
                     if domain_match:
                         successful_research_domains.add(domain_match.group(1).casefold().removeprefix("www."))
 
