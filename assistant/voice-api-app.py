@@ -2042,6 +2042,9 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             target = legacy_target.replace("_", " ")
             normalized.pop("device_id", None)
     lowered = user_text.casefold()
+    switch_bulk_request = bool(re.search(
+        r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered,
+    ))
     raw_action = str(normalized.get("action") or "").casefold().strip()
     if raw_action in {"on", "off"}:
         normalized["action"] = f"turn_{raw_action}"
@@ -2053,13 +2056,15 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             normalized["action"] = "turn_off"
         elif re.search(r"\b(?:turn\s+)?on\b", lowered):
             normalized["action"] = "turn_on"
+    if switch_bulk_request and target.casefold() in {"everything", "all devices", "all home devices"}:
+        target = "all switches"
     if not target:
         device_type = str(normalized.get("device_type") or "").casefold()
         if "neon" in lowered or "neon" in device_type:
             target = "Neon Lights"
         elif re.search(r"\b(all|everything)\b.*\b(light|lights|lamp|lamps)\b", lowered):
             target = "all lights"
-        elif re.search(r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered):
+        elif switch_bulk_request:
             target = "all switches"
         elif re.search(r"\b(all|everything)\b", lowered):
             target = "everything"

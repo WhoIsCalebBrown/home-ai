@@ -4378,6 +4378,13 @@ async def home_control(args: dict[str, Any]) -> dict[str, Any]:
     unavailable = [item for item in matches if item.get("state") in {"unavailable", "unknown"}]
     skipped = list(pre_skipped) + (unavailable if len(matches) > 1 else [])
     if unavailable and not skipped:
+        if protected:
+            return {
+                "status": "partial", "outcome": "no_action", "target_entity_ids": [],
+                "unavailable": [_home_entity_view(item) for item in unavailable],
+                "protected": [_home_entity_view(item) for item in protected],
+                "message": "No permitted switches were available; protected switches were excluded.",
+            }
         return {"status": "unavailable", "devices": [_home_entity_view(item) for item in unavailable]}
     matches = [item for item in matches if item not in skipped]
     by_domain: dict[str, list[str]] = {}

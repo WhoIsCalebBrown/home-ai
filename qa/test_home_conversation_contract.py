@@ -257,3 +257,29 @@ def test_bulk_switch_control_only_writes_default_safe_switches(monkeypatch):
         "switch.neon_lights_socket_1_2",
     ]}]
     assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
+
+
+def test_bulk_switch_control_preserves_protected_when_safe_switch_is_unavailable(monkeypatch):
+    monkeypatch.delenv("HOME_BULK_SAFE_ENTITIES", raising=False)
+    module = _load_tools()
+    entities = [
+        _entity("switch.neon_light_socket_1", "unavailable", "Neon Socket 1", "Office"),
+        _entity("switch.router", "on", "Router", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class ForbiddenHttpClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unavailable and protected switches must not receive a service call")
+
+    module._home_assistant_entities = inventory
+    module.HOME_WRITE_ALLOWED_ENTITIES.add("switch.router")
+    monkeypatch.setattr(module.httpx, "AsyncClient", ForbiddenHttpClient)
+    result = asyncio.run(module.home_control({"entity_or_area": "all switches", "action": "turn_off"}))
+
+    assert result["status"] == "partial"
+    assert result["target_entity_ids"] == []
+    assert [item["entity_id"] for item in result["unavailable"]] == ["switch.neon_light_socket_1"]
+    assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
