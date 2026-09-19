@@ -3004,16 +3004,20 @@ async def test_request_variants_execute_bound_media_request_same_turn(session, t
     assert session.client_id not in session.app.pending
 
 
-@pytest.mark.parametrize("discover_first", [False, True])
+@pytest.mark.parametrize("discover_first,request_text", [
+    (False, "Request Dune."),
+    (False, "Add Dune."),
+    (True, "Can you request it?"),
+])
 @pytest.mark.asyncio
-async def test_explicit_media_request_preserves_server_binding(session, discover_first):
+async def test_explicit_media_request_preserves_server_binding(session, discover_first, request_text):
     session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631", year="2021")
     if discover_first:
         await session.turn("Do you know Dune?", ollama_script=[{"message": {"tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
         ]}}])
         assert not session.backend.submitted_writes
-    reply = await session.turn("Can you request it?" if discover_first else "Request Dune 2021.")
+    reply = await session.turn(request_text)
     assert len(session.backend.submitted_writes) == 1
     assert len(session.backend.media_execution_calls) == 1
     call = session.backend.media_execution_calls[0]
@@ -3198,6 +3202,22 @@ async def test_media_information_and_negation_never_authorize_request(session, t
     assert not session.backend.media_execution_calls
     assert not session.backend.submitted_writes
     assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("text", [
+    "Can you find the movie Dune?",
+    "Can you find me the movie Dune?",
+])
+@pytest.mark.asyncio
+async def test_media_find_wording_identifies_without_authorizing_request(session, text):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    reply = await session.turn(text)
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert session.client_id not in session.app.pending_offers
+    assert "dune" in reply.casefold()
+    assert any(name == "media_plan_goal" for name, _ in session.backend.call_log)
 
 
 @pytest.mark.parametrize("request_text,selection", [

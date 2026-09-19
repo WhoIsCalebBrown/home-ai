@@ -2426,10 +2426,10 @@ def media_goal_request(text: str) -> bool:
 def media_acquisition_request_frame(text: str) -> bool:
     """Recognize an acquisition verb used as the user's actual request.
 
-    Plot descriptions routinely contain words such as ``get`` and ``find``;
-    those words only mean acquisition when they begin an imperative or an
-    explicit request frame. This narrower predicate is intentionally used
-    only where a title-shaped subject is otherwise already present.
+    Plot descriptions routinely contain words such as ``get``; acquisition
+    requires an imperative or an explicit request frame. Unqualified ``find``
+    asks for identification/search and does not authorize acquisition. This
+    narrower predicate is used where a title-shaped subject is present.
     """
     # Keep these bounded informational continuations ahead of the
     # descriptive `I want/need ... movie` frame.
@@ -2452,7 +2452,7 @@ def media_acquisition_request_frame(text: str) -> bool:
         or re.match(
             r"\s*(?:(?:can|could|would|will)\s+(?:you|i)\s+|"
             r"i\s+(?:want|need)\s+(?:to\s+)?|i(?:'d| would)\s+like\s+(?:to\s+)?|"
-            r"please\s+)?(?:get|give|grab|add|find|request|want|obtain)\b",
+            r"please\s+)?(?:get|give|grab|add|request|want|obtain)\b",
             text,
             re.I,
         )
