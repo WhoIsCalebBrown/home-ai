@@ -2050,8 +2050,10 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
         r"\b(?:apart\s+from|except|excluding|without|but(?:\s+not)?|not)\s+(?:the\s+)?(?:outlet|outlets|plug|plugs|switch|switches)\b",
         lowered,
     ))
+    # "Light switches" names switches; only an independent light/lamp names lights.
+    light_category_pattern = r"\b(light(?!\s+switch(?:es)?\b)|lights|lamp|lamps)\b"
     requested_light_category = (
-        bool(re.search(r"\b(light|lights|lamp|lamps)\b", lowered))
+        bool(re.search(light_category_pattern, lowered))
         and not bool(re.search(
             r"\b(?:apart\s+from|except|excluding|without|but(?:\s+not)?|not)\s+(?:the\s+)?(?:light|lights|lamp|lamps)\b",
             lowered,
@@ -2081,7 +2083,7 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
         device_type = str(normalized.get("device_type") or "").casefold()
         if "neon" in lowered or "neon" in device_type:
             target = "Neon Lights"
-        elif re.search(r"\b(all|everything)\b.*\b(light|lights|lamp|lamps)\b", lowered):
+        elif re.search(r"\b(all|everything)\b.*" + light_category_pattern, lowered):
             target = "all lights"
         elif switch_bulk_request:
             target = "all switches"

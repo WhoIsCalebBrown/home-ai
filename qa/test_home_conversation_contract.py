@@ -397,11 +397,15 @@ def test_mixed_whole_home_control_writes_lights_and_safe_switches(monkeypatch):
     ]
 
 
-def test_switch_bulk_filters_mixed_exact_ids_before_tools_control(monkeypatch):
+@pytest.mark.parametrize("utterance", [
+    "Turn off all switches.",
+    "Turn off all light switches.",
+])
+def test_switch_bulk_filters_mixed_exact_ids_before_tools_control(monkeypatch, utterance):
     arguments = _normalize_home_tool_arguments()("home_control", {
         "action": "turn_off", "entity_or_area": "everything",
         "entity_ids": ["light.office_light", "switch.neon_light_socket_1"],
-    }, "Turn off all switches.")
+    }, utterance)
     module = _load_tools()
     entities = [
         _entity("light.office_light", "on", "Office Light", "Office"),
@@ -436,9 +440,10 @@ def test_switch_bulk_filters_mixed_exact_ids_before_tools_control(monkeypatch):
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
     result = asyncio.run(module.home_control(arguments))
 
+    assert FakeAsyncClient.payloads == [{"entity_id": ["switch.neon_light_socket_1"]}]
+    assert arguments["entity_or_area"] == "all switches"
     assert arguments["entity_ids"] == ["switch.neon_light_socket_1"]
     assert result["target_entity_ids"] == ["switch.neon_light_socket_1"]
-    assert FakeAsyncClient.payloads == [{"entity_id": ["switch.neon_light_socket_1"]}]
 
 
 def test_switch_bulk_empty_filtered_exact_ids_sends_no_command(monkeypatch):
