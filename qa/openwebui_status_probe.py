@@ -5,6 +5,7 @@ import json
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
 
 
 app = FastAPI()
@@ -21,15 +22,6 @@ STATUS_FRAMES = [
 
 def sse_chunk(frame):
     return f"data: {json.dumps(frame, ensure_ascii=False, separators=(',', ':'))}\n\n"
-
-
-def probe_frames():
-    return [
-        {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
-        *STATUS_FRAMES,
-        {"choices": [{"index": 0, "delta": {"content": "Final probe answer."}, "finish_reason": None}]},
-        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-    ]
 
 
 async def events():
@@ -58,29 +50,32 @@ async def models():
     return probe_models()
 
 
-def decoded_probe_frames():
-    return iter(probe_frames())
+def decoded_probe_sse():
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "home-ai-probe", "stream": True,
+            "messages": [{"role": "user", "content": "Run status probe"}],
+        })
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    return [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
 
 
-def content_text(frames):
-    return "".join(frame["choices"][0]["delta"].get("content", "") for frame in frames)
-
-
-async def emitted_events():
-    return [event async for event in events()]
-
-
-def test_probe_never_places_status_in_content():
-    frames = list(decoded_probe_frames())
+def test_probe_endpoint_orders_non_content_status_before_sole_final_content():
+    sse_events = decoded_probe_sse()
+    frames = [json.loads(event) for event in sse_events if event != "[DONE]"]
+    assert [frame["choices"][0]["delta"] for frame in frames] == [
+        {"role": "assistant"},
+        STATUS_FRAMES[0]["choices"][0]["delta"],
+        STATUS_FRAMES[1]["choices"][0]["delta"],
+        {"content": "Final probe answer."},
+        {},
+    ]
     status = [f for f in frames if "home_ai_status" in f["choices"][0]["delta"]]
     assert [f["choices"][0]["delta"].get("content") for f in status] == [None, None]
-    assert content_text(frames) == "Final probe answer."
-
-
-def test_probe_stream_ends_once_after_stop():
-    stream = asyncio.run(emitted_events())
-    assert stream[-2].startswith("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}")
-    assert stream.count("data: [DONE]\n\n") == 1
+    assert [f["choices"][0]["delta"].get("content") for f in frames if "content" in f["choices"][0]["delta"]] == ["Final probe answer."]
+    assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+    assert sse_events.count("[DONE]") == 1
 
 
 def test_probe_advertises_the_model_open_webui_can_select():
