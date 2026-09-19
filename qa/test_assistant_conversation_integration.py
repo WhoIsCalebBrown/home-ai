@@ -56,12 +56,15 @@ contextual_entity_resolution, resolved_followup_text, the confirmation
 real, unmodified production code.
 """
 
+import asyncio
+import contextlib
 import importlib.util
 import json
 import re
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -2597,6 +2600,354 @@ async def test_query_drift_asks_for_clarification_instead_of_silent_wrong_match(
 class _FakeGatewayRequest:
     def __init__(self, headers=None):
         self.headers = headers or {}
+
+
+class _GatewayStream:
+    """Drive real ASGI sends; HTTPX's ASGITransport buffers streaming bodies."""
+
+    def __init__(self, app, body, headers=(), *, spec_version="2.0", fail_content_send=False, hold_content_send=None):
+        self.app = app
+        self.body = body
+        self.headers = headers
+        self.spec_version = spec_version
+        self.fail_content_send = fail_content_send
+        self.hold_content_send = hold_content_send
+        self.output = asyncio.Queue()
+        self.disconnected = asyncio.Event()
+        self.messages = []
+
+    async def __aenter__(self):
+        self.request_sent = False
+
+        async def receive():
+            if not self.request_sent:
+                self.request_sent = True
+                return {"type": "http.request", "body": json.dumps(self.body).encode(), "more_body": False}
+            await self.disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            self.messages.append(message)
+            if self.fail_content_send and b'"content":' in message.get("body", b""):
+                raise OSError("connection closed")
+            if self.hold_content_send is not None and b'"content":' in message.get("body", b""):
+                await self.hold_content_send.wait()
+            await self.output.put(message)
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": self.spec_version},
+                 "http_version": "1.1", "method": "POST", "scheme": "http",
+                 "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+                 "query_string": b"", "headers": [(b"authorization", b"Bearer qa-only"), *self.headers],
+                 "server": ("test", 80), "client": ("test", 1)}
+        self.task = asyncio.create_task(self.app(scope, receive, send))
+        return self
+
+    async def next_message(self):
+        try:
+            return await asyncio.wait_for(self.output.get(), 1)
+        except TimeoutError:
+            pytest.fail("OpenAI stream did not send a frame while the tool was blocked")
+
+    async def __aexit__(self, *args):
+        self.disconnected.set()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(self.task, 1)
+        finally:
+            if not self.task.done():
+                self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+
+
+def _openai_stream_body(**extra):
+    return {"model": "home-ai", "stream": True,
+            "messages": [{"role": "user", "content": "Check a source."}], **extra}
+
+
+def _stream_frames(messages):
+    wire = b"".join(m.get("body", b"") for m in messages).decode()
+    return [json.loads(line[6:]) if line != "data: [DONE]" else "[DONE]"
+            for line in wire.splitlines() if line.startswith("data: ")]
+
+
+def _stream_content(messages):
+    return "".join(frame["choices"][0]["delta"].get("content", "")
+                   for frame in _stream_frames(messages) if isinstance(frame, dict))
+
+
+@pytest.fixture
+def gateway_tool(app, monkeypatch):
+    import httpx
+
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+    payload = {"tool": "web_fetch", "status": "ok", "transport_ok": True, "operation_ok": True,
+               "result": {"title": "Private result title", "content": "private result body"}}
+    response_status = {"code": 200}
+
+    class ToolClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await asyncio.sleep(0.01 if args[0] is asyncio.CancelledError else 0)
+            closed.set()
+
+        async def post(self, url, json, headers):
+            assert url == f"{app.TOOLS_URL}/invoke"
+            calls.append(json)
+            entered.set()
+            await release.wait()
+            return httpx.Response(response_status["code"], json=payload, request=httpx.Request("POST", url))
+
+    async def respond(sink, client_id, request_id, user_text):
+        result = await app.invoke_tool("web_fetch", {"url": "https://www.cbc.ca/private?token=secret"}, client_id, request_id)
+        assert result == payload
+        await sink.send_json({"type": "text", "text": "A verified answer.", "request_id": request_id})
+
+    monkeypatch.setattr(app, "OPENAI_COMPAT_API_KEY", "qa-only")
+    monkeypatch.setattr(app, "OPENAI_COMPAT_API_KEY_FILE", "")
+    monkeypatch.setattr(app, "httpx", SimpleNamespace(AsyncClient=ToolClient))
+    monkeypatch.setattr(app, "respond", respond)
+    monkeypatch.setattr(app, "discovery_audit", lambda event: None)
+    return SimpleNamespace(entered=entered, release=release, closed=closed, payload=payload, calls=calls, response_status=response_status)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_sends_role_and_safe_progress_before_tool_completes(app, gateway_tool):
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        start = await stream.next_message()
+        assert start["type"] == "http.response.start"
+        assert start["status"] == 200
+        headers = dict(start["headers"])
+        assert headers[b"x-home-ai-session"].startswith(b"legacy:")
+        assert headers[b"x-home-ai-request"].startswith(b"req-")
+        role = await stream.next_message()
+        assert _stream_frames([role])[0]["choices"][0]["delta"] == {"role": "assistant"}
+        while "Reading CBC…" not in _stream_content(stream.messages):
+            await stream.next_message()
+        assert not gateway_tool.release.is_set()
+        assert not gateway_tool.closed.is_set()
+        await asyncio.wait_for(gateway_tool.entered.wait(), 1)
+        assert gateway_tool.calls[0]["client_id"] == headers[b"x-home-ai-session"].decode()
+        assert gateway_tool.calls[0]["turn_id"] == headers[b"x-home-ai-turn"].decode()
+        assert gateway_tool.calls[0]["trace_id"] == headers[b"x-home-ai-trace"].decode()
+        gateway_tool.release.set()
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n\n---\n\nA verified answer."
+    frames = _stream_frames(stream.messages)
+    assert sum(f == "[DONE]" for f in frames) == 1
+    assert sum(isinstance(f, dict) and f["choices"][0]["finish_reason"] == "stop" for f in frames) == 1
+    assert frames[-1] == "[DONE]"
+    assert app.spoken_text_for_openai_display(_stream_content(stream.messages)) == "A verified answer."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_openai_stream_disconnect_or_cancel_awaits_tool_cleanup(app, gateway_tool, cancel):
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await stream.next_message()
+        await asyncio.wait_for(gateway_tool.entered.wait(), 1)
+        if cancel:
+            stream.task.cancel()
+        else:
+            stream.disconnected.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(stream.task, 1)
+        assert gateway_tool.closed.is_set()
+        assert not gateway_tool.release.is_set()
+    assert app.tts_suppressed.get() is False
+    assert app.progress_sink_context.get() is None
+    assert asyncio.all_tasks() == previous_tasks
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_send_disconnect_awaits_tool_cleanup(app, gateway_tool):
+    from starlette.requests import ClientDisconnect
+
+    previous_tasks = asyncio.all_tasks()
+    with pytest.raises(ClientDisconnect):
+        async with _GatewayStream(app.app, _openai_stream_body(), spec_version="2.4", fail_content_send=True) as stream:
+            await asyncio.wait_for(stream.task, 1)
+    assert gateway_tool.closed.is_set()
+    assert not gateway_tool.release.is_set()
+    assert asyncio.all_tasks() == previous_tasks
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_coalesces_flood_without_blocking_tool_results(app, gateway_tool, monkeypatch):
+    completed = asyncio.Event()
+    client_reading = asyncio.Event()
+
+    async def respond(sink, client_id, request_id, user_text):
+        for tool in ["web_search"] * 100 + ["weather_forecast", "plex_search", "home_get_state", "future_tool"]:
+            result = await app.invoke_tool(tool, {"query": "private query"}, client_id, request_id)
+            assert result == gateway_tool.payload
+        completed.set()
+        await sink.send_json({"type": "text", "text": "Done."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    gateway_tool.release.set()
+    async with _GatewayStream(app.app, _openai_stream_body(), hold_content_send=client_reading) as stream:
+        await asyncio.wait_for(completed.wait(), 1)
+        client_reading.set()
+        await asyncio.wait_for(stream.task, 1)
+    content = _stream_content(stream.messages)
+    assert content == "**Working**\n- Searching the web…\n- Checking the forecast…\n- Checking Plex…\n- Checking your home…\n\n---\n\nDone."
+    assert len(_stream_frames(stream.messages)) <= 9
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_failure_is_generic_and_terminates(app, gateway_tool, monkeypatch):
+    async def respond(*args):
+        raise RuntimeError("private stack token=secret")
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == "Home-AI could not complete this request."
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_timeout_closes_tool_and_finishes(app, gateway_tool, monkeypatch):
+    monkeypatch.setattr(app, "OPENAI_STREAM_TIMEOUT_SECONDS", 0.05)
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert gateway_tool.closed.is_set()
+    assert _stream_content(stream.messages).endswith("\n---\n\nHome-AI could not complete this request.")
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["projection", "sink"])
+async def test_tool_result_survives_progress_failure(app, gateway_tool, monkeypatch, stage):
+    import progress_events
+
+    events = []
+
+    async def sink(event):
+        events.append(event)
+        raise RuntimeError("private sink failure")
+
+    if stage == "projection":
+        def bad_projection(*args):
+            raise RuntimeError("private projection failure")
+        monkeypatch.setattr(progress_events, "safe_progress_event", bad_projection)
+    token = progress_events.progress_sink_context.set(sink)
+    gateway_tool.release.set()
+    try:
+        result = await app.invoke_tool("web_fetch", {"url": "https://cbc.ca/private?token=secret"}, "client", "request")
+    finally:
+        progress_events.progress_sink_context.reset(token)
+    assert result == gateway_tool.payload
+    if stage == "sink":
+        assert events == [{"phase": "tool_started", "label": "Reading CBC…"}, {"phase": "tool_finished", "label": "Complete"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["operation", "missing", "transport"])
+async def test_tool_failures_emit_generic_progress_without_changing_outcome(app, gateway_tool, failure):
+    events = []
+
+    async def sink(event):
+        events.append(event)
+
+    if failure == "operation":
+        gateway_tool.payload["operation_ok"] = False
+        gateway_tool.payload["result"]["error"] = "private backend failure"
+    else:
+        gateway_tool.response_status["code"] = 404 if failure == "missing" else 503
+    gateway_tool.release.set()
+    token = app.progress_sink_context.set(sink)
+    try:
+        result = await app.invoke_tool("web_fetch", {"url": "http://server-tools/private?token=secret"}, "client", "request")
+    finally:
+        app.progress_sink_context.reset(token)
+    assert result["operation_ok"] is False
+    assert result["transport_ok"] is (failure != "transport")
+    if failure == "operation":
+        assert result == gateway_tool.payload
+    assert events == [{"phase": "tool_started", "label": "Reading a source…"}, {"phase": "tool_failed", "label": "Tool unavailable"}]
+
+
+@pytest.mark.asyncio
+async def test_openai_nonstream_keeps_json_schema_without_progress(app, gateway_tool):
+    gateway_tool.release.set()
+    async with _GatewayStream(app.app, _openai_stream_body(stream=False)) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    start = stream.messages[0]
+    assert dict(start["headers"])[b"x-home-ai-session"].startswith(b"legacy:")
+    body = json.loads(b"".join(m.get("body", b"") for m in stream.messages))
+    assert body["object"] == "chat.completion"
+    assert body["choices"] == [{"index": 0, "message": {"role": "assistant", "content": "A verified answer."}, "finish_reason": "stop"}]
+    assert body["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_openai_gateway_keeps_rich_footer_and_plain_speech(app, gateway_tool, monkeypatch, streaming):
+    gateway_tool.release.set()
+
+    async def respond(sink, client_id, request_id, user_text):
+        await app.invoke_tool("web_fetch", {"url": "https://cbc.ca/private?token=secret"}, client_id, request_id)
+        await app.emit_trace(sink, request_id, [{"tool": "web_fetch", "status": "ok", "result": {
+            "url": "https://cbc.ca/news/update?token=secret", "title": "Canada update",
+        }}])
+        await sink.send_json({"type": "text", "text": "A verified answer."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body(stream=streaming)) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    if streaming:
+        display = _stream_content(stream.messages)
+        assert display.startswith("**Working**\n- Reading CBC…\n\n---\n\nA verified answer.")
+    else:
+        body = json.loads(b"".join(m.get("body", b"") for m in stream.messages))
+        display = body["choices"][0]["message"]["content"]
+        assert display.startswith("A verified answer.")
+        assert "**Working**" not in display
+    assert "<!-- home-ai-display-trace -->" in display
+    assert "[Canada update](https://cbc.ca/news/update)" in display
+    assert "token=secret" not in display
+    assert display.count("A verified answer.") == 1
+    assert app.spoken_text_for_openai_display(display) == "A verified answer."
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_housekeeping_has_no_progress_or_tool_calls(app, gateway_tool, monkeypatch):
+    async def generate_final(messages):
+        return '{"title": "Source Check"}'
+
+    monkeypatch.setattr(app, "generate_final", generate_final)
+    async with _GatewayStream(app.app, {**OPENWEBUI_TITLE_TASK, "stream": True}) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == '{"title": "Source Check"}'
+    assert gateway_tool.calls == []
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_progress_and_identity_are_request_local(app, gateway_tool, monkeypatch):
+    gateway_tool.release.set()
+
+    async def respond(sink, client_id, request_id, user_text):
+        tool = "web_search" if client_id == "legacy:search" else "weather_forecast"
+        await app.invoke_tool(tool, {"query": "private household query"}, client_id, request_id)
+        await sink.send_json({"type": "text", "text": "Done."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body(), [(b"x-home-ai-session-id", b"search")]) as first:
+        async with _GatewayStream(app.app, _openai_stream_body(), [(b"x-home-ai-session-id", b"forecast")]) as second:
+            await asyncio.wait_for(asyncio.gather(first.task, second.task), 1)
+    assert _stream_content(first.messages) == "**Working**\n- Searching the web…\n\n---\n\nDone."
+    assert _stream_content(second.messages) == "**Working**\n- Checking the forecast…\n\n---\n\nDone."
+    assert app.progress_sink_context.get() is None
 
 
 OPENWEBUI_TITLE_TASK = {"messages": [{"role": "user", "content": (

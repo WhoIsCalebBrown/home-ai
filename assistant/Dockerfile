@@ -12,6 +12,7 @@ COPY assistant/semantic_routing.py ./semantic_routing.py
 COPY assistant/subject_model.py ./subject_model.py
 COPY assistant/tts_audio.py ./tts_audio.py
 COPY assistant/trace_projection.py ./trace_projection.py
+COPY assistant/progress_events.py ./progress_events.py
 COPY assistant/voice-api-index.html ./voice-api-index.html
 COPY assistant/tts-comparison.html ./tts-comparison.html
 COPY assistant/approved-pronunciation-lexicon.yaml ./pronunciation/approved-pronunciation-lexicon.yaml

@@ -15,6 +15,7 @@ def _load_helpers():
     names = {
         "OPENAI_COMPAT_MODEL",
         "_openai_session_id",
+        "_prepare_openai_turn",
         "_latest_user_message",
         "_is_openwebui_housekeeping_request",
         "_safe_markdown_text",
@@ -118,6 +119,19 @@ def test_legacy_response_token_can_be_echoed_without_double_prefix():
     module = _load_helpers()
     request = Request({"x-home-ai-session-id": "legacy:client-generated-session-123"})
     assert module._openai_session_id(request, {"messages": []}) == "legacy:client-generated-session-123"
+
+
+def test_prepared_stream_headers_keep_the_same_legacy_session_and_correlation():
+    module = _load_helpers()
+    request = Request()
+    body = {"messages": [{"role": "user", "content": "Check the weather."}]}
+    first = module._prepare_openai_turn(body, request)
+    assert module._prepare_openai_turn(body, request) == first
+    client_id, correlation = first
+    assert correlation["home_ai_session_id"] == client_id
+    assert correlation["request_id"].startswith("req-")
+    assert correlation["turn_id"].startswith("turn-")
+    assert correlation["trace_id"].startswith("trace-")
 
 
 # --- OpenWebUI internal housekeeping detection (real production bug: these ---

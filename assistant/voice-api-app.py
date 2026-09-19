@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextvars
+import contextlib
 import hashlib
 import hmac
 import io
@@ -15,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
+import anyio
 import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
@@ -27,6 +29,7 @@ from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
 from tts_audio import prepend_silence
 from trace_projection import MAX_SOURCES_PER_SEARCH, MAX_TRACE_ENTRIES, clean_text, project_trace, safe_display_url
+from progress_events import ProgressPreamble, emit_tool_progress, progress_sink_context
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -60,6 +63,7 @@ DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/disco
 OPENAI_COMPAT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "")
 OPENAI_COMPAT_API_KEY_FILE = os.getenv("OPENAI_COMPAT_API_KEY_FILE", "")
 OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "home-ai")
+OPENAI_STREAM_TIMEOUT_SECONDS = 180
 
 
 def _openai_compat_key() -> str:
@@ -2147,12 +2151,14 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
         trace_id = str(correlation.get("trace_id") or request_id)
         turn_id = str(correlation.get("turn_id") or request_id)
         async with httpx.AsyncClient(timeout=15) as http:
+            await emit_tool_progress(name, arguments, "started")
             response = await http.post(f"{TOOLS_URL}/invoke", json={
                 "name": name, "arguments": arguments, "client_id": client_id,
                 "session_id": client_id, "confirmed": confirmed, "action_id": action_id,
                 "trace_id": trace_id, "turn_id": turn_id, "tool_call_id": tool_call_id},
                 headers=_tools_service_headers())
             if response.status_code == 404:
+                await emit_tool_progress(name, arguments, "failed")
                 return {"tool": name, "status": "error", "transport_ok": True, "operation_ok": False,
                         "tool_call_id": tool_call_id, "result": {"error": "That tool is not enabled.", "evidence_available": False}}
             response.raise_for_status()
@@ -2169,8 +2175,11 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
                              "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                              "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [],
                              "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
+            phase = "finished" if payload.get("status") == "ok" and payload.get("operation_ok", True) is not False else "failed"
+            await emit_tool_progress(name, arguments, phase, result)
             return payload
     except Exception as exc:
+        await emit_tool_progress(name, arguments, "failed")
         return {"tool": name, "status": "error", "transport_ok": False, "operation_ok": False,
                 "tool_call_id": locals().get("tool_call_id"),
                 "result": {"error": "Tool service unavailable", "detail": type(exc).__name__, "evidence_available": False,
@@ -6679,35 +6688,41 @@ def _is_openwebui_housekeeping_request(body: dict) -> bool:
     return any(pattern.search(text) for pattern in _OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES)
 
 
-async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
-    user_text = _latest_user_message(body)
-    if not user_text:
+def _prepare_openai_turn(body: dict, request: Request) -> tuple[str, dict]:
+    """Resolve identity before streaming headers, reusing it inside the turn."""
+    if not _latest_user_message(body):
         raise HTTPException(400, detail="At least one user message is required")
+    prepared = getattr(request, "_home_ai_prepared_turn", None)
+    if prepared is not None:
+        return prepared
     client_id = _openai_session_id(request, body)
+    correlation = {} if _is_openwebui_housekeeping_request(body) else {
+        "frontend": "openwebui" if client_id.startswith("openwebui:") else "openai-compatible",
+        "frontend_user_id": str(request.headers.get("x-openwebui-user-id") or "")[:80],
+        "frontend_chat_id": str(request.headers.get("x-openwebui-chat-id") or "")[:120],
+        "home_ai_session_id": client_id,
+        "request_id": "req-" + uuid.uuid4().hex,
+        "turn_id": "turn-" + uuid.uuid4().hex,
+        "trace_id": "trace-" + uuid.uuid4().hex,
+    }
+    # Correlation events contain opaque IDs only: never prompts, bearer
+    # tokens, authorization headers, or tool payloads.
+    setattr(request, "_home_ai_correlation", correlation)
+    setattr(request, "_home_ai_prepared_turn", (client_id, correlation))
+    return client_id, correlation
+
+
+async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
+    client_id, correlation = _prepare_openai_turn(body, request)
+    user_text = _latest_user_message(body)
     if _is_openwebui_housekeeping_request(body):
-        # Answer directly from the given messages with a single tool-free
-        # completion -- OpenWebUI still gets a valid title/tags/follow-ups
-        # response, but no real backend service is ever touched.
+        # Frontend housekeeping gets one tool-free completion.
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
         answer = await generate_final(messages)
         if not answer:
             raise HTTPException(502, detail="Home-AI produced no assistant response")
         return answer, client_id, []
-    request_id = "req-" + uuid.uuid4().hex
-    turn_id = "turn-" + uuid.uuid4().hex
-    trace_id = "trace-" + uuid.uuid4().hex
-    correlation = {
-        "frontend": "openwebui" if client_id.startswith("openwebui:") else "openai-compatible",
-        "frontend_user_id": str(request.headers.get("x-openwebui-user-id") or "")[:80],
-        "frontend_chat_id": str(request.headers.get("x-openwebui-chat-id") or "")[:120],
-        "home_ai_session_id": client_id,
-        "request_id": request_id,
-        "turn_id": turn_id,
-        "trace_id": trace_id,
-    }
-    # Correlation events contain opaque IDs only: never prompts, bearer
-    # tokens, authorization headers, or tool payloads.
-    setattr(request, "_home_ai_correlation", correlation)
+    request_id = correlation["request_id"]
     discovery_audit({"event": "openai_turn_start", **correlation})
     sink = _OpenAIResponseSocket()
     token = tts_suppressed.set(True)
@@ -6830,6 +6845,9 @@ async def openai_chat_completions(request: Request):
         model = str(body.get("model") or OPENAI_COMPAT_MODEL)
         if model != OPENAI_COMPAT_MODEL:
             raise HTTPException(404, detail=f"Unknown model: {model}")
+        if body.get("stream"):
+            session_id, _ = _prepare_openai_turn(body, request)
+            return _openai_stream_response(body, request, session_id)
         answer, session_id, trace = await _openai_chat_turn(body, request)
     except HTTPException as exc:
         return _openai_error(str(exc.detail), "invalid_request", exc.status_code)
@@ -6849,22 +6867,106 @@ async def openai_chat_completions(request: Request):
         "X-Home-AI-Turn": str(correlation.get("turn_id") or ""),
         "X-Home-AI-Trace": str(correlation.get("trace_id") or ""),
     }
-    if body.get("stream"):
-        async def events():
-            chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
-                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": answer}, "finish_reason": None}]}
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            final = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
-                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            yield f"data: {json.dumps(final)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", **response_headers})
     return JSONResponse(
         content={"id": completion_id, "object": "chat.completion", "created": created, "model": OPENAI_COMPAT_MODEL,
                  "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
                  "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
         headers=response_headers,
     )
+
+
+class _OpenAIStreamingResponse(StreamingResponse):
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            # ASGI 2.4 send errors can leave the iterator suspended at yield.
+            # Close our async generator explicitly so its responder is joined.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
+def _openai_stream_response(body: dict, request: Request, session_id: str) -> StreamingResponse:
+    """Send progress while a supervised turn runs, with bounded pending state."""
+    queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=32)
+    preamble = ProgressPreamble()
+    completion_id = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    correlation = getattr(request, "_home_ai_correlation", {})
+
+    async def progress_sink(event: dict) -> None:
+        content = preamble.add(event)
+        if content:
+            # Progress is optional and must never backpressure a tool. Only
+            # four bounded fragments can enter this queue in one request.
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(("progress", content))
+
+    async def run_turn() -> None:
+        token = progress_sink_context.set(progress_sink)
+        try:
+            answer, _, trace = await asyncio.wait_for(
+                _openai_chat_turn(body, request), timeout=OPENAI_STREAM_TIMEOUT_SECONDS,
+            )
+            display = answer + openai_tool_trace_footer(trace)
+            # Register the plain final content too, for clients splitting SSE
+            # content chunks into separate speech requests.
+            register_openai_tts_text(display, answer)
+            queue.put_nowait(("answer", display))
+        except asyncio.CancelledError:
+            # A responder can itself be cancelled. Wake a still-connected
+            # consumer; disconnect cleanup will simply discard this event.
+            queue.put_nowait(("answer", "Home-AI could not complete this request."))
+            raise
+        except Exception as exc:
+            print(f"OPENAI_COMPAT_CHAT_FAILED error={type(exc).__name__}", flush=True)
+            queue.put_nowait(("answer", "Home-AI could not complete this request."))
+        finally:
+            progress_sink_context.reset(token)
+
+    def frame(delta: dict, finish_reason: str | None = None) -> str:
+        chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                 "model": OPENAI_COMPAT_MODEL,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    async def events():
+        # Do not start model/tool work until the role has been sent.
+        yield frame({"role": "assistant"})
+        responder = asyncio.create_task(run_turn())
+        progress_parts: list[str] = []
+        try:
+            while True:
+                kind, content = await queue.get()
+                if kind == "progress":
+                    progress_parts.append(content)
+                    yield frame({"content": content})
+                    continue
+                if progress_parts:
+                    separator = "\n---\n\n"
+                    register_openai_tts_text(
+                        "".join(progress_parts) + separator + content,
+                        spoken_text_for_openai_display(content),
+                    )
+                    yield frame({"content": separator})
+                yield frame({"content": content})
+                yield frame({}, "stop")
+                yield "data: [DONE]\n\n"
+                break
+        finally:
+            if not responder.done():
+                responder.cancel()
+            # Starlette disconnects cancel an AnyIO scope. Shield the await
+            # so HTTP client cleanup finishes before the request terminates.
+            with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError):
+                await responder
+
+    return _OpenAIStreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Home-AI-Session": session_id,
+        "X-Home-AI-Request": str(correlation.get("request_id") or ""),
+        "X-Home-AI-Turn": str(correlation.get("turn_id") or ""),
+        "X-Home-AI-Trace": str(correlation.get("trace_id") or ""),
+    })
 
 
 @app.post("/v1/audio/transcriptions")
