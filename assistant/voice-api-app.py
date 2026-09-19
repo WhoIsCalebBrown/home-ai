@@ -1035,9 +1035,30 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
             f"{torbox.get('errored', 0)} errored, and {torbox.get('pulling', 0)} pulling.")
 
 
-def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None) -> str:
+def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None, research_mode: str = "quick") -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
+    if research_mode == "deep":
+        office_title = r"(?:office[- ]holder|prime minister|president|vice president|governor general|governor|mayor|minister|chancellor|speaker|chief justice|secretary)"
+        person_name = r"(?P<name>[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){1,3})"
+        office_holder_patterns = (
+            rf"\b{person_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{office_title}\b",
+            rf"\b(?:the\s+)?(?:current\s+)?{office_title}\s+(?:is|remains)\s+{person_name}\b",
+        )
+        fetched_evidence = "\n".join(
+            str(item.get("result", {}).get("content") or "")
+            for item in results
+            if item.get("tool") == "web_fetch"
+            and item.get("status") == "ok"
+            and isinstance(item.get("result"), dict)
+        ).casefold()
+        claimed_holders = [
+            match.group("name")
+            for pattern in office_holder_patterns
+            for match in re.finditer(pattern, answer)
+        ]
+        if any(name.casefold() not in fetched_evidence for name in claimed_holders):
+            return "I can't safely verify that current office-holder from the fetched evidence."
     web_items = [item for item in results if item.get("tool") == "web_search"]
     if web_items and re.search(r"\b(?:don't|do not|cannot|can't)\s+(?:have|access)|\bno access to (?:live )?(?:news|the web)|\bcan't tell you what's happening", answer, re.I):
         successful = [item for item in web_items if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
@@ -3957,6 +3978,8 @@ def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) ->
     evidence = research_evidence_shape(live_results)
     if evidence["successful_searches"] < 3:
         return False
+    if evidence["successful_fetches"] == 0:
+        return False
     if not candidate_urls_exist:
         return True
     return (
@@ -4662,7 +4685,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
     async def emit_sentence(value: str) -> None:
         if value.strip():
             nonlocal full
-            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain) if guard_user_text else value.strip()
+            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain, research_mode) if guard_user_text else value.strip()
             safe = round_weather_temperatures(safe, guard_user_text, guard_domain) if guard_user_text else repair_decimal_spacing(safe)
             separator = "" if not full or full.endswith((" ", "\n")) else " "
             full += separator + safe
@@ -6083,6 +6106,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # question) must never ground the answer, even though it was
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
+            if profile["mode"] == "deep":
+                # Search snippets are discovery hints only. A deep-news final
+                # answer may use article text but must not treat a snippet as
+                # current evidence for office-holders or institutional facts.
+                grounding_results = [item for item in grounding_results if item.get("tool") != "web_search"]
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in grounding_results) else ""
             if any(x.get("tool") == "weather_forecast" for x in grounding_results):
                 instruction = (instruction + "\n" if instruction else "") + WEATHER_SYNTHESIS_RULE

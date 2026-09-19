@@ -1998,8 +1998,33 @@ async def test_deep_news_office_holder_prompt_prefers_fetched_evidence_to_a_snip
         for message in session.last_stream_payload["messages"]
         if message.get("role") == "system"
     )
-    assert "Snippet Holder" in prompt_text and "Fetched Holder" in prompt_text
+    assert "Snippet Holder" not in prompt_text and "Fetched Holder" in prompt_text
     assert "Current office-holder claims require fetched evidence" in system_text
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_a_current_office_holder_repeated_only_from_a_snippet(session):
+    """Repeating a stale snippet holder must fail after deep fetched-only grounding."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Snippet Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+    assert session.last_stream_payload is not None
+    assert "Snippet Holder" not in json.dumps(session.last_stream_payload["messages"])
 
 
 @pytest.mark.asyncio
@@ -2026,6 +2051,30 @@ async def test_deep_news_incomplete_fetched_evidence_returns_limitation_without_
     assert reply == "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
     assert session.last_stream_payload is None
     assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_deep_news_empty_or_invalid_search_results_return_limitation_without_synthesis(session):
+    """Three successful searches with no fetchable article must not permit a roundup."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Malformed result", "url": "not-a-url", "snippet": "No article URL."}],
+        [],
+        [{"title": "Unsupported scheme", "url": "ftp://example.test/news", "snippet": "No HTTP article URL."}],
+    ]
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="This canned model roundup must not be used when no article was fetched.",
+    )
+
+    assert reply == "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+    assert session.last_stream_payload is None
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
+    assert not any(name == "web_fetch" for name, _ in session.backend.call_log)
 
 
 # --- Real production transcript replay (UnresolvedSubject / relevance gate) -
