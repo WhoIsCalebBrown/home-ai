@@ -32,6 +32,17 @@ backends, or Home-AI Tools directly.
 Assistant produces a completed response and emits one final content delta; it
 does not claim token-level streaming.
 
+## Transient-status compatibility gate (BLOCKED)
+
+The pinned Open WebUI 0.11.3 image was probed on 2026-09-19 using a disposable
+provider and a normal chat-completion chunk with a namespaced
+`delta.home_ai_status` object and no `delta.content`. The UI did not render
+`Reading Example News…` before the final answer. It persisted only `Final probe
+answer.` after reload, so this event shape is **not** a proven transient status
+contract. Do not ship live progress based on it. See
+`docs/qa/openwebui-status-probe.md` for the pinned digest, frames, and required
+approval alternatives.
+
 ## Session mapping
 
 The facade maps `metadata.chat_id` (or `chat_id`/the Open WebUI header when
