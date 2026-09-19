@@ -22,8 +22,8 @@ def test_rich_sources_and_persistent_progress_are_never_spoken():
     displayed = (
         "**Working**\n- Searching the web…\n"
         "- Reading CBC…\n\n---\n\n"
-        "Here is the Canadian roundup.\n\n<!-- home-ai-display-trace -->\n"
-        "Research activity\n- Opened CBC News\n"
+        "Here is the Canadian roundup.\n\n<!-- home-ai-display-trace -->\n---\n"
+        "**Research activity**\n- Opened source — complete\n"
         "Sources\n- [Canada update](https://cbc.ca/news/update)"
     )
     assert app.remove_openai_display_metadata(displayed) == "Here is the Canadian roundup."
@@ -38,7 +38,7 @@ def test_progress_trace_and_source_only_fragments_are_silent():
     progress_only = "**Working**\n- Searching the web…\n\n---\n\n"
     trace_only = (
         "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
-        "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
+        "- Opened source — complete\nSources\n- [Canada update](https://cbc.ca/news/update)"
     )
     source_only = (
         "<!-- home-ai-display-trace -->\n---\n**Sources**\n"
@@ -81,9 +81,14 @@ def test_inline_trace_marker_is_ordinary_text_and_markerless_footer_is_silent(mo
     assert ordinary_response.status_code == 200
     assert synthesized[-1] == ordinary
 
+    ordinary_sources = "My notes\n\n---\n**Sources**\n- Discuss source status\nContinue."
+    ordinary_sources_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary_sources})))
+    assert ordinary_sources_response.status_code == 200
+    assert synthesized[-1] == ordinary_sources
+
     flattened_display = (
         "Here is the answer.\n\n---\n**Research activity**\n"
-        "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
+        "- Opened source — complete\nSources\n- [Canada update](https://cbc.ca/news/update)"
     )
     flattened_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": flattened_display})))
     assert flattened_response.status_code == 200
@@ -91,6 +96,55 @@ def test_inline_trace_marker_is_ordinary_text_and_markerless_footer_is_silent(mo
 
     footer_only = asyncio.run(app.openai_speech(_SpeechRequest({"input": flattened_display.split("\n\n", 1)[1]})))
     assert footer_only.status_code == 204
+
+
+def test_marker_only_and_bare_separator_literals_are_spoken(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    literals = [
+        "Explain this literal:\n<!-- home-ai-display-trace -->\n",
+        "Explain this literal.\n\n---\n",
+        "Explain this literal.\n\n<!-- home-ai-display-trace -->\n---\n",
+    ]
+    for literal in literals:
+        response = asyncio.run(app.openai_speech(_SpeechRequest({"input": literal})))
+        assert response.status_code == 200
+    assert synthesized == [literal.strip() for literal in literals]
+
+
+def test_actual_generated_footer_variants_are_silent_but_source_like_prose_survives(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    trace = [{
+        "tool": "web_fetch", "action": "Opened source", "status": "complete",
+        "sources": [{"title": "Canada update", "domain": "cbc.ca", "url": "https://cbc.ca/news/update", "kind": "fetched"}],
+    }]
+    footer = app.openai_tool_trace_footer(trace)
+    full_display = "Here is the answer." + footer
+    full_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": full_display})))
+    assert full_response.status_code == 200
+    assert synthesized[-1] == "Here is the answer."
+
+    markerless = footer.replace("<!-- home-ai-display-trace -->\n", "", 1)
+    markerless_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": markerless})))
+    assert markerless_response.status_code == 204
+
+    ordinary = "My notes\n\n---\n**Research activity**\n- Discuss project status\nContinue."
+    ordinary_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary})))
+    assert ordinary_response.status_code == 200
+    assert synthesized[-1] == ordinary
 
 
 def test_invalid_progress_shape_is_not_silenced(monkeypatch):
@@ -184,8 +238,8 @@ def test_openai_speech_does_not_synthesize_progress_or_rich_trace_fragments(monk
     monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
     fragments = [
         "**Working**\n- Reading CBC…\n\n---\n\n",
-        "<!-- home-ai-display-trace -->\n---\n**Research activity**\n- Opened CBC News",
-        "<!-- home-ai-display-trace -->\n---\n**Sources**\n- CBC News",
+        "<!-- home-ai-display-trace -->\n---\n**Research activity**\n- Opened source — complete",
+        "<!-- home-ai-display-trace -->\n---\n**Sources**\n- [CBC News](https://cbc.ca/news)",
     ]
     for fragment in fragments:
         response = asyncio.run(app.openai_speech(_SpeechRequest({"input": fragment})))

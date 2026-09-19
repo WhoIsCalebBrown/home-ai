@@ -6891,34 +6891,91 @@ def remove_openai_display_metadata(text: str) -> str:
 
     cleaned = strip_progress(cleaned)
 
-    marker = re.search(
-        r"(?m)^[ \t]*<!-- home-ai-display-trace -->[ \t]*(?:\r?\n|$)"
-        r"(?=(?:[ \t]*(?:---|\*\*Research activity\*\*|Research activity|\*\*Sources\*\*|Sources)"
-        r"[ \t]*(?:\r?\n|$)|\Z))",
-        cleaned,
+    action_status = re.compile(
+        r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|"
+        r"Checked your home|Used an assistant tool) — (?:complete|no results|failed)"
     )
+    source_link = re.compile(
+        r"[ \t]*-[ \t]+\[(?:\\.|[^\]\r\n])+\]\(https?://[^)\s]+\)"
+        r"(?:[ \t]+—[^\r\n]*)?[ \t]*"
+    )
+
+    def valid_rich_footer(value: str) -> bool:
+        lines = value.strip().splitlines()
+        if len(lines) < 2 or lines[0].strip() != "---":
+            return False
+        heading = lines[1].strip()
+        if heading in {"**Sources**", "Sources"}:
+            source_count = sum(bool(source_link.fullmatch(line)) for line in lines[2:] if line.strip())
+            return source_count > 0 and all(
+                not line.strip() or source_link.fullmatch(line) for line in lines[2:]
+            )
+        if heading not in {"**Research activity**", "Research activity"}:
+            return False
+        activity_count = 0
+        plain_activity = False
+        source_count = 0
+        source_heading = False
+        for line in lines[2:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in {"**Sources**", "Sources"}:
+                source_heading = True
+            elif action_status.fullmatch(re.sub(r"^-\s+", "", stripped)):
+                activity_count += 1
+            elif source_link.fullmatch(line):
+                source_count += 1
+            elif not source_heading and re.fullmatch(r"[ \t]*-[ \t]+[^\r\n]+", line):
+                plain_activity = True
+            else:
+                return False
+        if source_heading and source_count == 0:
+            return False
+        return activity_count > 0 or (plain_activity and source_heading and source_count > 0)
+
+    marker = None
+    for candidate in re.finditer(
+        r"(?m)^[ \t]*<!-- home-ai-display-trace -->[ \t]*(?:\r?\n|$)", cleaned
+    ):
+        if valid_rich_footer(cleaned[candidate.end():]):
+            marker = candidate
+            break
     if marker:
         cleaned = cleaned[:marker.start()]
 
     # Some Open WebUI speech requests contain the rich footer after Markdown
-    # comments have been removed. Require the exact separator, heading, and a
-    # bounded activity row so an arbitrary horizontal rule is not destructive.
-    markerless_footer = re.search(
-        r"(?ms)(?:\A|\n\n)[ \t]*---[ \t]*\r?\n"
-        r"[ \t]*\*\*Research activity\*\*[ \t]*\r?\n"
-        r"[ \t]*-[ \t]+[^\r\n]*(?:\r?\n|$)",
-        cleaned,
-    )
-    if markerless_footer:
-        cleaned = cleaned[:markerless_footer.start()]
+    # comments have been removed. Validate the entire bounded footer grammar,
+    # not merely its heading and an arbitrary bullet.
+    if not marker:
+        boundaries = [0] + [match.start() + 2 for match in re.finditer(r"\n\n", cleaned)]
+        for start in boundaries:
+            if valid_rich_footer(cleaned[start:]):
+                cleaned = cleaned[:start]
+                break
 
     # Flattened clients can turn those same boundary newlines into spaces.
-    flattened_footer = re.search(
-        r"(?:\A|\n\n|\s{2,})---\s+\*\*Research activity\*\*\s+-\s+",
-        cleaned,
-    )
-    if flattened_footer:
-        cleaned = cleaned[:flattened_footer.start()]
+    if not marker:
+        flat = re.compile(r"---\s+\*\*Research activity\*\*\s+-\s+.*", re.S)
+        for candidate in re.finditer(r"(?:\A|\n\n|\s{2,})(?=---\s+\*\*Research activity\*\*)", cleaned):
+            start = candidate.end()
+            tail = re.sub(r"\s+", " ", cleaned[start:].strip())
+            if not flat.fullmatch(tail):
+                continue
+            known = re.match(
+                r"--- \*\*Research activity\*\* - "
+                r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|Checked your home|Used an assistant tool)"
+                r" — (?:complete|no results|failed)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*$",
+                tail,
+            )
+            linked = re.fullmatch(
+                r"--- \*\*Research activity\*\* - [^\s].* Sources - "
+                r"\[[^\]]+\]\(https?://[^)\s]+\)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*",
+                tail,
+            )
+            if known or linked:
+                cleaned = cleaned[:start]
+                break
 
     # Legacy saved messages used an aria-hidden HTML wrapper or a flattened
     # ``Tools used`` footer before the stable trace marker existed.

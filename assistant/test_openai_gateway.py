@@ -251,8 +251,8 @@ def test_display_metadata_fallback_removes_only_owned_rich_boundaries():
     module = _load_helpers()
     displayed = (
         "**Working**\n- Searching the web…\n\n---\n\n"
-        "Here is the answer.\n\n<!-- home-ai-display-trace -->\n"
-        "Research activity\n- Opened CBC News\n"
+        "Here is the answer.\n\n<!-- home-ai-display-trace -->\n---\n"
+        "**Research activity**\n- Opened source — complete\n"
         "Sources\n- [Canada update](https://cbc.ca/news/update)"
     )
     assert module.remove_openai_display_metadata(displayed) == "Here is the answer."
