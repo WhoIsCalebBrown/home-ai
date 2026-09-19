@@ -258,7 +258,12 @@ PROBE_PRIVATE_URL = "http://private-source.invalid/household?token=fixture-token
 PROBE_SNIPPET = "raw fixture snippet"
 PROBE_TOKEN = "fixture-token-9f1c"
 PROBE_TOOL_ERROR = "tool exception fixture"
-PROBE_HOSTILE_TITLE = '<img src="x" onerror="alert(1)"> [spoof](https://evil.example)'
+# The ordinary prefix is intentional: Open WebUI's Markdown renderer can
+# normalize a leading escaped tag differently between versions.  It gives the
+# browser a human-visible witness that this raw hostile title reached the
+# production projection/footer boundary, while the following HTML/Markdown
+# remains the injection payload being tested.
+PROBE_HOSTILE_TITLE = 'Unsafe title witness <img src="x" onerror="alert(1)"> [spoof](https://evil.example)'
 PROBE_PROMPT = f"Show the QA fixture for {PROBE_RAW_QUERY}."
 PROBE_BLOCK_SECONDS = 3.0
 PROBE_SAFE_TITLE = "Fixture source"

@@ -15,6 +15,7 @@ import { chromium } from "playwright";
 const FINAL_ANSWER = "Here is the fixture answer.";
 const TRACE_TEXT = "Research activity";
 const SAFE_URL = "https://example.com/news";
+const HOSTILE_TITLE_WITNESS = "Unsafe title witness";
 const PROMPT = "Show the QA fixture for household-private-query.";
 const SAFE_PROGRESS = ["Searching the web…", "Reading example.com…"];
 const FORBIDDEN = [
@@ -96,7 +97,8 @@ function checkCompletedDom(snapshot, phase) {
   assert(snapshot.safe_anchor_clickable, phase + ": safe source anchor is not clickable");
   assert(snapshot.evil_anchor_count === 0, phase + ": hostile title created evil destination");
   assert(snapshot.injected_node_count === 0, phase + ": hostile title created injected node");
-  assert(snapshot.text.includes("spoof"), phase + ": hostile title text was not visible");
+  assert(snapshot.text.includes(HOSTILE_TITLE_WITNESS),
+    phase + ": sanitized hostile-title witness was not visible as inert text");
   assert(!FORBIDDEN.some(value => snapshot.text.includes(value)), phase + ": raw fixture data leaked");
 }
 

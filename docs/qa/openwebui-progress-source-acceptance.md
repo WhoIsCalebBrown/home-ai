@@ -80,8 +80,9 @@ The script fails unless all of these hold in the assistant DOM:
   lines and a rendered separator;
 - final answer precedes Research activity;
 - exactly one visible, enabled source anchor has href https://example.com/news;
-- hostile title text is inert: no evil.example anchor, img/script, or event
-  handler node is created;
+- the projected hostile title's `Unsafe title witness` prefix is visible as
+  inert human text; no evil.example anchor, img/script, or event-handler node
+  is created;
 - raw query, snippet, private/internal URL, token, or raw error is absent from
   the assistant message.
 
@@ -96,7 +97,7 @@ The completed browser invocation returned:
   "early_final_visible": false,
   "early_elapsed_ms": 477,
   "completed_progress_line_count": 2,
-  "final_elapsed_ms": 3439,
+  "final_elapsed_ms": 3446,
   "reloaded_progress_line_count": 2,
   "status": "pass"
 }
@@ -129,11 +130,21 @@ docker run --rm --network none --read-only \
   qa/test_assistant_conversation_integration.py
 ~~~
 
-Focused result: 643 passed, 561 warnings in 27.53s. The warnings are the
+Focused result: 643 passed, 561 warnings in 27.01s. The warnings are the
 existing audioop and FastAPI startup-event deprecations; the cache provider was
 disabled so the read-only cache warnings are absent.
 
-The required full production-shaped suite was run at this fix-round HEAD:
+The current fix-round full production-shaped suite used this exact runnable
+command:
+
+~~~bash
+docker build -f qa/Dockerfile.assistant_integration -t home-ai-assistant-sdd-qa .
+docker run --rm --network none --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -w /repo home-ai-assistant-sdd-qa python -m pytest -q
+~~~
+
+Result:
 
 ~~~text
 1087 passed, 563 warnings in 53.30s
