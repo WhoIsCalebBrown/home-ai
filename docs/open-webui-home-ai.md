@@ -28,9 +28,13 @@ The model is `home-ai`; requests are translated into the existing
 `respond()`/session path. Open WebUI never calls Ollama, Plex, Frigate, media
 backends, or Home-AI Tools directly.
 
-`stream=true` is supported as an OpenAI-compatible SSE response. The current
-Assistant produces a completed response and emits one final content delta; it
-does not claim token-level streaming.
+`stream=true` is supported as an OpenAI-compatible SSE response. Before a
+tool-backed final answer, the Assistant can emit an ordinary persisted Markdown
+`**Working**` preamble with no more than four distinct safe major-stage lines.
+It then emits `---`, the answer, and the server-owned rich source trace. This
+is deliberately not token-level streaming. The preamble remains in the saved
+Open WebUI conversation by design, but it and the source trace are removed
+before TTS.
 
 ## Transient-status compatibility gate (BLOCKED)
 
@@ -123,3 +127,13 @@ Not yet claimed as complete:
 
 These are intentionally separate from the backend integration and do not
 require changing the Home-AI brain or any third-party image.
+
+## Progress and source acceptance
+
+The pinned Open WebUI image remains unchanged. The repeatable disposable
+acceptance procedure, including authenticated stream timestamps, browser reload
+evidence, clickable-link and hostile-title checks, TTS boundary check, and
+screenshot hashes, is recorded in
+`docs/qa/openwebui-progress-source-acceptance.md`. It is a QA release gate;
+it is not authorization to change this container, its production provider, or
+Home Assistant configuration.

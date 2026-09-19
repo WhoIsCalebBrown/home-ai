@@ -11,6 +11,7 @@ line, output is JSON, and confirmation/write-shaped prompts are refused unless
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -21,10 +22,22 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import httpx
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 
 
 WRITE_WORDS = re.compile(r"\b(?:confirm|approve|download|acquire|add|request|get|grab|restart|delete|remove|turn on|turn off)\b", re.I)
 SECRET_KEYS = re.compile(r"(?:token|authorization|password|secret|api[_-]?key)", re.I)
+DISPLAY_TRACE_MARKER = "<!-- home-ai-display-trace -->"
+SAFE_PROGRESS_LABELS = {
+    "Searching the web…", "Reading a source…", "Checking the forecast…",
+    "Checking Plex…", "Checking your home…", "Working…", "Reading CBC…",
+    "Reading Reuters…", "Reading BBC…",
+}
+UNSAFE_DISPLAY_MARKERS = (
+    "household-private-query", "private-source.invalid", "snippet=", "raw snippet",
+    "tool exception", "traceback", "token=", "authorization:",
+)
 
 
 @dataclass
@@ -42,6 +55,48 @@ class Turn:
     grounding_ok: bool | None = None
     elapsed_ms: float = 0.0
     error: str | None = None
+    stream_events: list[dict[str, Any]] = field(default_factory=list)
+    progress_before_answer: bool | None = None
+    persisted_progress_lines: int | None = None
+
+
+def _is_safe_progress_label(label: str) -> bool:
+    """Accept only the owned fixed labels or a bounded public hostname."""
+    if label in SAFE_PROGRESS_LABELS:
+        return True
+    host = label.removeprefix("Reading ").removesuffix("…")
+    return bool(re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+        host,
+    )) and len(host) <= 80 and not host.endswith((".local", ".internal", ".lan", ".home"))
+
+
+def _assert_progress_source_display(display: str, events: list[dict[str, Any]]) -> tuple[float, float, int]:
+    """Check the persisted Open WebUI display boundary without logging secrets.
+
+    The event list intentionally stores only ordinary assistant content deltas
+    after this checker has accepted them.  This keeps the operator JSON useful
+    for timing evidence without turning the live harness into a raw SSE log.
+    """
+    assert display.startswith("**Working**\n"), "missing ordinary Working preamble"
+    preamble, separator, remainder = display.partition("\n---\n\n")
+    assert separator, "missing progress/final-answer separator"
+    lines = preamble.splitlines()
+    assert lines and lines[0] == "**Working**", "invalid progress header"
+    progress = [line.removeprefix("- ") for line in lines[1:] if line.startswith("- ")]
+    assert 1 <= len(progress) <= 4, "preamble must contain one through four progress lines"
+    assert len(progress) == len(set(progress)), "preamble progress lines must be distinct"
+    assert all(_is_safe_progress_label(label) for label in progress), "unsafe progress label"
+    assert remainder.strip(), "missing final answer"
+    assert DISPLAY_TRACE_MARKER in remainder, "missing rich source trace"
+    lowered = display.casefold()
+    assert not any(marker in lowered for marker in UNSAFE_DISPLAY_MARKERS), "unsafe display data leaked"
+
+    progress_at = next((event["t_ms"] for event in events if event.get("content", "").startswith("**Working**")), None)
+    answer_at = next((event["t_ms"] for event in events if event.get("after_separator") and event.get("content", "").strip()), None)
+    assert progress_at is not None and answer_at is not None, "missing timestamped progress or answer chunk"
+    assert progress_at < answer_at, "ordinary progress did not precede final answer"
+    return float(progress_at), float(answer_at), len(progress)
 
 
 def _redact(value: Any) -> Any:
@@ -128,6 +183,60 @@ class OpenWebUILive:
         response = self.client.post(f"{self.base_url}/api/v1/chats/{chat_id}", json={"chat": chat})
         response.raise_for_status()
 
+    def progress_source_turn(self, prompt: str, chat_id: str | None = None) -> Turn:
+        """Exercise a streamed, read-only progress/source response through Open WebUI.
+
+        This is deliberately separate from ``turn`` so normal P0 regression
+        coverage keeps its non-streaming contract.  It records monotonic
+        content-event timestamps, validates the bounded persisted display
+        response, and then stores that exact display text in the authenticated
+        disposable chat document for the reload check performed by the browser
+        acceptance procedure.
+        """
+        if WRITE_WORDS.search(prompt) and not self.safe_mode:
+            raise ValueError(f"refusing write/confirmation-shaped prompt: {prompt!r}; pass --safe-mode to run non-approving coverage")
+        chat_id = chat_id or self.new_chat("Progress/source live acceptance")
+        payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}], "stream": True,
+                   "chat_id": chat_id, "metadata": {"user_id": self.user_id, "chat_id": chat_id}}
+        started = time.perf_counter()
+        record = Turn(prompt=prompt, chat_id=chat_id, user_id=self.user_id)
+        content_parts: list[str] = []
+        saw_separator = False
+        try:
+            with self.client.stream("POST", f"{self.base_url}/api/chat/completions", json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line.removeprefix("data: ")
+                    if data == "[DONE]":
+                        record.stream_events.append({"t_ms": round((time.perf_counter() - started) * 1000, 2), "event": "done"})
+                        continue
+                    frame = json.loads(data)
+                    delta = ((frame.get("choices") or [{}])[0].get("delta") or {})
+                    content = delta.get("content")
+                    if not isinstance(content, str) or not content:
+                        continue
+                    now_ms = round((time.perf_counter() - started) * 1000, 2)
+                    content_parts.append(content)
+                    # A separator may be emitted in its own content delta.  A
+                    # later non-empty delta is the first answer/trace event.
+                    event = {"t_ms": now_ms, "event": "content", "content": content,
+                             "after_separator": saw_separator}
+                    record.stream_events.append(event)
+                    if "\n---\n" in content:
+                        saw_separator = True
+            record.answer = "".join(content_parts)
+            progress_at, answer_at, line_count = _assert_progress_source_display(record.answer, record.stream_events)
+            record.progress_before_answer = progress_at < answer_at
+            record.persisted_progress_lines = line_count
+            self._persist_visible_turn(chat_id, prompt, record.answer)
+            record.tools_footer = _footer(record.answer)
+        except Exception as exc:
+            record.error = type(exc).__name__ + ": " + str(exc)
+        record.elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        return record
+
     def turn(self, prompt: str, chat_id: str | None = None, expected: dict[str, Any] | None = None) -> Turn:
         if WRITE_WORDS.search(prompt) and not self.safe_mode:
             raise ValueError(f"refusing write/confirmation-shaped prompt: {prompt!r}; pass --safe-mode to run non-approving coverage")
@@ -164,6 +273,74 @@ def _chain(api: OpenWebUILive, prompts: list[str], chat_id: str | None = None) -
     return [api.turn(prompt, chat_id=chat_id) for prompt in prompts]
 
 
+# This tiny provider is QA-only.  It lets an operator observe the *unchanged*
+# pinned Open WebUI client with a deterministic blocked-source stream, without
+# pointing a disposable browser at a real Home-AI or any production dependency.
+progress_source_probe = FastAPI()
+PROBE_KEY = "progress-source-fixture-key"
+PROBE_MODEL = "home-ai-progress-source-fixture"
+PROBE_ANSWER = (
+    "Here is the fixture answer.\n\n"
+    "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
+    "- Opened source — complete\n"
+    "  - [Fixture source](https://example.com/news) — example.com\n"
+    r"  - \[spoof\]\(https\:\/\/evil.example\) — example.com"
+)
+
+
+def _probe_sse(delta: dict[str, Any], finish_reason: str | None = None) -> str:
+    frame = {"id": "chatcmpl-progress-source-fixture", "object": "chat.completion.chunk",
+             "created": 0, "model": PROBE_MODEL,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+    return f"data: {json.dumps(frame, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _require_probe_auth(request: Request) -> None:
+    if request.headers.get("authorization") != f"Bearer {PROBE_KEY}":
+        raise HTTPException(401, "QA fixture requires its disposable bearer key")
+
+
+@progress_source_probe.get("/v1/models")
+async def progress_source_models(request: Request):
+    _require_probe_auth(request)
+    return {"object": "list", "data": [{"id": PROBE_MODEL, "object": "model", "owned_by": "home-ai-qa"}]}
+
+
+@progress_source_probe.post("/v1/chat/completions")
+async def progress_source_chat(request: Request):
+    _require_probe_auth(request)
+    body = await request.json()
+    if body.get("model") != PROBE_MODEL or not body.get("stream"):
+        raise HTTPException(400, "fixture accepts only its streamed QA model")
+
+    async def events():
+        yield _probe_sse({"role": "assistant"})
+        yield _probe_sse({"content": "**Working**\n- Searching the web…\n- Reading example.com…\n"})
+        # The pause represents a blocked source.  The browser must show the
+        # ordinary content above before this source completes.
+        await asyncio.sleep(1.5)
+        yield _probe_sse({"content": "\n---\n\n"})
+        yield _probe_sse({"content": PROBE_ANSWER})
+        yield _probe_sse({}, "stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@progress_source_probe.post("/v1/audio/speech")
+async def progress_source_tts(request: Request):
+    _require_probe_auth(request)
+    text = str((await request.json()).get("input") or "")
+    # The fixture has no synthesizer.  A 204 is the required outcome for
+    # progress/source-only text and proves it never asks a speech backend to
+    # read browser display diagnostics.
+    if not text or text == PROBE_ANSWER or DISPLAY_TRACE_MARKER in text or text.startswith("**Working**"):
+        return Response(status_code=204)
+    if text == "Here is the fixture answer.":
+        return Response(content=b"fixture-spoken-answer", media_type="audio/wav")
+    raise HTTPException(400, "unexpected fixture speech input")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.getenv("OPENWEBUI_BASE_URL", "http://localhost:3000"))
@@ -179,6 +356,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-used-gb", type=float, help="authoritative rounded cache used value from the raw tool result")
     parser.add_argument("--cache-free-gb", type=float, help="authoritative rounded cache free value from the raw tool result")
     parser.add_argument("--cache-percent", type=float, help="authoritative cache used percentage from the raw tool result")
+    parser.add_argument("--progress-source-acceptance", action="store_true",
+                        help="run one authenticated streamed read-only progress/source acceptance turn")
+    parser.add_argument("--progress-source-prompt", default="Show the QA source transparency fixture.",
+                        help="read-only prompt for --progress-source-acceptance; use only the disposable fixture")
     parser.add_argument("--output", default="-", help="JSON output path, or - for stdout")
     args = parser.parse_args(argv)
     token = ""
@@ -191,22 +372,29 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"set ${args.token_env} or --token-file; tokens are never accepted as command-line arguments")
     api = OpenWebUILive(args.base_url, token, args.model, args.user_id, args.timeout, args.safe_mode)
     try:
-        prompts = args.prompt or ["How full is cache?"]
+        # The deterministic fixture accepts exactly one prompt.  Keep this
+        # mode isolated from ordinary P0 turns and their identity follow-ups.
+        prompts = [] if args.progress_source_acceptance else (args.prompt or ["How full is cache?"])
         cache_expected = ({"used_gb": args.cache_used_gb, "free_gb": args.cache_free_gb, "percent": args.cache_percent}
                           if all(value is not None for value in (args.cache_used_gb, args.cache_free_gb, args.cache_percent))
                           else {})
         records = []
         for prompt in prompts:
             records.append(asdict(api.turn(prompt, expected=cache_expected if "cache" in prompt.casefold() else {})))
-        # Same first prompt in two independent chats is the minimum isolation
-        # probe; follow-ups remain separate and never approve a write.
-        identical = args.identity_prompt
-        chat_a = api.new_chat("P0 LIVE identical prompt A")
-        chat_b = api.new_chat("P0 LIVE identical prompt B")
-        records.extend(asdict(x) for x in _chain(api, [identical, "Do I have it?"], chat_a))
-        records.extend(asdict(x) for x in _chain(api, [identical, "What year did it come out?"], chat_b))
+        if args.progress_source_acceptance:
+            records.append(asdict(api.progress_source_turn(args.progress_source_prompt)))
+        if not args.progress_source_acceptance:
+            # Same first prompt in two independent chats is the minimum
+            # isolation probe; follow-ups remain separate and never approve a
+            # write.
+            identical = args.identity_prompt
+            chat_a = api.new_chat("P0 LIVE identical prompt A")
+            chat_b = api.new_chat("P0 LIVE identical prompt B")
+            records.extend(asdict(x) for x in _chain(api, [identical, "Do I have it?"], chat_a))
+            records.extend(asdict(x) for x in _chain(api, [identical, "What year did it come out?"], chat_b))
         result = {"harness": "openwebui_live_p0", "base_url": args.base_url, "model": args.model,
                   "user_id": args.user_id, "safe_mode": args.safe_mode, "production_writes": 0,
+                  "progress_source_acceptance": args.progress_source_acceptance,
                   "records": _redact(records)}
         output = json.dumps(result, indent=2, ensure_ascii=False)
         if args.output == "-":
