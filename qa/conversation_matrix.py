@@ -14,6 +14,7 @@ def load_router():
     tree = ast.parse(source.read_text(encoding="utf-8"))
     names = {
         "media_goal_request", "media_acquisition_language", "media_identity_signal", "media_status_question",
+        "informational_media_continuation",
         "media_title_status_signal", "visual_question",
         "direct_file_request", "playback_request", "preflight_plan", "deterministic_plan",
         "explicit_domain", "explicit_web_search_request", "current_external_question",

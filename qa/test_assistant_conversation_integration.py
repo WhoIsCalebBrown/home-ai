@@ -62,6 +62,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +231,8 @@ class FakeToolsBackend:
         self.submitted_writes: list[dict] = []
         self.consumed_confirmations: set[str] = set()
         self.call_log: list[tuple[str, dict]] = []
+        self.media_execution_calls: list[dict] = []
+        self.planner_confirmations: list[dict] = []
         self.web_search_fixtures: list[list[dict] | None] = []
         self.web_fetch_failures: set[str] = set()
         self.web_fetch_final_urls: dict[str, str] = {}
@@ -464,7 +467,13 @@ class FakeToolsBackend:
                                   "media_type": media_type, "season_scope": []},
                     "operation": operation, "canonical_external_id": canonical_id,
                     "canonical_media_type": media_type, "title": identity.get("title"),
+                    "session_id": client_id, "status": "PENDING",
+                    "arguments_hash": f"arguments-{confirmation_id}",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+                    "manager": operation.split(".", 1)[0],
                 }
+                self.planner_confirmations.append(result["confirmation_record"])
             return {"tool": name, "status": "ok", "result": result}
         if name == "media_execute_goal":
             # Real /invoke: TOOLS.get("media_execute_goal") is None -> HTTP
@@ -516,6 +525,8 @@ class FakeToolsBackend:
             state = entry["state"] if entry else "ABSENT"
             return {"tool": name, "status": "ok", "result": {"matched": state not in {"ABSENT", "NOT_FOUND"}, "current_state": state, "canonical_identity": identity}}
         if name == "media_standard_request":
+            self.media_execution_calls.append({"arguments": dict(arguments), "confirmed": confirmed,
+                                               "action_id": action_id, "session_id": client_id})
             workflow_id = arguments.get("workflow_id")
             confirmation_context = arguments.get("confirmation_context") or {}
             confirmation_id = confirmation_context.get("confirmation_id")
@@ -527,6 +538,8 @@ class FakeToolsBackend:
                 return {"tool": name, "status": "ok", "result": {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}}
             if confirmation_id:
                 self.consumed_confirmations.add(confirmation_id)
+            if any(write.get("workflow_id") == workflow_id for write in self.submitted_writes):
+                return {"tool": name, "status": "ok", "result": {"status": "no_op", "reason": "STANDARD_WORKFLOW_ALREADY_ACTIVE_OR_SATISFIED", "write_executed": False}}
             self.submitted_writes.append({"workflow_id": workflow_id, "arguments": dict(arguments)})
             return {"tool": name, "status": "ok", "result": {"status": "submitted", "write_executed": True, "ingestion_confirmed": True, "workflow_id": workflow_id}}
         if name == "get_storage_status":
@@ -851,8 +864,7 @@ async def test_unresolved_home_exclusion_clarifies_without_control(session):
     assert session.backend.submitted_writes == before
 
 
-# --- Scenario: discover -> library read -> explicit write intent -> strict
-# confirmation -> fake write (spec #2, #24) ---------------------------------
+# --- Scenario: discover -> library read -> explicit request -> fake write ---
 
 @pytest.mark.asyncio
 async def test_full_discover_library_request_confirmation_conversation(session):
@@ -888,10 +900,8 @@ async def test_full_discover_library_request_confirmation_conversation(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Cowboy Bebop"}}},
         ]}}],
     )
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, "media_plan_goal's confirmation_required result must stage a real PendingConfirmation"
-    assert action["name"] in {"media_standard_request", "media_execute_goal"}
-    assert not session.backend.submitted_writes  # still no write -- confirmation only
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending
 
     reply4 = await session.turn("Go for it.")
     assert len(session.backend.submitted_writes) == 1, "exactly one execution"
@@ -910,15 +920,14 @@ async def test_disabled_tv_writes_gives_a_clear_reason_not_a_dead_end(session):
     # limitation -- but the old message gave zero explanation, reading
     # like a broken/opaque failure instead of "shows aren't enabled yet."
     session.backend.seed_library("Silo", media_type="tv", state="ABSENT", tvdb_id="371980")
-    await session.turn(
+    session.backend.media_standard_request_override = {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False}
+    reply = await session.turn(
         "Can you get me the show Silo",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get the show Silo", "media_type": "tv"}}},
         ]}}],
     )
-    assert session.app.pending.get(session.client_id) is not None, "must have staged a real confirmation"
-    session.backend.media_standard_request_override = {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False}
-    reply = await session.turn("yes")
+    assert session.client_id not in session.app.pending
     assert reply == "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
     assert not session.backend.submitted_writes
 
@@ -1056,6 +1065,7 @@ async def test_web_to_plex_to_request_same_subject(session):
     )
     referent = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
     assert referent and "segua" in referent.casefold()
+    assert not session.backend.submitted_writes, "an online lookup is read-only"
 
     await session.turn(
         "Do I have it?",
@@ -1072,8 +1082,8 @@ async def test_web_to_plex_to_request_same_subject(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
     await session.turn("Go ahead.")
     assert len(session.backend.submitted_writes) == 1
@@ -1134,8 +1144,8 @@ async def test_weather_media_web_plex_request_full_chain(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
 
 # --- Red team: Tools failure during offer execution must never write (#23) --
@@ -1487,13 +1497,16 @@ async def test_concurrent_sessions_do_not_leak_subjects_or_offers(app, backend):
 
     action_a = app.pending.get(client_a)
     action_b = app.pending.get(client_b)
-    assert action_a is not None and action_b is not None
-    assert action_a["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert action_a is None and action_b is not None
+    assert len(backend.submitted_writes) == 1
+    dune_write = backend.submitted_writes[0]
+    assert dune_write["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert dune_write["arguments"]["session_id"] == client_a
     assert action_b["arguments"]["confirmation_context"]["title"] == "Rodeo"
-    assert action_a["arguments"] != action_b["arguments"]
+    assert dune_write["arguments"] != action_b["arguments"]
     assert app.conversation_context.get(client_a, {}).get("latest_media_workflow", {}).get("title") != "Rodeo"
 
-    # Confirm session A; session B's pending confirmation must be untouched.
+    # A stale approval in session A must not consume session B's confirmation.
     app.httpx = _FakeHttpxModule([{"message": {"content": "", "tool_calls": []}}], "Done, got Dune.")
     await app.respond(ws_a, client_a, str(uuid.uuid4()), "Go for it.")
     assert len(backend.submitted_writes) == 1
@@ -2702,7 +2715,7 @@ async def test_fresh_title_restatement_replaces_stale_subject_and_bare_reply_res
     # never echo "Zzyzx" back to the user.
     reply2 = await session.turn(f"Can you give me the movie {title} by {creator}?")
     assert "zzyzx" not in reply2.casefold(), "a fresh title restatement must never echo the old garbled subject back"
-    assert title.casefold() in reply2.casefold(), "the fresh title must actually be used, not discarded"
+    assert session.backend.submitted_writes[-1]["arguments"]["confirmation_context"]["title"] == title
     last_goal_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
     assert "zzyzx" not in str(last_goal_calls[-1]).casefold(), "the retry must not carry the stale title forward"
 
@@ -2718,7 +2731,8 @@ async def test_fresh_title_restatement_replaces_stale_subject_and_bare_reply_res
     # capability, which is the exact live production bug this proves fixed.
     calls_before = len(session.backend.call_log)
     reply4 = await session.turn(title)
-    assert title.casefold() in reply4.casefold(), f"the bare reply must resolve as the title, got: {reply4!r}"
+    assert "already" in reply4.casefold(), f"the resolved title was already requested, got: {reply4!r}"
+    assert len(session.backend.submitted_writes) == 1
     new_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
     assert new_calls, "the bare reply must be tried against media_plan_goal, not silently dropped"
     assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is None, (
@@ -2769,8 +2783,9 @@ async def test_add_the_thing_year_ambiguity_the_older_one(session):
     await session.turn("The older one.")
     plan_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
     assert plan_calls and "1982" in str(plan_calls[-1].get("goal", "")), "\"older\" (comparative) must resolve like \"old\""
-    # Confirmed identified -> a real confirmation prompt, never a silent write.
-    assert not session.backend.submitted_writes
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "1091"
+    assert session.client_id not in session.app.pending
 
 
 # --- Tool fan-out check: a media clarification reply must not trigger ----
@@ -2793,7 +2808,7 @@ async def test_disambiguation_reply_does_not_fan_out_to_unrelated_tools(session)
     calls_before = [name for name, _ in session.backend.call_log]
     await session.turn("The older one.")
     new_calls = [name for name, _ in session.backend.call_log[len(calls_before):]]
-    assert new_calls == ["media_plan_goal"], f"a clarification reply must only touch media_plan_goal, got: {new_calls}"
+    assert new_calls == ["media_plan_goal", "media_standard_request"], new_calls
 
 
 @pytest.mark.asyncio
@@ -2868,26 +2883,20 @@ async def test_pending_disambiguation_expires(session):
 # --- Clarification vs. confirmation: never the same concept ---------------
 
 @pytest.mark.asyncio
-async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(session):
-    """A media clarification answer ("The older one.") and a write
-    confirmation answer ("Yeah.") are different concepts entirely --
-    resolving a candidate must never itself execute or authorize a write,
-    and must never be interpretable as answering an unrelated pending
-    confirmation."""
+async def test_discovery_clarification_does_not_authorize_media_write(session):
+    """Selection after discovery supplies identity but no request authority."""
     session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
     session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
     await session.turn(
-        "Add The Thing.",
+        "Do you know The Thing?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
         ]}}],
     )
     await session.turn("The older one.")
-    # Resolving the candidate must stage a real confirmation prompt (a
-    # write requires an explicit "yes" of its own) -- never execute directly.
     assert not session.backend.submitted_writes
     action = session.app.pending.get(session.client_id)
-    assert action is not None, "identification must stage a real PendingConfirmation, not skip straight to a write"
+    assert action is None
 
 
 # --- Descriptive media discovery (real live production bug): a plain --
@@ -2984,18 +2993,177 @@ async def test_phrasing_variants_all_reach_media_plan_goal(session, text):
     "Request the movie with Brad Pitt and fly fishing.",
 ])
 @pytest.mark.asyncio
-async def test_request_variants_reach_media_plan_goal_and_proceed_to_confirmation(session, text):
-    """Item 11: request-shaped descriptive variants use the SAME identity
-    resolution machinery (media_plan_goal), then proceed to normal
-    confirmation once resolved -- never a second, independent resolver."""
+async def test_request_variants_execute_bound_media_request_same_turn(session, text):
+    """Explicit requests consume one planner binding without another approval."""
     session.backend.seed_person("brad pitt", "A River Runs Through It")
     session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
     await session.turn(text)
     called = [name for name, _ in session.backend.call_log]
     assert "media_plan_goal" in called, text
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, f"a resolved request must stage a real confirmation, not write directly: {text}"
+    assert len(session.backend.submitted_writes) == 1, text
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("discover_first", [False, True])
+@pytest.mark.asyncio
+async def test_explicit_media_request_preserves_server_binding(session, discover_first):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631", year="2021")
+    if discover_first:
+        await session.turn("Do you know Dune?", ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
+        ]}}])
+        assert not session.backend.submitted_writes
+    reply = await session.turn("Can you request it?" if discover_first else "Request Dune 2021.")
+    assert len(session.backend.submitted_writes) == 1
+    assert len(session.backend.media_execution_calls) == 1
+    call = session.backend.media_execution_calls[0]
+    record = session.backend.planner_confirmations[-1]
+    assert call["confirmed"] is True
+    assert call["action_id"] == record["confirmation_id"]
+    assert call["session_id"] == session.client_id
+    assert call["arguments"] == {
+        "workflow_id": "wf-438631", "canonical_external_id": "438631", "media_type": "movie",
+        "season_scope": [], "confirmation_context": record, "session_id": session.client_id,
+    }
+    assert call["arguments"]["confirmation_context"] is record
+    assert "looking for it" in reply.casefold()
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_repeated_explicit_media_request_returns_executor_no_op(session):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Request Dune.")
+    reply = await session.turn("Request Dune.")
+    assert len(session.backend.media_execution_calls) == 2
+    assert len(session.backend.submitted_writes) == 1
+    assert "already" in reply.casefold() and "looking for it" not in reply.casefold()
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_already_in_plex_skips_executor(session):
+    session.backend.seed_library("Dune", media_type="movie", state="AVAILABLE_IN_PLEX", tmdb_id="438631")
+    reply = await session.turn("Request Dune.")
+    assert "already" in reply.casefold() and "plex" in reply.casefold()
+    assert not session.backend.media_execution_calls
     assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("request_text", ["Request Dune.", "Do you know Dune?"])
+@pytest.mark.asyncio
+async def test_ambiguous_media_preserves_original_operation_until_selection(session, request_text):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn(request_text, ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
+    ]}}])
+    entry = session.app.conversation_context[session.client_id]["pending_disambiguation"]
+    assert entry["original_operation"] == ("MEDIA_REQUEST" if request_text.startswith("Request") else "MEDIA_DISCOVERY")
+    assert not session.backend.media_execution_calls
+    await session.turn("yes")
+    assert not session.backend.media_execution_calls
+    await session.turn("The new one.")
+    expected_writes = 1 if request_text.startswith("Request") else 0
+    assert len(session.backend.submitted_writes) == expected_writes
+    if expected_writes:
+        assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "438631"
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_bare_yes_without_pending_media_action_never_writes(session):
+    await session.turn("yes")
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    ({"status": "disabled", "reason": "STANDARD_MOVIE_WRITES_DISABLED"}, "aren't turned on"),
+    ({"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID"}, "expired or didn't match"),
+    ({"status": "failed_ingestion"}, "couldn't hand that off"),
+    ({"status": "submitted", "ingestion_confirmed": False}, "couldn't confirm"),
+    ({}, "couldn't confirm"),
+])
+@pytest.mark.asyncio
+async def test_explicit_media_request_reports_executor_outcome_truthfully(session, outcome, expected):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    session.backend.media_standard_request_override = outcome
+    reply = await session.turn("Request Dune.")
+    assert len(session.backend.media_execution_calls) == 1
+    assert expected in reply.casefold()
+    assert "looking for it" not in reply.casefold()
+    assert session.client_id not in session.app.pending
+    state = session.app.conversation_context[session.client_id]["latest_media_workflow"]
+    assert state["execution_status"] == outcome.get("status", "ok")
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_without_server_confirmation_id_never_writes(session, monkeypatch):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    original = session.backend.invoke
+
+    async def incomplete_planner(name, arguments, client_id, request_id, **kwargs):
+        result = await original(name, arguments, client_id, request_id, **kwargs)
+        if name == "media_plan_goal":
+            result["result"]["confirmation_record"].pop("confirmation_id")
+        return result
+
+    monkeypatch.setattr(session.backend, "invoke", incomplete_planner)
+    await session.turn("Request Dune.")
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_after_unresolved_title_executes_current_request(session):
+    await session.turn("Request Nonexistent Zzyzx movie.")
+    assert not session.backend.submitted_writes
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Can you get me the movie Dune?")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "438631"
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_title_clarification_preserves_explicit_request_until_scope_is_known(session):
+    await session.turn("Can you request the movie?")
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Dune")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_discovery_model_request_arguments_do_not_stage_write(session):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Do you know Dune?", ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+    ]}}])
+    assert not session.backend.media_execution_calls
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+@pytest.mark.asyncio
+async def test_media_clarification_new_read_request_does_not_inherit_write_intent(session, ambiguous):
+    if ambiguous:
+        session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+        session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+        await session.turn("Request Dune.")
+        reply = "Do I have the 2021 movie in Plex?"
+    else:
+        await session.turn("Can you request the movie?")
+        session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+        reply = "Do I have Dune?"
+    await session.turn(reply)
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
 
 
 @pytest.mark.asyncio
@@ -3164,9 +3332,7 @@ def test_creator_hint_only_resolves_when_catalog_candidates_supply_unique_people
 
 @pytest.mark.asyncio
 async def test_knowledge_to_request_handoff(session):
-    """Item 13: descriptive discovery resolves identity; "Add it." then
-    proceeds through normal media planning and stops at strict
-    confirmation -- no production write during QA."""
+    """Descriptive discovery retains the exact identity for an explicit request."""
     session.backend.seed_person("brad pitt", "A River Runs Through It")
     session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
 
@@ -3175,9 +3341,9 @@ async def test_knowledge_to_request_handoff(session):
     assert session.client_id not in session.app.pending
 
     await session.turn("Add it.")
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, "a request following identity resolution must stop at a real confirmation prompt"
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "11202"
 
 
 @pytest.mark.asyncio
@@ -3242,12 +3408,8 @@ async def test_legitimate_confirmed_media_request_still_executes_end_to_end(sess
     confirmation, answered with a real "yes", must still execute the fake
     write exactly as before."""
     session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
-    await session.turn(
-        "Get Dune 2021.",
-        ollama_script=[{"message": {"content": "", "tool_calls": [
-            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune 2021"}}},
-        ]}}],
-    )
+    result = await session.backend.invoke("media_plan_goal", {"goal": "get Dune 2021"}, session.client_id, "legacy-request")
+    session.app.stage_media_confirmation(session.client_id, "legacy-request", result["result"])
     action = session.app.pending.get(session.client_id)
     assert action is not None
     assert action["name"] in {"media_standard_request", "media_execute_goal"}
@@ -3272,7 +3434,7 @@ async def test_bug_a_untyped_request_reaches_media_plan_goal_through_respond(ses
     reply = await session.turn("Can you request Sagwa The Chinese Siamese Cat")
     called = [name for name, _ in session.backend.call_log]
     assert "media_plan_goal" in called
-    assert "sagwa" in reply.casefold()
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "77670"
     assert "no tools" not in reply.casefold() and "no access" not in reply.casefold()
 
 
@@ -3294,7 +3456,8 @@ async def test_bug_b_yes_do_that_continues_the_offered_identity(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Sagwa The Chinese Siamese Cat"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
     await session.turn("yes do that")
     assert len(session.backend.submitted_writes) == 1

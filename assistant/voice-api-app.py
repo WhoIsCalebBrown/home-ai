@@ -2483,6 +2483,8 @@ def media_intent(text: str, context: dict | None = None) -> str | None:
         return "MEDIA_STATUS"
     if media_library_query(text):
         return "MEDIA_LIBRARY_QUERY"
+    if re.search(r"\b(?:find|search|look)\b.*\b(?:online|web|internet)\b", text, re.I):
+        return "MEDIA_DISCOVERY"
     descriptive_clue = _descriptive_media_clue(text)
     descriptive_media = descriptive_clue and media_identity_signal(text)
     if ((media_goal_request(text) and (not descriptive_clue or media_acquisition_request_frame(text)))
@@ -2561,7 +2563,8 @@ def referential_media_request(text: str, context: dict | None = None) -> bool:
     if not isinstance(context.get("canonical_identity"), dict):
         return False
     return bool(re.fullmatch(
-        r"\s*(?:(?:okay|ok|well|then)[,.]?\s+)?(?:please\s+)?"
+        r"\s*(?:no[?.,!]\s*)?(?:(?:okay|ok|well|then)[,.]?\s+)?"
+        r"(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
         r"(?:get|add|request|grab)\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*",
         text,
         re.I,
@@ -2700,7 +2703,7 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
     scope: dict = {}
     names = {name for name, _ in planned}
     if "media_plan_goal" in names:
-        if referential_media_request(text, context) or media_acquisition_request_frame(text):
+        if operation != "MEDIA_DISCOVERY" and (referential_media_request(text, context) or media_acquisition_request_frame(text)):
             operation = "MEDIA_REQUEST"
         elif referential_media_library_question(text, context):
             operation = "MEDIA_LIBRARY_QUERY"
@@ -4279,12 +4282,12 @@ def is_confirmation(text: str) -> bool:
     ))
 
 
-def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> None:
-    """Retain the exact planner-issued media binding for a later approval turn."""
+def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> dict | None:
+    """Retain and return the exact planner-issued media authorization."""
     if not result.get("confirmation_required"):
         return
     record = result.get("confirmation_record")
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or not record.get("confirmation_id"):
         return
     arguments = dict(record.get("arguments") or {})
     if not arguments.get("workflow_id") or not arguments.get("canonical_external_id"):
@@ -4297,7 +4300,7 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     pending[client_id] = {
         "name": "media_standard_request" if record.get("operation", "").startswith("cli_debrid.") else "media_execute_goal",
         "arguments": arguments,
-        "action_id": record.get("confirmation_id") or str(uuid.uuid4()),
+        "action_id": record["confirmation_id"],
         "conversation_id": client_id,
         "session_id": client_id,
         "expires": time.time() + 120,
@@ -4323,6 +4326,74 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
         },
     })
     conversation_context[client_id] = prior
+    return pending[client_id]
+
+
+def media_request_outcome(action: dict, result: dict) -> str:
+    """Record and render executor evidence; transport success is not ingestion."""
+    client_id = action["session_id"]
+    details = result.get("result") if isinstance(result.get("result"), dict) else {}
+    outer_status = result.get("status")
+    status = details.get("status")
+    reason = details.get("reason") or details.get("error")
+    media_state = dict(conversation_context.get(client_id, {}))
+    media_state.update({
+        "domain": "media", "kind": "media_workflow", "group": "media",
+        "referent_type": "media_workflow", "referent_ids": [action.get("canonical_external_id")],
+        "latest_media_workflow": {
+            "workflow_id": action.get("workflow_id"),
+            "canonical_external_id": action.get("canonical_external_id"),
+            "media_type": action.get("arguments", {}).get("media_type"),
+            "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
+            "mode": "standard", "execution_status": status or outer_status, "reason": reason,
+        },
+    })
+    conversation_context[client_id] = media_state
+    if outer_status != "ok":
+        return "I couldn't hand that request off to your media queue."
+    if status == "submitted" and details.get("ingestion_confirmed"):
+        return "Done. It's looking for it now."
+    if status == "no_op":
+        if reason and reason.startswith("ALREADY_AVAILABLE"):
+            return "You already have that -- no need to request it again."
+        return "That's already been taken care of, no action needed."
+    if status == "failed_ingestion":
+        return "I couldn't hand that off to your media queue."
+    if status in {"rejected", "disabled"}:
+        if reason in {"STANDARD_SEASON_WRITES_DISABLED", "STANDARD_EPISODE_SCOPE_UNSUPPORTED"}:
+            return "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
+        if reason == "STANDARD_MOVIE_WRITES_DISABLED":
+            return "Movie requests aren't turned on for me yet."
+        if reason in {"STANDARD_MEDIA_WRITES_DISABLED", "STANDARD_MEDIA_BACKEND_NOT_READY", "BRIDGE_SECRET_MISSING"}:
+            return "The media request system isn't available right now, so nothing was requested."
+        if reason in {"CONFIRMATION_BINDING_REQUIRED", "CONFIRMATION_SESSION_OR_STATUS_INVALID"}:
+            return "That confirmation expired or didn't match up -- go ahead and ask again."
+        return "I couldn't hand that off to your media system."
+    return "I couldn't confirm that media request was accepted."
+
+
+async def execute_bound_media_request(client_id: str, request_id: str, action: dict) -> str:
+    """Consume only a stored planner action, never reconstructed title arguments."""
+    result = await invoke_tool(action["name"], action["arguments"], client_id, request_id,
+                               confirmed=True, action_id=action["action_id"])
+    return media_request_outcome(action, result)
+
+
+async def complete_media_plan(client_id: str, request_id: str, result: dict, operation: str | None) -> str | None:
+    """An explicit standard request authorizes its now-unambiguous bound plan."""
+    plan = result.get("result") if isinstance(result.get("result"), dict) else {}
+    if (result.get("status") != "ok" or operation != "MEDIA_REQUEST"
+            or plan.get("ambiguous") or not plan.get("canonical_identity")):
+        return None
+    action = stage_media_confirmation(client_id, request_id, plan)
+    if action and action["name"] == "media_standard_request":
+        # Claim the exact newly staged action before the first await. The
+        # executor remains authoritative for session/hash checks and dedup.
+        pending.pop(client_id)
+        return await execute_bound_media_request(client_id, request_id, action)
+    if plan.get("confirmation_required") and not action:
+        return "I couldn't confirm that media request was accepted."
+    return None
 
 
 # Which argument key names the subject of a call to this tool. This is the
@@ -4656,7 +4727,7 @@ def canonical_media_year_answer(context: dict, text: str) -> str | None:
 _DISAMBIGUATION_TTL_SECONDS = 90
 
 
-def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str) -> None:
+def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str, original_operation: str | None = None) -> None:
     """Persist an ambiguous media_plan_goal's candidate set so the next
     turn's natural-language reply ("the new one", "2021", "the movie") can
     resolve against it, instead of the assistant losing the candidates the
@@ -4667,6 +4738,7 @@ def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: 
     context = dict(conversation_context.get(client_id, {}))
     context["pending_disambiguation"] = {
         "candidates": candidates, "original_goal": original_goal, "created_at": time.time(),
+        "original_operation": original_operation or operation_for_plan(original_goal, context, [("media_plan_goal", {})])[0],
     }
     conversation_context[client_id] = context
 
@@ -4691,7 +4763,10 @@ def stage_title_clarification(client_id: str, original_goal: str) -> None:
     pending_offers/pending_disambiguation -- not a fourth state-tracking
     style."""
     context = dict(conversation_context.get(client_id, {}))
-    context["pending_title_clarification"] = {"original_goal": original_goal, "created_at": time.time()}
+    context["pending_title_clarification"] = {
+        "original_goal": original_goal, "created_at": time.time(),
+        "original_operation": operation_for_plan(original_goal, context, [("media_plan_goal", {})])[0],
+    }
     conversation_context[client_id] = context
 
 
@@ -5239,6 +5314,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 enriched_title = f"{unresolved_subject.title_or_name}. {user_text.strip()}"
             enriched = unresolved_subject.enrich(title_or_name=enriched_title, **(enrichment_hint or {}))
             enriched_goal = enriched.resolution_goal_text()
+            enriched_operation = operation_for_plan(user_text, conversation_context.get(client_id, {}), [("media_plan_goal", {})])[0]
+            if enriched_operation == "MEDIA_REQUEST":
+                enriched_goal = f"get {enriched_goal}"
             result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_enriched = [result]
@@ -5249,13 +5327,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if not resolved_text:
                     resolved_text = f"I found {plan_result['canonical_identity'].get('title', enriched.title_or_name)}."
                 if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                    executed = await complete_media_plan(client_id, request_id, result, enriched_operation)
+                    resolved_text = executed or resolved_text
                 elif not plan_result.get("ambiguous"):
                     offer_question = stage_media_offer(client_id, plan_result)
                     if offer_question:
                         resolved_text = f"{resolved_text} {offer_question}"
             elif plan_result.get("ambiguous") and plan_result.get("candidates"):
-                stage_disambiguation(client_id, plan_result["candidates"], enriched_goal)
+                stage_disambiguation(client_id, plan_result["candidates"], enriched_goal, enriched_operation)
                 resolved_text = media_plan_response(user_text, live_results_enriched) or "I found more than one possible match. Which one do you mean?"
             else:
                 # Still unresolved even after enrichment: keep the subject
@@ -5295,7 +5374,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             context_cleared = dict(conversation_context.get(client_id, {}))
             context_cleared.pop("pending_title_clarification", None)
             conversation_context[client_id] = context_cleared
-            result = await invoke_tool("media_plan_goal", {"goal": candidate_title, "session_id": client_id}, client_id, request_id)
+            clarified_operation = operation_for_plan(user_text, context_cleared, [("media_plan_goal", {})])[0]
+            if (clarified_operation == "MEDIA_DISCOVERY"
+                    and user_text.strip().strip(" .!?").casefold() == candidate_title.casefold()
+                    and not re.match(r"\s*(?:do|does|did|what|which|who|when|where|why|how|is|are|can|could|would|will)\b", user_text, re.I)):
+                clarified_operation = title_clarification.get("original_operation")
+            clarified_goal = f"get {candidate_title}" if clarified_operation == "MEDIA_REQUEST" else candidate_title
+            result = await invoke_tool("media_plan_goal", {"goal": clarified_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_clarified = [result]
             if plan_result.get("canonical_identity"):
@@ -5305,13 +5390,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if not resolved_text:
                     resolved_text = f"I found {plan_result['canonical_identity'].get('title', candidate_title)}."
                 if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                    executed = await complete_media_plan(client_id, request_id, result, clarified_operation)
+                    resolved_text = executed or resolved_text
                 elif not plan_result.get("ambiguous"):
                     offer_question = stage_media_offer(client_id, plan_result)
                     if offer_question:
                         resolved_text = f"{resolved_text} {offer_question}"
             elif plan_result.get("ambiguous") and plan_result.get("candidates"):
-                stage_disambiguation(client_id, plan_result["candidates"], candidate_title)
+                stage_disambiguation(client_id, plan_result["candidates"], candidate_title, clarified_operation)
                 resolved_text = media_plan_response(user_text, live_results_clarified) or "I found more than one possible match. Which one do you mean?"
             else:
                 resolved_text = media_plan_response(user_text, live_results_clarified) or f"I still couldn't find anything called '{candidate_title}'."
@@ -5355,8 +5441,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             year = resolved.get("year")
             media_type = resolved.get("media_type")
             type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
-            original_goal = str(disambiguation.get("original_goal") or "")
-            action_prefix = "get " if media_acquisition_language(original_goal) else ""
+            original_operation = media_intent(user_text, context_cleared) or disambiguation.get("original_operation")
+            action_prefix = "get " if original_operation == "MEDIA_REQUEST" else ""
             disambiguated_goal = f"{action_prefix}{title}{f' from {year}' if year else ''} {type_word}".strip()
             result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": client_id}, client_id, request_id)
             live_results_resolved = [result]
@@ -5367,8 +5453,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if resolved_text is None:
                 post_direct_resolved = direct_structured_answer(user_text, live_results_resolved)
                 resolved_text = post_direct_resolved or f"I found {title}."
-                if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                executed = await complete_media_plan(client_id, request_id, result, original_operation)
+                resolved_text = executed or resolved_text
             elif plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
                 offer_question = stage_media_offer(client_id, plan_result)
                 if offer_question:
@@ -5461,8 +5547,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             result = await invoke_tool(offer.operation, offer_arguments, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             if offer.operation == "media_plan_goal" and plan_result:
-                stage_media_confirmation(client_id, request_id, plan_result)
                 full = direct_structured_answer(user_text, [{"tool": "media_plan_goal", "status": result.get("status"), "result": plan_result}])
+                offer_operation = operation_for_plan(user_text, conversation_context.get(client_id, {}), [("media_plan_goal", {})])[0]
+                executed = await complete_media_plan(client_id, request_id, result, offer_operation)
+                full = executed or full
                 if not full:
                     full = "I couldn't confirm that without changing anything."
             else:
@@ -5524,73 +5612,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             else:
                 full = f"I couldn't restart {display_target}."
         elif action_name == "media_standard_request":
-            details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
-            outer_status = result.get("status")
-            execution_status = details.get("status")
-            execution_reason = details.get("reason") or details.get("error")
-            media_state = dict(conversation_context.get(client_id, {}))
-            media_state.update({
-                "domain": "media", "kind": "media_workflow", "group": "media",
-                "referent_type": "media_workflow",
-                "referent_ids": [action.get("canonical_external_id")],
-                "latest_media_workflow": {
-                    "workflow_id": action.get("workflow_id"),
-                    "canonical_external_id": action.get("canonical_external_id"),
-                    "media_type": action.get("arguments", {}).get("media_type"),
-                    "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
-                    "mode": "standard",
-                    "execution_status": execution_status or outer_status,
-                    "reason": execution_reason,
-                },
-            })
-            conversation_context[client_id] = media_state
-            status = execution_status
-            if outer_status != "ok":
-                full = "I couldn't hand that request off to your media queue."
-            elif status == "submitted" and details.get("ingestion_confirmed"):
-                full = "Done. It's looking for it now."
-            elif status == "no_op":
-                # Real production bug found in a 65-conversation live sweep:
-                # "You already have Whiplash in Plex" -> confirmed with a
-                # plain "yes" -> "It's already on the way." -- misleading;
-                # "no_op" here almost always means the opposite of "in
-                # progress" (ALREADY_AVAILABLE_IN_BOTH_LIBRARIES/
-                # _PERMANENTLY/_STANDARD -- see tools/server-tools-app.py's
-                # media_standard_request), i.e. it's already fully done,
-                # not "on its way." Only the genuinely ambiguous reason
-                # (an active workflow that could be either in-progress or
-                # already satisfied) keeps neutral wording.
-                no_op_reason = execution_reason
-                if no_op_reason and no_op_reason.startswith("ALREADY_AVAILABLE"):
-                    full = "You already have that -- no need to request it again."
-                else:
-                    full = "That's already been taken care of, no action needed."
-            elif status == "failed_ingestion":
-                full = "I couldn't hand that off to your media queue."
-            elif status in {"rejected", "disabled"}:
-                # Real production gap found live: "Can you get me the show
-                # Silo" -> confirmed -> "I couldn't hand that off to your
-                # media system." -- technically honest (this server has TV
-                # show requests deliberately turned off,
-                # STANDARD_SEASON_WRITES_ENABLED=false), but gave the user
-                # zero explanation why, which reads as a broken/opaque
-                # failure rather than a real, nameable limitation. A user
-                # with zero knowledge of the system's internals has no way
-                # to know movies work but shows don't, or that a session
-                # simply expired, unless told directly.
-                reason = execution_reason
-                if reason in {"STANDARD_SEASON_WRITES_DISABLED", "STANDARD_EPISODE_SCOPE_UNSUPPORTED"}:
-                    full = "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
-                elif reason == "STANDARD_MOVIE_WRITES_DISABLED":
-                    full = "Movie requests aren't turned on for me yet."
-                elif reason in {"STANDARD_MEDIA_WRITES_DISABLED", "STANDARD_MEDIA_BACKEND_NOT_READY", "BRIDGE_SECRET_MISSING"}:
-                    full = "The media request system isn't available right now, so nothing was requested."
-                elif reason in {"CONFIRMATION_BINDING_REQUIRED", "CONFIRMATION_SESSION_OR_STATUS_INVALID"}:
-                    full = "That confirmation expired or didn't match up -- go ahead and ask again."
-                else:
-                    full = "I couldn't hand that off to your media system."
-            else:
-                full = "I couldn't confirm that media request was accepted."
+            full = media_request_outcome(action, result)
         else:
             messages = [{"role": "system", "content": SYSTEM}, *history[-12:], {"role": "tool", "name": action["name"], "content": json.dumps(result.get("result", {}), separators=(",", ":"))}, {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE}]
             full = await generate_final(messages)
@@ -5976,7 +5998,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if direct:
             for item in live_results:
                 if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
-                    stage_media_confirmation(client_id, request_id, item.get("result") or {})
+                    executed = await complete_media_plan(client_id, request_id, item, context.get("operation"))
+                    if executed:
+                        direct = executed
+                        break
             store_provenance(client_id, live_results)
             await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
             await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_structured")
@@ -6245,7 +6270,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 for item in live_results:
                     if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
                         plan_result = item.get("result") or {}
-                        stage_media_confirmation(client_id, request_id, plan_result)
+                        executed = await complete_media_plan(client_id, request_id, item, context.get("operation"))
+                        if executed:
+                            post_direct = executed
+                            break
                         # media_plan_goal is almost always reached through
                         # this Qwen tool-call loop, not the deterministic
                         # preflight list (semantic_preflight_allowed only
