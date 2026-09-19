@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import yaml
@@ -1039,17 +1039,29 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
     if research_mode == "deep":
-        office_title = r"(?P<title>office[- ]holder|prime minister|president|vice president|governor general|governor|mayor|minister|chancellor|speaker|chief justice|secretary)"
-        person_name = r"(?P<name>[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){1,3})"
-        office_holder_patterns = (
-            rf"\b{person_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{office_title}\b",
-            rf"\b(?:the\s+)?(?:current\s+)?{office_title}\s+(?:is|remains)\s+{person_name}\b",
+        # Detection is deliberately broader than acceptance: no vocabulary of
+        # known offices or people can exempt a new current-role claim.
+        role_claim_patterns = (
+            r"(?P<name>[^.!?;\n]+?)\s+(?:is|serves as|remains)\s+(?:the\s+)?current\s+(?P<title>[^.!?;\n]+)",
+            r"\b(?:the\s+)?current\s+(?P<title>[^.!?;\n]+?)\s+(?:is|remains)\s+(?P<name>[^.!?;\n]+)",
         )
+
+        def normalized(value: str) -> str:
+            return " ".join(value.casefold().split())
+
+        def fetched_host(value: object) -> str:
+            try:
+                parsed = urlsplit(str(value or ""))
+                host = (parsed.hostname or "").casefold().rstrip(".")
+                if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+                    return ""
+                return host if re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", host) else ""
+            except ValueError:
+                return ""
+
         fetched_articles = [
             (
-                (domain_match.group(1).casefold().removeprefix("www.") if (domain_match := re.match(
-                    r"^https?://([^/?#]+)", str(item.get("result", {}).get("url") or "").strip(), re.I
-                )) else ""),
+                fetched_host(item.get("result", {}).get("url")),
                 str(item.get("result", {}).get("content") or ""),
             )
             for item in results
@@ -1059,47 +1071,57 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
             and str(item.get("result", {}).get("content") or "").strip()
         ]
         claimed_holders = [
-            (match.group("name"), match.group("title"))
-            for pattern in office_holder_patterns
+            (normalized(match.group("name")), normalized(match.group("title")))
+            for pattern in role_claim_patterns
             for match in re.finditer(pattern, answer, re.I)
         ]
 
-        refutation_markers = re.compile(
-            r"\b(?:false|reports?|reported|claimed|alleged|denied|former|no\s+longer|not)\b",
-            re.I,
-        )
-
-        def direct_current_role_assertions(content: str) -> list[tuple[str, str]]:
-            assertions = []
-            for sentence in re.split(r"(?<=[.!?])\s+", content):
-                if refutation_markers.search(sentence):
-                    continue
-                assertions.extend(
-                    (match.group("name"), match.group("title"))
-                    for pattern in office_holder_patterns
-                    for match in re.finditer(pattern, sentence, re.I)
-                )
-            return assertions
-
         def fetched_evidence_supports_current_role(name: str, title: str) -> bool:
-            normalized_name = re.sub(r"\s+", " ", name).casefold()
-            normalized_title = re.sub(r"\s+", " ", title).casefold()
+            # Full sentences only: embedded reports, quotes and qualifying or
+            # refuting suffixes cannot become support through a substring match.
+            # Reverse-order assertions can expose conflicts, but only the
+            # canonical person-first form supplies positive evidence.
+            person = r"(?P<name>[^\W\d_][\w'’ -]*?)"
+            relation = re.compile(
+                rf"{person} is (?P<negative>not |no longer )?(?:the )?current {re.escape(title)}(?![\w-])"
+            )
+            reverse_relation = re.compile(
+                rf"(?:the )?current {re.escape(title)} is {person}\.?"
+            )
             supporting_domains = set()
             for domain, content in fetched_articles:
-                for asserted_name, asserted_title in direct_current_role_assertions(content):
-                    if re.sub(r"\s+", " ", asserted_title).casefold() != normalized_title:
+                if not domain:
+                    continue
+                for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", content):
+                    sentence = normalized(sentence)
+                    assertion = relation.match(sentence)
+                    reverse = reverse_relation.fullmatch(sentence)
+                    if reverse and reverse.group("name") != name:
+                        return False
+                    if not assertion:
                         continue
-                    if re.sub(r"\s+", " ", asserted_name).casefold() != normalized_name:
+                    # A matching relationship followed by extra prose may be
+                    # qualified or refuted. Treat it as unresolved, including
+                    # when other fetched articles offer a clean assertion.
+                    if sentence[assertion.end():] not in {"", "."}:
+                        return False
+                    if assertion.group("negative"):
+                        if assertion.group("name") == name:
+                            return False
+                        continue
+                    if assertion.group("name") != name:
                         return False
                     supporting_domains.add(domain)
             authoritative = any(
-                domain.endswith(".gc.ca")
-                or domain.endswith(".gov")
-                or ".gov." in domain
-                or domain.startswith("gov.")
+                domain == suffix or domain.endswith("." + suffix)
                 for domain in supporting_domains
+                for suffix in ("gov", "gc.ca", "gov.uk", "gov.au", "gov.nz")
             )
-            return authoritative or len(supporting_domains) >= 2
+            # Subdomains of one publisher are not independent sources. Taking
+            # the last two labels intentionally undercounts multi-label public
+            # suffixes (e.g. co.uk) rather than overclaiming independence.
+            independent_domains = {".".join(domain.split(".")[-2:]) for domain in supporting_domains}
+            return authoritative or len(independent_domains) >= 2
 
         if any(not fetched_evidence_supports_current_role(name, title) for name, title in claimed_holders):
             return "I can't safely verify that current office-holder from the fetched evidence."

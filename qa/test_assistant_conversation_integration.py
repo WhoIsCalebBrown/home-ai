@@ -2126,7 +2126,7 @@ async def test_deep_news_accepts_a_current_holder_corroborated_by_independent_fe
         [{"title": "Background", "url": third_url, "snippet": "Government context."}],
     ]
     session.backend.web_fetch_contents[first_url] = "Corroborated Holder is the current office-holder."
-    session.backend.web_fetch_contents[second_url] = "The current office-holder is Corroborated Holder."
+    session.backend.web_fetch_contents[second_url] = "Corroborated Holder is the current office-holder."
 
     reply = await session.turn(
         user_text,
@@ -2137,6 +2137,50 @@ async def test_deep_news_accepts_a_current_holder_corroborated_by_independent_fe
     )
 
     assert reply == "Corroborated Holder is the current office-holder."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_url,first_content,second_content,final_text,accepted",
+    [
+        pytest.param("https://canada.gc.ca/holder", "The claim that Alice Doe is the current office-holder was debunked.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="debunked-embedded-claim"),
+        pytest.param("https://news-one.example/holder", "Unrelated political context.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="arbitrary-role"),
+        pytest.param("https://gov.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="fake-government-prefix"),
+        pytest.param("https://news.gov.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="fake-government-infix"),
+        pytest.param("https://canada.gc.ca.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="government-suffix-spoof"),
+        pytest.param("https://canada.gc.ca/holder", '"Alice Doe is the current Foreign Minister."', "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="quoted-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister, a claim subsequently debunked.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="refuted-suffix"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is not the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="negated-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Bob Roe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="conflicting-holder"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Bob Roe is the current Foreign Minister, following the election.", "Alice Doe is the current Foreign Minister.", False, id="conflicting-holder-with-context"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is not the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="contradictory-negation"),
+        pytest.param("https://alias.news-two.example/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="same-publisher-subdomains"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", True, id="safe-government"),
+        pytest.param("https://department.gov.uk/holder", "Alice Doe is the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", True, id="safe-government-country-suffix"),
+        pytest.param("https://news-one.example/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is current Foreign Minister.", "Alice Doe is the current Foreign Minister.", True, id="independent-domains"),
+        pytest.param("https://news-one.example/holder", "Unrelated political context.", "Unrelated economic context.", "The current Foreign Minister is Alice Doe.", False, id="reverse-output-claim"),
+    ],
+)
+async def test_deep_news_current_role_evidence_boundary(
+    session, first_url, first_content, second_content, final_text, accepted,
+):
+    """Weak relationship matching or hostname trust must not authorize speech."""
+    second_url = "https://news-two.example/holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "First update", "url": first_url, "snippet": "Government update."}],
+        [{"title": "Second update", "url": second_url, "snippet": "Independent update."}],
+        [{"title": "Background", "url": "https://news-three.example/context", "snippet": "Economic update."}],
+    ]
+    session.backend.web_fetch_contents[first_url] = first_content
+    session.backend.web_fetch_contents[second_url] = second_content
+    reply = await session.turn(
+        "Please give me an in-depth review of current Canadian government news.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text=final_text,
+    )
+    assert reply == (final_text if accepted else "I can't safely verify that current office-holder from the fetched evidence.")
 
 
 @pytest.mark.asyncio
