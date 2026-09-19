@@ -230,6 +230,8 @@ class FakeToolsBackend:
         self.submitted_writes: list[dict] = []
         self.consumed_confirmations: set[str] = set()
         self.call_log: list[tuple[str, dict]] = []
+        self.web_search_fixtures: list[list[dict]] = []
+        self.web_fetch_failures: set[str] = set()
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
@@ -321,6 +323,10 @@ class FakeToolsBackend:
                        "verified": True, "protected": protected, "target_entity_ids": targets}
             return {"tool": name, "status": "ok", "result": payload}
         if name == "web_search":
+            if self.web_search_fixtures:
+                return {"tool": name, "status": "ok", "result": {
+                    "results": [dict(item) for item in self.web_search_fixtures.pop(0)],
+                }}
             query = str(arguments.get("query", ""))
             entries = None
             for title, hits in self.web_index.items():
@@ -332,6 +338,17 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": {
                 "results": [{"title": e["canonical_identity"]["title"], "url": "https://example.invalid/x",
                              "snippet": f"{e['canonical_identity']['title']} is a {e['media_type']}."} for e in entries],
+            }}
+        if name == "web_fetch":
+            url = str(arguments.get("url", ""))
+            if url in self.web_fetch_failures:
+                return {"tool": name, "status": "error", "result": {
+                    "url": url,
+                    "error": "fixture fetch failure",
+                }}
+            return {"tool": name, "status": "ok", "result": {
+                "url": url,
+                "content": f"Fixture article body for {url}.",
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
@@ -1769,6 +1786,113 @@ async def test_active_camera_context_survives_an_interleaved_media_question(sess
     assert any(name == "frigate_snapshot" for name, _ in session.backend.call_log[-1:]), (
         "the retained camera event must still route a live-presence follow-up correctly after the media detour"
     )
+
+
+# --- Bounded deep-news evidence recovery ----------------------------------
+# A model that returns no follow-up calls after discovery must not prevent
+# recovery-search evidence from being fetched. These fixtures use multiple
+# domains so a first-search-only fetch block cannot accidentally satisfy the
+# deep-research readiness contract.
+
+@pytest.mark.asyncio
+async def test_deep_news_recovery_fetches_results_from_each_search(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Initial discovery", "url": "https://wire.test/initial", "snippet": "Initial report."}],
+        [{"title": "Recovery source", "url": "https://public.test/recovery", "snippet": "Independent report."}],
+        [{"title": "Follow-up source", "url": "https://regional.test/follow-up", "snippet": "Regional report."}],
+    ]
+
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    profile = session.app.research_profile(user_text)
+    search_calls = [arguments for name, arguments in session.backend.call_log if name == "web_search"]
+    fetch_calls = [arguments for name, arguments in session.backend.call_log if name == "web_fetch"]
+    fetched_domains = {
+        re.match(r"https?://([^/]+)", str(arguments["url"])).group(1)
+        for arguments in fetch_calls
+    }
+
+    assert len(search_calls) == 3, "deep recovery must issue all three successful discovery searches"
+    assert len(fetch_calls) >= 2, "recovery-search results must be fetched as evidence, not only searched"
+    assert len(fetched_domains) >= 2, "deep evidence must include fetched sources from different domains"
+    assert len(session.backend.call_log) <= profile["max_calls"]
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_fetch_failure_still_reaches_successful_evidence(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    failed_url = "https://failed.test/initial"
+    later_url = "https://later.test/initial"
+    recovery_url = "https://recovery.test/update"
+    session.backend.web_search_fixtures = [
+        [
+            {"title": "Failed fetch", "url": failed_url, "snippet": "Unavailable report."},
+            {"title": "Later candidate", "url": later_url, "snippet": "Available report."},
+        ],
+        [{"title": "Recovery evidence", "url": recovery_url, "snippet": "Recovery report."}],
+        [{"title": "Third discovery", "url": "https://third.test/context", "snippet": "Context report."}],
+    ]
+    session.backend.web_fetch_failures.add(failed_url)
+
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    profile = session.app.research_profile(user_text)
+    fetch_calls = [arguments for name, arguments in session.backend.call_log if name == "web_fetch"]
+    assert failed_url in [arguments["url"] for arguments in fetch_calls]
+    assert later_url in [arguments["url"] for arguments in fetch_calls], "a failed first candidate must not stop later candidates"
+    assert recovery_url in [arguments["url"] for arguments in fetch_calls], "recovery-search candidates must still be scheduled"
+    assert len(session.backend.call_log) <= profile["max_calls"]
+
+    assert session.last_stream_payload is not None
+    successful_fetch_messages = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+        and json.loads(message["content"]).get("content")
+    ]
+    assert len(successful_fetch_messages) >= profile["minimum_fetches"], (
+        "a failed fetch must not count as one of the required successful deep-research fetches"
+    )
+    assert any(message.get("url") == later_url for message in successful_fetch_messages)
+
+
+@pytest.mark.asyncio
+async def test_deep_news_model_calls_never_exceed_research_budget(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [
+            {"title": f"Source {index}A", "url": f"https://source-{index}-a.test/news", "snippet": "Report A."},
+            {"title": f"Source {index}B", "url": f"https://source-{index}-b.test/news", "snippet": "Report B."},
+        ]
+        for index in range(8)
+    ]
+
+    def search_call(index: int) -> dict:
+        return {"function": {"name": "web_search", "arguments": {"query": f"Canada technology news {index}"}}}
+
+    await session.turn(
+        user_text,
+        ollama_script=[
+            {"message": {"content": "", "tool_calls": [search_call(index)]}}
+            for index in range(4)
+        ] + [{"message": {"content": "", "tool_calls": [search_call(index) for index in range(4, 8)]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    assert len(session.backend.call_log) <= session.app.research_profile(user_text)["max_calls"]
 
 
 # --- Real production transcript replay (UnresolvedSubject / relevance gate) -

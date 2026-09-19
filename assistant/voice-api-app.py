@@ -5848,7 +5848,44 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             return
         full = ""
         research_calls = 0
-        researched_urls: set[str] = set()
+        attempted_research_urls: set[str] = set()
+        successful_research_domains: set[str] = set()
+
+        async def fetch_search_evidence(search_result: dict) -> None:
+            """Fetch bounded, diverse article evidence for one successful search."""
+            nonlocal research_calls
+            if search_result.get("status") != "ok" or not isinstance(search_result.get("result"), dict):
+                return
+            max_calls = int(profile["max_calls"])
+            fetch_limit = {"quick": 0, "normal": 1, "deep": 2}.get(str(profile["mode"]), 0)
+            candidates = research_fetch_candidates(
+                search_result["result"],
+                attempted_research_urls,
+                successful_research_domains,
+                min(fetch_limit, max_calls - research_calls),
+            )
+            for url in candidates:
+                if research_calls >= max_calls:
+                    break
+                attempted_research_urls.add(url)
+                fetched = await invoke_tool(
+                    "web_fetch",
+                    enrich_research_arguments("web_fetch", {"url": url}, profile, user_text),
+                    client_id,
+                    request_id,
+                )
+                research_calls += 1
+                live_results.append(fetched)
+                fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+                messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(
+                    compact_research_result("web_fetch", fetched_result, deep=profile["mode"] == "deep"),
+                    separators=(",", ":"),
+                )})
+                if fetched.get("status") == "ok" and str(fetched_result.get("content") or "").strip():
+                    domain_match = re.match(r"^https?://([^/?#]+)", url, re.I)
+                    if domain_match:
+                        successful_research_domains.add(domain_match.group(1).casefold().removeprefix("www."))
+
         for _ in range(int(profile["iterations"])):
             discovery_audit({
                 "event": "ollama_request",
@@ -5885,10 +5922,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     research_calls += 1
                     live_results.append(followup)
                     messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
+                    await fetch_search_evidence(followup)
                     continue
                 break
             messages.append(message)
-            for call in calls[: min(4, int(profile["max_calls"]) - research_calls)]:
+            for call in calls[:4]:
+                if research_calls >= int(profile["max_calls"]):
+                    break
                 fn = call.get("function", {})
                 name, arguments = fn.get("name"), fn.get("arguments", {})
                 if name in MODEL_FACING_EXCLUDED_TOOLS:
@@ -5929,19 +5969,6 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                         "status": result.get("status"), "timestamp": time.time()
                     }
                 live_results.append(result)
-                if name == "web_search" and result.get("status") == "ok" and isinstance(result.get("result"), dict):
-                    candidates_for_fetch = result["result"].get("results") or []
-                    fetch_limit = 2 if profile["mode"] == "deep" else 1 if profile["mode"] == "normal" else 0
-                    for candidate in candidates_for_fetch:
-                        url = str(candidate.get("url") or "").strip()
-                        if not url or url in researched_urls or research_calls >= int(profile["max_calls"]) or fetch_limit <= 0:
-                            continue
-                        researched_urls.add(url)
-                        fetched = await invoke_tool("web_fetch", {"url": url, "max_chars": 9000 if profile["mode"] == "deep" else 6000, "extract": "article"}, client_id, request_id)
-                        research_calls += 1
-                        live_results.append(fetched)
-                        messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(compact_research_result("web_fetch", fetched.get("result", {}) if isinstance(fetched.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
-                        fetch_limit -= 1
                 if result.get("status") == "confirmation_required":
                     pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": client_id, "expires": time.time() + 60}
                     messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
@@ -5950,6 +5977,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
                     record_tool_referent(client_id, name, arguments, result)
+                if name == "web_search":
+                    await fetch_search_evidence(result)
             if research_calls >= int(profile["max_calls"]):
                 break
         if live_results:
