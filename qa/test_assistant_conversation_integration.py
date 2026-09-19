@@ -790,7 +790,7 @@ async def test_home_result_set_exclusion_control_and_reconciliation(session):
     first = await session.turn("What's on?")
     assert "Office Light" in first and "Hallway Light" in first
     controlled = await session.turn("Turn those off except the hallway.")
-    assert "excluded" in controlled.casefold()
+    assert "protected: router" in controlled.casefold()
     assert session.backend.home_entities["light.office"]["state"] == "off"
     assert session.backend.home_entities["light.hall"]["state"] == "on"
     assert session.backend.home_entities["switch.router"]["state"] == "on"
@@ -807,7 +807,7 @@ async def test_home_exact_brightness_and_bulk_protected_load(session):
     bulk = await session.turn("Turn everything off.", ollama_script=[{"message": {"content": "", "tool_calls": [
         {"function": {"name": "home_control", "arguments": {"entity_or_area": "everything", "action": "turn_off"}}}
     ]}}])
-    assert "excluded" in bulk.casefold()
+    assert "protected: router" in bulk.casefold()
     assert session.backend.home_entities["switch.router"]["state"] == "on"
 
 
