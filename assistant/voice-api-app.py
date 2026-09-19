@@ -3864,10 +3864,101 @@ def research_profile(text: str) -> dict[str, int | str]:
     """Choose a bounded web-research budget from explicit user intent."""
     lowered = text.casefold()
     if re.search(r"\b(in[- ]depth|deep dive|deeply|comprehensive|thorough|full picture|detailed review|properly research|research this)\b", lowered):
-        return {"mode": "deep", "iterations": 8, "max_calls": 16, "num_predict": 720}
+        return {"mode": "deep", "iterations": 8, "max_calls": 16, "num_predict": 720, "minimum_searches": 3, "minimum_fetches": 2}
     if re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered):
-        return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360}
-    return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180}
+        return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360, "minimum_searches": 1, "minimum_fetches": 1}
+    return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180, "minimum_searches": 1, "minimum_fetches": 0}
+
+
+def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: set[str], limit: int) -> list[str]:
+    """Choose normalized fetch URLs, favoring primary sources and coverage diversity."""
+    def normalized_url(value: object) -> tuple[str, str] | None:
+        match = re.match(r"^(https?)://([^/?#]+)([^#]*)$", str(value or "").strip(), re.I)
+        if not match:
+            return None
+        scheme, domain, path = match.groups()
+        domain = domain.casefold().removeprefix("www.")
+        if not domain:
+            return None
+        return f"{scheme.casefold()}://{domain}{path}", domain
+
+    normalized_seen_urls = {
+        normalized[0] for value in seen_urls if (normalized := normalized_url(value))
+    }
+    normalized_seen_domains = {str(value).casefold().removeprefix("www.") for value in seen_domains}
+    options = []
+    for index, item in enumerate(result.get("results", []) if isinstance(result, dict) else []):
+        normalized = normalized_url(item.get("url") if isinstance(item, dict) else None)
+        if normalized is None or normalized[0] in normalized_seen_urls:
+            continue
+        url, domain = normalized
+        if any(existing[1] == url for existing in options):
+            continue
+        authoritative = domain.endswith(".gc.ca") or domain.endswith(".gov") or ".gov." in domain or domain.startswith("gov.")
+        options.append((index, url, domain, authoritative))
+
+    selected = []
+    selected_domains = set(normalized_seen_domains)
+    while options and len(selected) < max(limit, 0):
+        choice = min(
+            options,
+            key=lambda option: (
+                0 if option[3] else 1,
+                0 if option[2] not in selected_domains else 1,
+                option[0],
+            ),
+        )
+        options.remove(choice)
+        selected.append(choice[1])
+        selected_domains.add(choice[2])
+    return selected
+
+
+def research_evidence_shape(live_results: list[dict]) -> dict[str, int]:
+    """Summarize successful web evidence without making network calls."""
+    successful_searches = 0
+    successful_fetches = 0
+    fetched_urls = set()
+    fetched_domains = set()
+    for item in live_results:
+        if not isinstance(item, dict) or item.get("status") != "ok":
+            continue
+        if item.get("tool") == "web_search":
+            successful_searches += 1
+            continue
+        if item.get("tool") != "web_fetch":
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if not str(result.get("content") or "").strip():
+            continue
+        successful_fetches += 1
+        match = re.match(r"^https?://([^/?#]+)", str(result.get("url") or "").strip(), re.I)
+        if not match:
+            continue
+        url = re.sub(r"#.*$", "", str(result["url"]).strip())
+        domain = match.group(1).casefold().removeprefix("www.")
+        fetched_urls.add(url)
+        fetched_domains.add(domain)
+    return {
+        "successful_searches": successful_searches,
+        "successful_fetches": successful_fetches,
+        "distinct_fetched_urls": len(fetched_urls),
+        "distinct_fetched_domains": len(fetched_domains),
+    }
+
+
+def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) -> bool:
+    """Require independently fetched evidence before a deep-research answer."""
+    evidence = research_evidence_shape(live_results)
+    if evidence["successful_searches"] < 3:
+        return False
+    if not candidate_urls_exist:
+        return True
+    return (
+        evidence["successful_fetches"] >= 2
+        and evidence["distinct_fetched_urls"] >= 2
+        and evidence["distinct_fetched_domains"] >= 2
+    )
 
 
 def compact_research_result(name: str, result: dict, *, deep: bool = False) -> dict:
