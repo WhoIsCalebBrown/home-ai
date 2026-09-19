@@ -1045,26 +1045,61 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
             rf"\b{person_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{office_title}\b",
             rf"\b(?:the\s+)?(?:current\s+)?{office_title}\s+(?:is|remains)\s+{person_name}\b",
         )
-        fetched_evidence = "\n".join(
-            str(item.get("result", {}).get("content") or "")
+        fetched_articles = [
+            (
+                (domain_match.group(1).casefold().removeprefix("www.") if (domain_match := re.match(
+                    r"^https?://([^/?#]+)", str(item.get("result", {}).get("url") or "").strip(), re.I
+                )) else ""),
+                str(item.get("result", {}).get("content") or ""),
+            )
             for item in results
             if item.get("tool") == "web_fetch"
             and item.get("status") == "ok"
             and isinstance(item.get("result"), dict)
-        ).casefold()
+            and str(item.get("result", {}).get("content") or "").strip()
+        ]
         claimed_holders = [
             (match.group("name"), match.group("title"))
             for pattern in office_holder_patterns
             for match in re.finditer(pattern, answer, re.I)
         ]
+
+        refutation_markers = re.compile(
+            r"\b(?:false|reports?|reported|claimed|alleged|denied|former|no\s+longer|not)\b",
+            re.I,
+        )
+
+        def direct_current_role_assertions(content: str) -> list[tuple[str, str]]:
+            assertions = []
+            for sentence in re.split(r"(?<=[.!?])\s+", content):
+                if refutation_markers.search(sentence):
+                    continue
+                assertions.extend(
+                    (match.group("name"), match.group("title"))
+                    for pattern in office_holder_patterns
+                    for match in re.finditer(pattern, sentence, re.I)
+                )
+            return assertions
+
         def fetched_evidence_supports_current_role(name: str, title: str) -> bool:
-            escaped_name = re.escape(name)
-            escaped_title = re.escape(title)
-            relationship_patterns = (
-                rf"\b{escaped_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{escaped_title}\b",
-                rf"\b(?:the\s+)?(?:current\s+)?{escaped_title}\s+(?:is|remains)\s+{escaped_name}\b",
+            normalized_name = re.sub(r"\s+", " ", name).casefold()
+            normalized_title = re.sub(r"\s+", " ", title).casefold()
+            supporting_domains = set()
+            for domain, content in fetched_articles:
+                for asserted_name, asserted_title in direct_current_role_assertions(content):
+                    if re.sub(r"\s+", " ", asserted_title).casefold() != normalized_title:
+                        continue
+                    if re.sub(r"\s+", " ", asserted_name).casefold() != normalized_name:
+                        return False
+                    supporting_domains.add(domain)
+            authoritative = any(
+                domain.endswith(".gc.ca")
+                or domain.endswith(".gov")
+                or ".gov." in domain
+                or domain.startswith("gov.")
+                for domain in supporting_domains
             )
-            return any(re.search(pattern, fetched_evidence, re.I) for pattern in relationship_patterns)
+            return authoritative or len(supporting_domains) >= 2
 
         if any(not fetched_evidence_supports_current_role(name, title) for name, title in claimed_holders):
             return "I can't safely verify that current office-holder from the fetched evidence."

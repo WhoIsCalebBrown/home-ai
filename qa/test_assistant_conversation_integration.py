@@ -1974,7 +1974,7 @@ async def test_deep_news_synthesis_prompt_allows_a_detailed_supported_roundup(se
 async def test_deep_news_office_holder_prompt_prefers_fetched_evidence_to_a_snippet(session):
     """A stale snippet must not be eligible evidence for the current holder."""
     user_text = "Please give me an in-depth review of current Canadian government news."
-    authoritative_url = "https://canada.ca/government/current-holder"
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
     session.backend.web_search_fixtures = [
         [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
         [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
@@ -2006,7 +2006,7 @@ async def test_deep_news_office_holder_prompt_prefers_fetched_evidence_to_a_snip
 async def test_deep_news_rejects_a_current_office_holder_repeated_only_from_a_snippet(session):
     """Repeating a stale snippet holder must fail after deep fetched-only grounding."""
     user_text = "Please give me an in-depth review of current Canadian government news."
-    authoritative_url = "https://canada.ca/government/current-holder"
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
     session.backend.web_search_fixtures = [
         [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
         [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
@@ -2031,7 +2031,7 @@ async def test_deep_news_rejects_a_current_office_holder_repeated_only_from_a_sn
 async def test_deep_news_removes_tool_call_prose_from_the_final_synthesis_prompt(session):
     """A dispatch message's prose must not carry a stale snippet into final synthesis."""
     user_text = "Please give me an in-depth review of current Canadian government news."
-    authoritative_url = "https://canada.ca/government/current-holder"
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
     session.backend.web_search_fixtures = [
         [{"title": "Government update", "url": authoritative_url, "snippet": "Search-result holder."}],
         [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
@@ -2063,7 +2063,7 @@ async def test_deep_news_removes_tool_call_prose_from_the_final_synthesis_prompt
 async def test_deep_news_rejects_current_holder_when_fetched_text_only_names_a_former_holder(session):
     """A fetched name alone cannot support the asserted current office-holder role."""
     user_text = "Please give me an in-depth review of current Canadian government news."
-    authoritative_url = "https://canada.ca/government/current-holder"
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
     session.backend.web_search_fixtures = [
         [{"title": "Government update", "url": authoritative_url, "snippet": "Former Holder is the current office-holder."}],
         [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
@@ -2082,6 +2082,61 @@ async def test_deep_news_rejects_current_holder_when_fetched_text_only_names_a_f
     )
 
     assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_an_attributed_false_report_about_a_current_holder(session):
+    """An attributed, refuted report cannot establish the current office-holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    false_report_url = "https://news-one.example/current-holder"
+    second_url = "https://news-two.example/current-holder"
+    third_url = "https://news-three.example/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Claim report", "url": false_report_url, "snippet": "Former Holder is current."}],
+        [{"title": "Department update", "url": second_url, "snippet": "Current-holder update."}],
+        [{"title": "Background", "url": third_url, "snippet": "Government context."}],
+    ]
+    session.backend.web_fetch_contents[false_report_url] = (
+        "A false report claimed Former Holder is the current office-holder; "
+        "the department says Fetched Holder is. Fetched Holder is the current office-holder."
+    )
+    session.backend.web_fetch_contents[second_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Former Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+
+
+@pytest.mark.asyncio
+async def test_deep_news_accepts_a_current_holder_corroborated_by_independent_fetched_sources(session):
+    """Two independent direct fetched assertions may support the current holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    first_url = "https://news-one.example/current-holder"
+    second_url = "https://news-two.example/current-holder"
+    third_url = "https://news-three.example/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "First current-holder report", "url": first_url, "snippet": "Current-holder update."}],
+        [{"title": "Second current-holder report", "url": second_url, "snippet": "Independent current-holder update."}],
+        [{"title": "Background", "url": third_url, "snippet": "Government context."}],
+    ]
+    session.backend.web_fetch_contents[first_url] = "Corroborated Holder is the current office-holder."
+    session.backend.web_fetch_contents[second_url] = "The current office-holder is Corroborated Holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Corroborated Holder is the current office-holder.",
+    )
+
+    assert reply == "Corroborated Holder is the current office-holder."
 
 
 @pytest.mark.asyncio
