@@ -17,6 +17,8 @@ def _load_helpers():
         "_openai_session_id",
         "_latest_user_message",
         "_is_openwebui_housekeeping_request",
+        "_safe_markdown_text",
+        "openai_tool_trace_footer",
     }
     assignment_names = {"_OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES"}
 
@@ -29,8 +31,9 @@ def _load_helpers():
     selected = [
         node for node in tree.body
         if isinstance(node, ast.Import)
-        and any(alias.name in {"re", "uuid"} for alias in node.names)
+        and any(alias.name in {"html", "re", "uuid"} for alias in node.names)
     ]
+    selected += [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "trace_projection"]
     selected += [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names) or is_needed_assignment(node)]
     namespace["Request"] = object
     namespace["quote"] = quote
@@ -171,3 +174,36 @@ def test_unrecognized_task_shape_is_not_swallowed():
     and a pattern is added deliberately."""
     module = _load_helpers()
     assert module._is_openwebui_housekeeping_request(_body("### Task:\nSummarize this document for me.")) is False
+
+
+def test_rich_footer_names_opened_sources_without_raw_tool_data():
+    module = _load_helpers()
+    footer = module.openai_tool_trace_footer([{
+        "tool": "web_fetch", "action": "Opened source", "status": "complete",
+        "sources": [{
+            "title": "Canada update", "domain": "cbc.ca",
+            "url": "https://cbc.ca/news/update", "kind": "fetched",
+        }],
+    }])
+    assert "<!-- home-ai-display-trace -->" in footer
+    assert "Opened source" in footer
+    assert "[Canada update](https://cbc.ca/news/update)" in footer
+    assert "web_fetch" not in footer
+
+
+def test_rich_footer_deduplicates_and_bounds_safe_projected_sources():
+    module = _load_helpers()
+    trace = [{
+        "tool": "web_fetch", "action": "Opened source", "status": "complete",
+        "sources": [{
+            "title": "Safe source", "domain": "example.com",
+            "url": "https://example.com/story?token=secret", "kind": "fetched",
+            "query": "household terms", "content": "never display",
+        }] * 4,
+    }] * 13
+    footer = module.openai_tool_trace_footer(trace)
+    assert footer.count("Safe source") == 1
+    assert footer.count("Opened source") <= 12
+    assert "token=secret" not in footer
+    assert "household terms" not in footer
+    assert "never display" not in footer

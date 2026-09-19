@@ -3,6 +3,7 @@ import base64
 import contextvars
 import hashlib
 import hmac
+import html
 import io
 import json
 import os
@@ -26,6 +27,7 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
 from tts_audio import prepend_silence
+from trace_projection import MAX_SOURCES_PER_SEARCH, MAX_TRACE_ENTRIES, clean_text, project_trace, safe_display_url
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -1967,6 +1969,11 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str 
     # or clip the start of a chunk.
     for chunk in speakable_chunks(prepared):
         await speak(ws, request_id, chunk, prepared=True)
+
+
+async def emit_trace(ws: WebSocket, request_id: str, live_results: list[dict]) -> None:
+    """Send only the bounded display projection to graphical clients."""
+    await ws.send_json({"type": "trace", "request_id": request_id, "entries": project_trace(live_results)})
 
 
 def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) -> dict:
@@ -5392,7 +5399,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 conversation_context[client_id] = context_after
                 resolved_text = f"I still couldn't confirm a match for {enriched.title_or_name}, even with that detail."
             store_provenance(client_id, live_results_enriched)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_enriched)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="unresolved_subject_enrichment")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5448,7 +5455,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if plan_result.get("current_state") != "NO_TITLE_GIVEN":
                     stage_unresolved_media_subject(client_id, candidate_title, media_type=extract_media_type_hint(user_text))
             store_provenance(client_id, live_results_clarified)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_clarified)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="title_clarification_reply")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5505,7 +5512,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if offer_question:
                     resolved_text = f"{resolved_text} {offer_question}"
             store_provenance(client_id, live_results_resolved)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_resolved)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="disambiguation_resolved")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5718,7 +5725,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             full = direct or "I couldn't retry the previous Home Assistant command."
             await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": result.get("tool"), "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, [result])
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         if social_acknowledgement(user_text):
@@ -5920,7 +5927,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if live_results and re.search(r"\b(how many|count|storage|space|free|left|summary|overview)\b", user_text, re.I):
             if any(item.get("tool") in {"list_containers", "get_storage_status"} and item.get("status") == "ok" for item in live_results):
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 count = next((item.get("result", {}).get("count") for item in live_results if item.get("tool") == "list_containers"), None)
                 overview = next((item.get("result", {}) for item in live_results if item.get("tool") == "get_server_overview"), {})
                 if re.search(r"\b(summary|overview)\b", user_text, re.I) and count is not None:
@@ -5947,7 +5954,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if event_result is not None:
                 store_provenance(client_id, live_results)
                 full = grounded_camera_presence_answer(event_result)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, full, client_id=client_id)
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -5958,7 +5965,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 direct = grounded_recent_activity_answer(activity_result)
                 if direct:
                     store_provenance(client_id, live_results)
-                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_trace(ws, request_id, live_results)
                     await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_recent_activity")
                     history.append({"role": "assistant", "content": direct})
                     await ws.send_json({"type": "done", "request_id": request_id})
@@ -5969,7 +5976,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 direct = grounded_event_timing_answer(details_result)
                 if direct:
                     store_provenance(client_id, live_results)
-                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_trace(ws, request_id, live_results)
                     await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_event_timing")
                     history.append({"role": "assistant", "content": direct})
                     await ws.send_json({"type": "done", "request_id": request_id})
@@ -5979,7 +5986,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             direct = grounded_investigation_answer(investigation, user_text)
             if direct:
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, direct, client_id=client_id)
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -5987,7 +5994,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         identification_direct = canonical_identification_answer(live_results) if context.get("operation") == "MEDIA_DISCOVERY" else None
         if identification_direct:
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, identification_direct, client_id=client_id, origin="canonical_media_identification")
             history.append({"role": "assistant", "content": identification_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5995,7 +6002,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         library_direct = canonical_library_answer(live_results) if context.get("operation") == "MEDIA_LIBRARY_QUERY" else None
         if library_direct:
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, library_direct, client_id=client_id, origin="canonical_media_library")
             history.append({"role": "assistant", "content": library_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -6034,7 +6041,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     if guessed_title:
                         stage_unresolved_media_subject(client_id, guessed_title, media_type=extract_media_type_hint(user_text))
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
             history.append({"role": "assistant", "content": media_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -6048,7 +6055,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                         direct = executed
                         break
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_structured")
             history.append({"role": "assistant", "content": direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -6124,7 +6131,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # Do not ask Qwen to improvise around a total live-tool outage.
             full = unavailable_live_answer(user_text)
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, full, client_id=client_id, origin="all_live_tools_failed")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -6304,7 +6311,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if not deep_research_ready(live_results, candidate_urls_exist):
                 full = "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, full, client_id=client_id, origin="deep_research_incomplete")
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -6368,7 +6375,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                                 else:
                                     post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")
                 history.append({"role": "assistant", "content": post_direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -6394,7 +6401,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if evidence_messages:
                 evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
                 messages.extend(evidence_messages)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
         else:
             grounding_results = live_results
         # The Qwen tool-dispatch loop above appends a raw {"role": "tool",
@@ -6722,7 +6729,7 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     # boundary to split on -- without it, two joined duplicate answers read
     # as a single run-on sentence ("running.You've") that never collapses.
     answer = collapse_repeated_sentences(" ".join(str(item.get("text", "")) for item in sink.messages if item.get("type") == "text").strip())
-    trace = next((item.get("tools", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
+    trace = next((item.get("entries", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
     if not answer:
         raise HTTPException(502, detail="Home-AI produced no assistant response")
     discovery_audit({"event": "openai_turn_complete", **correlation,
@@ -6732,19 +6739,45 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     return answer, client_id, trace
 
 
+def _safe_markdown_text(value: object, limit: int) -> str:
+    """Render projected remote text as Markdown text, never Markdown syntax."""
+    return (html.escape(clean_text(value, limit), quote=True)
+            .replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]"))
+
+
 def openai_tool_trace_footer(trace: list[dict]) -> str:
-    """Make the existing bounded trace visible in Open WebUI chat output."""
-    if not trace:
+    """Render the bounded server trace as Open WebUI-safe Markdown."""
+    if not isinstance(trace, list) or not trace:
         return ""
-    rows = []
-    for item in trace:
-        tool = str(item.get("tool") or "unknown")
-        status = str(item.get("status") or "unknown").replace("_", " ")
-        rows.append(f"- `{tool}` — {status}")
-    # Keep this as ordinary Markdown because Open WebUI may display raw HTML
-    # rather than sanitizing it into a hidden DOM region. The speech endpoint
-    # removes this diagnostic section before sending text to Pocket.
-    return "\n\n---\n**Tools used**\n" + "\n".join(rows)
+    rows: list[str] = []
+    seen_urls: set[str] = set()
+    statuses = {"complete", "no results", "failed"}
+    for item in trace[:MAX_TRACE_ENTRIES]:
+        if not isinstance(item, dict):
+            continue
+        action = _safe_markdown_text(item.get("action"), 100) or "Used an assistant tool"
+        status = str(item.get("status") or "")
+        rows.append(f"- {action} — {status if status in statuses else 'complete'}")
+        sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+        for source in sources[:MAX_SOURCES_PER_SEARCH]:
+            if not isinstance(source, dict):
+                continue
+            url = safe_display_url(source.get("url")) if isinstance(source.get("url"), str) else None
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            title = _safe_markdown_text(source.get("title"), 180)
+            domain = _safe_markdown_text(source.get("domain"), 253)
+            label = title or domain or "Source"
+            if url:
+                markdown_url = url.replace(")", "\\)")
+                label = f"[{label}]({markdown_url})"
+            rows.append(f"  - {label}" + (f" — {domain}" if title and domain else ""))
+    if not rows:
+        return ""
+    # This exact marker is the display/speech boundary consumed by Task 5.
+    return "\n\n<!-- home-ai-display-trace -->\n---\n**Research activity**\n" + "\n".join(rows)
 
 
 def remove_openai_tool_trace(text: str) -> str:
