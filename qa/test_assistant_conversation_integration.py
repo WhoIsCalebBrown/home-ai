@@ -3166,6 +3166,65 @@ async def test_media_clarification_new_read_request_does_not_inherit_write_inten
     assert session.client_id not in session.app.pending
 
 
+@pytest.mark.parametrize("reply", [
+    "Do I have the 2021 one?",
+    "Is the 2021 one in my library?",
+    "No, not the 2021 one.",
+])
+@pytest.mark.asyncio
+async def test_media_request_ambiguity_nonaffirmative_reply_never_writes(session, reply):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn("Request Dune.")
+    original = session.app.conversation_context[session.client_id]["pending_disambiguation"]
+    await session.turn(reply)
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert session.app.conversation_context[session.client_id]["pending_disambiguation"] == original
+
+
+@pytest.mark.parametrize("text", [
+    "Can you give me information about the movie Dune?",
+    "Can you find out about the movie Dune?",
+    "Do not request the movie Dune.",
+])
+@pytest.mark.asyncio
+async def test_media_information_and_negation_never_authorize_request(session, text):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn(text, ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+    ]}}])
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("request_text,selection", [
+    ("Request the movie Dune from 2021.", None),
+    ("Request Dune.", "The 2021 one."),
+    ("Request Dune.", "The new one."),
+])
+@pytest.mark.asyncio
+async def test_positive_media_authorization_executes_one_exact_binding(session, request_text, selection):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn(request_text)
+    if selection:
+        assert not session.backend.media_execution_calls
+        await session.turn(selection)
+    assert len(session.backend.media_execution_calls) == 1
+    assert len(session.backend.submitted_writes) == 1
+    call = session.backend.media_execution_calls[0]
+    record = session.backend.planner_confirmations[-1]
+    assert call["confirmed"] is True
+    assert call["action_id"] == record["confirmation_id"]
+    assert call["arguments"]["confirmation_context"] is record
+    assert call["arguments"]["canonical_external_id"] == "438631"
+    assert call["arguments"]["session_id"] == session.client_id
+    assert session.client_id not in session.app.pending
+
+
 @pytest.mark.asyncio
 async def test_knowledge_to_availability_handoff(session):
     """Item 12: descriptive discovery resolves identity (read-only) and

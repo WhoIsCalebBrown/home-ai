@@ -2386,10 +2386,15 @@ def media_acquisition_language(text: str) -> bool:
 
 
 def informational_media_continuation(text: str) -> bool:
-    """Recognize an initial desire to learn about media, not acquire it."""
+    """Recognize requests to learn about media rather than acquire it."""
     return bool(re.match(
         r"\s*i\s+(?:want|need)\s+to\s+(?:know|find\s+out|remember|learn|"
         r"figure\s+out|identify|understand|see|check)\b",
+        text,
+        re.I,
+    ) or re.search(
+        r"\bfind\s+out\b|\b(?:give|get|request|want|need|obtain)\s+"
+        r"(?:me\s+)?(?:some\s+)?(?:information|info|details|facts|a\s+summary)\b",
         text,
         re.I,
     ))
@@ -2429,6 +2434,13 @@ def media_acquisition_request_frame(text: str) -> bool:
     # Keep these bounded informational continuations ahead of the
     # descriptive `I want/need ... movie` frame.
     if informational_media_continuation(text):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|not|never|without)\s+"
+        r"(?:get|give|grab|add|find|request|want|obtain|requesting|adding|getting)\b",
+        text,
+        re.I,
+    ):
         return False
     return bool(
         re.match(
@@ -2487,8 +2499,7 @@ def media_intent(text: str, context: dict | None = None) -> str | None:
         return "MEDIA_DISCOVERY"
     descriptive_clue = _descriptive_media_clue(text)
     descriptive_media = descriptive_clue and media_identity_signal(text)
-    if ((media_goal_request(text) and (not descriptive_clue or media_acquisition_request_frame(text)))
-            or (media_acquisition_request_frame(text) and descriptive_clue)):
+    if media_acquisition_request_frame(text) and (media_identity_signal(text) or descriptive_clue):
         return "MEDIA_REQUEST"
     if descriptive_media or (discovery_question(text) and media_identity_signal(text)):
         return "MEDIA_DISCOVERY"
@@ -4774,6 +4785,39 @@ def _title_clarification_expired(entry: dict) -> bool:
     return time.time() - float(entry.get("created_at", 0)) > _TITLE_CLARIFICATION_TTL_SECONDS
 
 
+def affirmative_media_selection(text: str, candidates: list[dict]) -> bool:
+    """Require selection language before carrying a prior request's authority.
+
+    Mentioning a candidate's year in a question or rejection is identity
+    evidence, not permission to execute the original request.
+    """
+    if media_acquisition_request_frame(text):
+        return True
+    selection = text.strip().casefold().rstrip(".!?")
+    selection = re.sub(r"^(?:yes|yeah|yep|okay|ok|sure)[,.]?\s+", "", selection)
+    selection = re.sub(r"^(?:i\s+(?:mean|meant|choose|prefer)|let's\s+go\s+with)\s+", "", selection)
+    if re.fullmatch(
+        r"(?:the\s+)?(?:(?:19|20)\d{2}|new|newer|newest|latest|recent|old|older|oldest|"
+        r"original|first|second|movie|film|album|record|show|series|anime|game)"
+        r"(?:\s+(?:one|movie|film|version))?",
+        selection,
+    ):
+        return True
+    for candidate in candidates:
+        title = str(candidate.get("title") or "").strip().casefold()
+        year = candidate.get("year")
+        if title and selection in {title, f"{title} {year}", f"{title} from {year}", f"{title} ({year})"}:
+            return True
+        people = candidate.get("people") or []
+        if isinstance(people, str):
+            people = [people]
+        if isinstance(people, list) and any(
+            selection == f"the {str(person).strip().casefold()} one" for person in people
+        ):
+            return True
+    return False
+
+
 def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | None:
     """Match a natural reply to exactly one candidate, or return None.
 
@@ -5432,7 +5476,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # block every media-type-word reply from ever resolving.
         disambiguation_domain = explicit_domain(user_text)
         has_competing_intent = disambiguation_domain is not None and disambiguation_domain != "media"
-        resolved = None if has_competing_intent else resolve_disambiguation_reply(user_text, candidates)
+        affirmative_selection = affirmative_media_selection(user_text, candidates)
+        resolved = None if has_competing_intent or not affirmative_selection else resolve_disambiguation_reply(user_text, candidates)
         if resolved is not None:
             context_cleared = dict(conversation_context.get(client_id, {}))
             context_cleared.pop("pending_disambiguation", None)
