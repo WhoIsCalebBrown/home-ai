@@ -3900,13 +3900,18 @@ def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: s
     selected = []
     selected_domains = set(normalized_seen_domains)
     while options and len(selected) < max(limit, 0):
+        def candidate_rank(option: tuple[int, str, str, bool]) -> tuple[int, int, int]:
+            if not selected:
+                return (0 if option[3] else 1, 0, option[0])
+            return (
+                0 if option[2] not in selected_domains else 1,
+                0 if option[3] else 1,
+                option[0],
+            )
+
         choice = min(
             options,
-            key=lambda option: (
-                0 if option[3] else 1,
-                0 if option[2] not in selected_domains else 1,
-                option[0],
-            ),
+            key=candidate_rank,
         )
         options.remove(choice)
         selected.append(choice[1])

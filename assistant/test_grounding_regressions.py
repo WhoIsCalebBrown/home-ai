@@ -920,6 +920,20 @@ def test_research_fetch_candidates_deduplicates_and_prioritizes_diverse_authorit
     ]
 
 
+def test_research_fetch_candidates_choose_a_new_domain_before_a_second_authoritative_url():
+    result = {
+        "results": [
+            {"url": "https://canada.gc.ca/releases/one"},
+            {"url": "https://canada.gc.ca/releases/two"},
+            {"url": "https://commercial.example/report"},
+        ]
+    }
+    assert research_fetch_candidates(result, set(), set(), 2) == [
+        "https://canada.gc.ca/releases/one",
+        "https://commercial.example/report",
+    ]
+
+
 def test_research_evidence_shape_counts_successful_distinct_fetches():
     evidence = [
         {"tool": "web_search", "status": "ok", "result": {"results": []}},
