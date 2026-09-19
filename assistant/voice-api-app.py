@@ -2419,7 +2419,7 @@ def media_library_query(text: str) -> bool:
                 or re.search(r"\bplex\b.*\b(?:do i have|do we have|is there)\b", text, re.I))
 
 
-def media_intent(text: str) -> str | None:
+def media_intent(text: str, context: dict | None = None) -> str | None:
     """Classify which media OPERATION an utterance is asking for, before
     any title/media-identity resolution happens. Not every sentence that
     contains a potential title means "request this" -- a status check, a
@@ -2431,7 +2431,9 @@ def media_intent(text: str) -> str | None:
     named, testable classification rather than duplicating their logic --
     each of those predicates remains the actual routing authority; this
     function documents and verifies their combined, mutually-exclusive
-    intent surface for the media domain.
+    intent surface for the media domain. ``context`` is accepted so callers
+    can classify an operation against the same per-turn contract they use to
+    stage it; current explicit utterances remain authoritative.
     """
     if direct_file_request(text):
         return None
@@ -2441,9 +2443,9 @@ def media_intent(text: str) -> str | None:
         return "MEDIA_STATUS"
     if media_library_query(text):
         return "MEDIA_LIBRARY_QUERY"
-    if media_goal_request(text):
+    if media_goal_request(text) or (media_acquisition_language(text) and _descriptive_media_clue(text)):
         return "MEDIA_REQUEST"
-    if discovery_question(text) and media_identity_signal(text):
+    if _descriptive_media_clue(text) or (discovery_question(text) and media_identity_signal(text)):
         return "MEDIA_DISCOVERY"
     return None
 
@@ -2651,7 +2653,7 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
     # here made an unrelated successful turn silently re-promote stale state;
     # the bounded branches below are the only places where an elliptical
     # follow-up is allowed to carry an operation forward.
-    operation = media_intent(text)
+    operation = media_intent(text, context)
     scope: dict = {}
     names = {name for name, _ in planned}
     if "media_plan_goal" in names and (referential_media_request(text, context) or media_acquisition_language(text)):
@@ -2738,7 +2740,7 @@ def media_status_question(text: str) -> bool:
     # because the movie's own multi-word capitalized TITLE matched the
     # same two-Title-Case-words shape used to detect a person's name.
     strong_status_marker = re.search(
-        r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b"
+        r"\b(?:request|download(?:ing|ed)?)\b.{0,25}\b(?:going|doing|done|finish(?:ed)?|status|ready)\b"
         r"|\bstatus\s+of\b"
         r"|\bdownload(?:ed|ing)?\s+yet\b",
         routed_text, re.I,

@@ -1696,6 +1696,30 @@ def test_media_intent_classifies_the_five_operation_shapes():
     assert media_intent("Play The Room.") == "MEDIA_PLAY"
 
 
+@pytest.mark.parametrize(("text", "expected"), [
+    ("What's that movie where two cops dress as blonde women?", "MEDIA_DISCOVERY"),
+    ("Do I have White Chicks in Plex?", "MEDIA_LIBRARY_QUERY"),
+    ("Can you request White Chicks?", "MEDIA_REQUEST"),
+    ("How is my White Chicks request doing?", "MEDIA_STATUS"),
+    ("Play White Chicks in the living room", "MEDIA_PLAY"),
+])
+def test_media_operation_contract(text, expected):
+    assert media_intent(text, {}) == expected
+
+
+def test_media_operation_contract_precedence_negatives():
+    assert media_intent("What is White Chicks about?", {}) == "MEDIA_DISCOVERY"
+    assert media_intent("Can you play the trailer?", {}) == "MEDIA_PLAY"
+    assert media_intent("How is my White Chicks download doing?", {}) == "MEDIA_STATUS"
+
+
+def test_descriptive_media_operation_is_preserved_for_media_plan_goal():
+    text = "What's that movie where two cops dress as blonde women?"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
 def test_media_intent_titleless_request_is_still_media_request():
     """"Can you add a movie?" has intent=MEDIA_REQUEST with no title yet --
     that is exactly the NO_TITLE_GIVEN case media_plan_goal already handles
