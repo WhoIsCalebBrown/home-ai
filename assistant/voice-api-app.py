@@ -2407,6 +2407,23 @@ def media_goal_request(text: str) -> bool:
     )
 
 
+def media_acquisition_request_frame(text: str) -> bool:
+    """Recognize an acquisition verb used as the user's actual request.
+
+    Plot descriptions routinely contain words such as ``get`` and ``find``;
+    those words only mean acquisition when they begin an imperative or an
+    explicit request frame. This narrower predicate is intentionally used
+    only where a title-shaped subject is otherwise already present.
+    """
+    return bool(re.match(
+        r"\s*(?:(?:can|could|would|will)\s+(?:you|i)\s+|"
+        r"i\s+(?:want|need)\s+(?:to\s+)?|i(?:'d| would)\s+like\s+(?:to\s+)?|"
+        r"please\s+)?(?:get|give|grab|add|find|request|want|obtain)\b",
+        text,
+        re.I,
+    ))
+
+
 def media_library_query(text: str) -> bool:
     """"Do I have X on Plex?" / "Do I have any movies on my server?" -- a
     question about what is already IN the library, distinct from a request
@@ -2443,9 +2460,16 @@ def media_intent(text: str, context: dict | None = None) -> str | None:
         return "MEDIA_STATUS"
     if media_library_query(text):
         return "MEDIA_LIBRARY_QUERY"
-    if media_goal_request(text) or (media_acquisition_language(text) and _descriptive_media_clue(text)):
+    descriptive_clue = _descriptive_media_clue(text)
+    title_shaped_about_question = bool(
+        re.search(r"\bwhat(?:'s|\s+is)\s+(?:(?:the|that)\s+)?(?:[a-z]+\s+){1,4}[a-z]+\s+about\b", text, re.I)
+        and re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", text)
+    )
+    descriptive_media = descriptive_clue and (media_identity_signal(text) or title_shaped_about_question)
+    if ((media_goal_request(text) and (not descriptive_clue or media_acquisition_request_frame(text)))
+            or (media_acquisition_request_frame(text) and descriptive_clue)):
         return "MEDIA_REQUEST"
-    if _descriptive_media_clue(text) or (discovery_question(text) and media_identity_signal(text)):
+    if descriptive_media or (discovery_question(text) and media_identity_signal(text)):
         return "MEDIA_DISCOVERY"
     return None
 
@@ -2656,8 +2680,13 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
     operation = media_intent(text, context)
     scope: dict = {}
     names = {name for name, _ in planned}
-    if "media_plan_goal" in names and (referential_media_request(text, context) or media_acquisition_language(text)):
-        operation = "MEDIA_REQUEST"
+    if "media_plan_goal" in names:
+        if referential_media_request(text, context) or media_acquisition_request_frame(text):
+            operation = "MEDIA_REQUEST"
+        elif referential_media_library_question(text, context):
+            operation = "MEDIA_LIBRARY_QUERY"
+        elif operation is None:
+            operation = "MEDIA_DISCOVERY"
     elif "plex_library_counts" in names:
         operation = "PLEX_LIBRARY_COUNT"
         category = library_count_category(text)
@@ -2670,8 +2699,6 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
         operation = "STORAGE_CAPACITY"
         if arguments.get("target"):
             scope["target"] = arguments["target"]
-    elif "media_plan_goal" in names and referential_media_library_question(text, context):
-        operation = "MEDIA_LIBRARY_QUERY"
     elif "web_search" in names and referential_web_query(text, context):
         operation = "MEDIA_WEB_RESEARCH"
     return operation, scope
