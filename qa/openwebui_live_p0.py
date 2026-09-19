@@ -17,7 +17,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -35,8 +34,9 @@ SAFE_PROGRESS_LABELS = {
     "Reading Reuters…", "Reading BBC…",
 }
 UNSAFE_DISPLAY_MARKERS = (
-    "household-private-query", "private-source.invalid", "snippet=", "raw snippet",
-    "tool exception", "traceback", "token=", "authorization:",
+    "household-private-query", "private-source.invalid", "raw fixture snippet",
+    "fixture-token-9f1c", "tool exception fixture", "traceback", "token=",
+    "authorization:", "127.0.0.1", "localhost",
 )
 
 
@@ -145,7 +145,6 @@ class OpenWebUILive:
         self.user_id = user_id
         self.safe_mode = safe_mode
         self.client = httpx.Client(timeout=timeout, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-        self.chat_documents: dict[str, dict[str, Any]] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -156,42 +155,16 @@ class OpenWebUILive:
         response = self.client.post(f"{self.base_url}/api/v1/chats/new", json={"chat": chat})
         response.raise_for_status()
         chat_id = str(response.json()["id"])
-        self.chat_documents[chat_id] = chat
         return chat_id
-
-    def _persist_visible_turn(self, chat_id: str, prompt: str, answer: str) -> None:
-        chat = self.chat_documents.get(chat_id)
-        if not chat:
-            return
-        history = chat["history"]
-        messages = history["messages"]
-        parent_id = history.get("currentId")
-        user_message_id = str(uuid.uuid4())
-        assistant_message_id = str(uuid.uuid4())
-        if parent_id in messages:
-            messages[parent_id].setdefault("childrenIds", []).append(user_message_id)
-        messages[user_message_id] = {
-            "id": user_message_id, "parentId": parent_id, "childrenIds": [assistant_message_id],
-            "role": "user", "content": prompt, "timestamp": int(time.time()),
-        }
-        messages[assistant_message_id] = {
-            "id": assistant_message_id, "parentId": user_message_id, "childrenIds": [],
-            "role": "assistant", "content": answer, "done": True, "model": self.model,
-            "timestamp": int(time.time()),
-        }
-        history["currentId"] = assistant_message_id
-        response = self.client.post(f"{self.base_url}/api/v1/chats/{chat_id}", json={"chat": chat})
-        response.raise_for_status()
 
     def progress_source_turn(self, prompt: str, chat_id: str | None = None) -> Turn:
         """Exercise a streamed, read-only progress/source response through Open WebUI.
 
         This is deliberately separate from ``turn`` so normal P0 regression
         coverage keeps its non-streaming contract.  It records monotonic
-        content-event timestamps, validates the bounded persisted display
-        response, and then stores that exact display text in the authenticated
-        disposable chat document for the reload check performed by the browser
-        acceptance procedure.
+        content-event timestamps and validates the stream contract. Persisted
+        UI behavior is deliberately checked only by the browser acceptance
+        script; this HTTP harness never writes an assistant message.
         """
         if WRITE_WORDS.search(prompt) and not self.safe_mode:
             raise ValueError(f"refusing write/confirmation-shaped prompt: {prompt!r}; pass --safe-mode to run non-approving coverage")
@@ -230,7 +203,6 @@ class OpenWebUILive:
             progress_at, answer_at, line_count = _assert_progress_source_display(record.answer, record.stream_events)
             record.progress_before_answer = progress_at < answer_at
             record.persisted_progress_lines = line_count
-            self._persist_visible_turn(chat_id, prompt, record.answer)
             record.tools_footer = _footer(record.answer)
         except Exception as exc:
             record.error = type(exc).__name__ + ": " + str(exc)
@@ -255,7 +227,6 @@ class OpenWebUILive:
             body = response.json()
             record.raw = _redact(body)
             record.answer = _text((body.get("choices") or [{}])[0].get("message", {}).get("content", ""))
-            self._persist_visible_turn(chat_id, prompt, record.answer)
             record.tools_footer = _footer(record.answer)
             record.home_ai_session_id = response.headers.get("x-home-ai-session")
             record.request_id = response.headers.get("x-home-ai-request")
@@ -279,6 +250,14 @@ def _chain(api: OpenWebUILive, prompts: list[str], chat_id: str | None = None) -
 progress_source_probe = FastAPI()
 PROBE_KEY = "progress-source-fixture-key"
 PROBE_MODEL = "home-ai-progress-source-fixture"
+PROBE_RAW_QUERY = "household-private-query"
+PROBE_PRIVATE_URL = "http://private-source.invalid/household?token=fixture-token-9f1c"
+PROBE_SNIPPET = "raw fixture snippet"
+PROBE_TOKEN = "fixture-token-9f1c"
+PROBE_TOOL_ERROR = "tool exception fixture"
+PROBE_HOSTILE_TITLE = '<img src="x" onerror="alert(1)"> [spoof](https://evil.example)'
+PROBE_PROMPT = f"Show the QA fixture for {PROBE_RAW_QUERY}."
+PROBE_BLOCK_SECONDS = 3.0
 PROBE_ANSWER = (
     "Here is the fixture answer.\n\n"
     "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
@@ -310,7 +289,9 @@ async def progress_source_models(request: Request):
 async def progress_source_chat(request: Request):
     _require_probe_auth(request)
     body = await request.json()
-    if body.get("model") != PROBE_MODEL or not body.get("stream"):
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    prompt = " ".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
+    if body.get("model") != PROBE_MODEL or not body.get("stream") or PROBE_RAW_QUERY not in prompt:
         raise HTTPException(400, "fixture accepts only its streamed QA model")
 
     async def events():
@@ -318,7 +299,7 @@ async def progress_source_chat(request: Request):
         yield _probe_sse({"content": "**Working**\n- Searching the web…\n- Reading example.com…\n"})
         # The pause represents a blocked source.  The browser must show the
         # ordinary content above before this source completes.
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(PROBE_BLOCK_SECONDS)
         yield _probe_sse({"content": "\n---\n\n"})
         yield _probe_sse({"content": PROBE_ANSWER})
         yield _probe_sse({}, "stop")
@@ -358,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-percent", type=float, help="authoritative cache used percentage from the raw tool result")
     parser.add_argument("--progress-source-acceptance", action="store_true",
                         help="run one authenticated streamed read-only progress/source acceptance turn")
-    parser.add_argument("--progress-source-prompt", default="Show the QA source transparency fixture.",
+    parser.add_argument("--progress-source-prompt", default=PROBE_PROMPT,
                         help="read-only prompt for --progress-source-acceptance; use only the disposable fixture")
     parser.add_argument("--output", default="-", help="JSON output path, or - for stdout")
     args = parser.parse_args(argv)

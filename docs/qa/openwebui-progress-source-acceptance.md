@@ -2,31 +2,36 @@
 
 Date: 2026-09-19
 
-## Result: PASS — disposable acceptance only
+## Disposable, unchanged-client scope
 
-This used a new Docker network, a new temporary Open WebUI data directory, and
-the unchanged pinned image. It did not attach to production, Home Assistant, or
-any production provider. The provider was the deterministic authenticated QA
-fixture in qa/openwebui_live_p0.py. It sends ordinary Working content, holds a
-fake source for 1.5 seconds, then sends the final answer and rich trace. It
-never executes a real tool.
-
-Pinned client:
+The acceptance uses only a new Docker network and data directory. The client is
+the unchanged pinned image below. It does not attach to production Open WebUI,
+Home Assistant, voiceai, or a production provider, and it does not modify any
+deployment or configuration.
 
 ~~~text
 ghcr.io/open-webui/open-webui@sha256:41daa0cf2561a5d4c8d1ff31ee2a98d93ab4d3ac2605cac69366ff6a3374a933
 ~~~
 
-## Reproduction
+The provider is the authenticated QA fixture in qa/openwebui_live_p0.py. It
+requires a sentinel raw query in the UI prompt, retains a private URL, raw
+snippet, token, raw error, and hostile title internally, emits only safe
+progress labels, then holds the fake source for three seconds before producing
+the final answer and safe rich trace.
 
-Run from the repository root. The fixture bearer key below is public QA-only
-data; it is not a Home-AI credential.
+## Reproducible browser acceptance
+
+Run from the repository root. The fixture key/password are public disposable
+test data, not Home-AI credentials.
 
 ~~~bash
 set -eu
 docker build -t home-ai-progress-source-qa -f qa/Dockerfile qa
 export QA_NETWORK=home-ai-progress-source-acceptance
 export QA_DATA="$(mktemp -d /tmp/openwebui-progress-source.XXXXXX)"
+export PLAYWRIGHT_HOME="$(mktemp -d /tmp/openwebui-progress-source-playwright.XXXXXX)"
+npm install --prefix "$PLAYWRIGHT_HOME" playwright@1.52.0
+docker pull mcr.microsoft.com/playwright:v1.52.0-noble
 docker network create "$QA_NETWORK"
 docker run -d --rm --name home-ai-progress-source-provider \
   --network "$QA_NETWORK" --network-alias progress-source-provider \
@@ -39,124 +44,106 @@ docker run -d --rm --name home-ai-progress-source-webui \
   -e OPENAI_API_KEYS='progress-source-fixture-key' -e ENABLE_SIGNUP=true \
   -v "$QA_DATA:/app/backend/data" \
   ghcr.io/open-webui/open-webui@sha256:41daa0cf2561a5d4c8d1ff31ee2a98d93ab4d3ac2605cac69366ff6a3374a933
+until curl -fsS http://127.0.0.1:18094/health >/dev/null; do sleep 1; done
+docker run --rm --network "$QA_NETWORK" --shm-size=1gb \
+  -e NODE_PATH=/node_modules \
+  -v "$PLAYWRIGHT_HOME/node_modules:/node_modules:ro" \
+  -v "$PWD/qa:/workspace/qa:ro" -v "$QA_DATA:/evidence" \
+  mcr.microsoft.com/playwright:v1.52.0-noble \
+  node /workspace/qa/openwebui_progress_source_acceptance.mjs \
+  --base-url http://home-ai-progress-source-webui:8080 \
+  --artifacts-dir /evidence/browser
+cat "$QA_DATA/browser/results.json"
 ~~~
 
-After health succeeds, create the temporary fixture user through the disposable
-UI. Authenticate the QA harness without printing its temporary user token:
+The committed browser script creates or signs into the disposable account
+through the UI, types the sentinel prompt into the contenteditable composer,
+captures an early DOM/screenshot before the source release, waits for the
+final answer, reloads the same UI, and then examines the naturally persisted
+assistant message. It makes no request to the chats persistence API.
 
-~~~bash
-export OPENWEBUI_TOKEN="$(curl -fsS -X POST http://127.0.0.1:18094/api/v1/auths/signin \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"progress-source@example.test","password":"FixturePassword123!"}' \
-  | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
-docker run --rm --network host -e OPENWEBUI_TOKEN \
-  -v "$PWD/qa:/workspace/qa:ro" -v /tmp:/evidence home-ai-progress-source-qa \
-  python /workspace/qa/openwebui_live_p0.py \
-  --base-url http://127.0.0.1:18094 \
-  --model home-ai-progress-source-fixture \
-  --progress-source-acceptance \
-  --output /evidence/openwebui-progress-source-harness.json
+Artifacts are deterministic and inspectable under QA_DATA/browser while the
+fixture is retained: results.json, progress-visible-before-source-completes.png,
+progress-source-final.png, and progress-source-reload.png. They are not
+committed because they include a temporary browser account and the intentional
+raw-query user prompt. Re-run the command above to regenerate them; acceptance
+does not rely on deleted temporary-file hashes.
+
+The script fails unless all of these hold in the assistant DOM:
+
+- ordinary Working/progress is visible before the delayed final response;
+- the completed and reloaded messages retain one through four safe preamble
+  lines and a rendered separator;
+- final answer precedes Research activity;
+- exactly one visible, enabled source anchor has href https://example.com/news;
+- hostile title text is inert: no evil.example anchor, img/script, or event
+  handler node is created;
+- raw query, snippet, private/internal URL, token, or raw error is absent from
+  the assistant message.
+
+## Observed result
+
+The completed browser invocation returned:
+
+~~~json
+{
+  "fixture_delay_ms": 3000,
+  "early_progress_visible": true,
+  "early_final_visible": false,
+  "early_elapsed_ms": 484,
+  "completed_progress_line_count": 2,
+  "final_elapsed_ms": 3394,
+  "reloaded_progress_line_count": 2,
+  "status": "pass"
+}
 ~~~
 
-The acceptance mode records only ordinary content after it passes the
-safe-display contract. It requires timestamped Working before final content,
-one through four distinct safe labels, a separator, an answer, a rich trace,
-and no fixture raw-query/snippet/private-URL/tool-exception sentinel. It writes
-the accepted display text to the authenticated disposable chat for reload.
+This is graphical acceptance evidence from the UI itself; no synthetic
+assistant message was inserted.
 
-## Observed graphical acceptance
-
-Playwright Chromium created a disposable account, sent the fixture prompt, took
-an early screenshot while the source was blocked, waited for completion, then
-reloaded the page.
-
-| Check | Observation |
-| --- | --- |
-| Timing | Harness timestamps: Working 18.89 ms; separator 1517.42 ms; first final-answer/trace content 1517.61 ms. Progress led final content by 1498.72 ms. |
-| Visible progress | The early snapshot contained Working, Searching the web, and Reading example.com; it did not contain the final answer. |
-| Persistence | Reload retained the two-line preamble, separator, answer, and Research activity; two lines is within the four-line limit. |
-| Fetched source | Exactly one https://example.com/news anchor was present and clickable. |
-| Hostile title | The Markdown-shaped hostile title rendered as inert spoof/evil.example text; no anchor had an evil.example destination. |
-| Display privacy | The accepted display contained no raw fixture query, snippet, private URL, token, or exception sentinel. |
-
-Screenshots were inspected before teardown and are deliberately not committed:
-
-~~~text
-/tmp/openwebui-progress-source.b4E1it/progress-visible-before-source-completes.png
-sha256 6a34b4d59048ca2508655513b484511f779f36745ff73fd52f794cdf878ebd2e
-
-/tmp/openwebui-progress-source.b4E1it/progress-source-final.png
-sha256 dff8daa6760863bc80465d0084870934ec64629bf96dfc76bea98106be9e549b
-~~~
-
-## Voice acceptance
-
-The production-shaped TTS normalization and gateway tests below verify the
-actual Assistant boundary: combined preamble/answer/trace maps to the plain
-answer only, and progress-only plus trace/source-only requests return HTTP 204
-without invoking a synthesizer. The disposable fixture also returns 204 for
-display-only input:
-
-~~~bash
-docker run --rm --network "$QA_NETWORK" curlimages/curl:8.11.1 \
-  -sS -o /dev/null -w '%{http_code}\n' -X POST \
-  http://progress-source-provider:8000/v1/audio/speech \
-  -H 'Authorization: Bearer progress-source-fixture-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"**Working**\n- Searching the web…\n\n---\n\n<!-- home-ai-display-trace -->"}'
-~~~
-
-Observed: 204. The fixture has no synthesizer; the production-shaped suite is
-the authoritative test for the real TTS endpoint.
+The fixture speech endpoint returned 204 for a preamble/trace-only request.
+The real speech boundary is covered by the production-shaped TTS normalization
+and OpenAI gateway tests: preamble and rich trace are removed, while
+progress-only and trace-only input returns 204 without invoking a synthesizer.
 
 ## Production-shaped test evidence
 
-Focused suite, run once:
+The literal brief command using context assistant cannot build: the Dockerfile
+contains COPY assistant/... and therefore requires repository-root context.
+The following is the repository's successful production-shaped QA command,
+using the same Python/base/system/runtime dependencies and adding pytest only
+for verification:
 
 ~~~bash
-docker build -t home-ai-assistant-sdd -f assistant/Dockerfile assistant
-docker run --rm --network none --read-only home-ai-assistant-sdd \
-  python -m pytest -q assistant/test_trace_projection.py \
-  assistant/test_progress_events.py assistant/test_openai_gateway.py \
-  assistant/test_tts_normalization.py assistant/test_grounding_regressions.py \
+docker build -f qa/Dockerfile.assistant_integration -t home-ai-assistant-sdd-qa .
+docker run --rm --network none --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  -w /repo home-ai-assistant-sdd-qa python -m pytest -q -p no:cacheprovider \
+  assistant/test_trace_projection.py assistant/test_progress_events.py \
+  assistant/test_openai_gateway.py assistant/test_tts_normalization.py \
+  assistant/test_grounding_regressions.py \
   qa/test_assistant_conversation_integration.py
 ~~~
 
-Result: one focused execution was started in the rebuilt
-home-ai-assistant-sdd-qa image (image ID
-ac97c355b4d1a18c51e96926ace19fb9af9d1671c7a6f05c66f039e60d214f06).
-It selected 643 tests. Its attached terminal capture was cut off at 89 percent
-by the runner while the container continued; the final full run below is the
-authoritative completion evidence and includes all 643 selected tests. The
-focused command used no pytest cache provider, so it avoided the read-only
-cache warnings seen in the exact full command.
+Focused result: 643 passed, 561 warnings in 30.39s. The warnings are the
+existing audioop and FastAPI startup-event deprecations; the cache provider was
+disabled so the read-only cache warnings are absent.
 
-Final full suite, run once and not rerun after documentation-only edits:
+The final full run from the reviewed pre-fix commit remains:
 
-~~~bash
-docker build -t home-ai-assistant-sdd -f assistant/Dockerfile assistant
-docker run --rm --network none --read-only home-ai-assistant-sdd python -m pytest -q
+~~~text
+1087 passed, 563 warnings in 54.65s
 ~~~
 
-Result: 1087 passed, 563 warnings in 54.65s. Warnings were the existing
-pytest-asyncio fixture-loop-scope deprecation, Python audioop deprecation, 280
-FastAPI startup-event deprecations, and two pytest cache write warnings caused
-by the intentionally read-only repository. No tests failed or skipped.
+Its warnings were existing pytest-asyncio/audioop/FastAPI deprecations plus two
+expected pytest cache write warnings from the deliberately read-only repository.
+The fix round changes QA/docs only; it does not alter Assistant runtime code.
 
-The literal plan command using build context assistant was also attempted once
-and failed before pytest: assistant/Dockerfile uses COPY assistant/... and
-therefore requires the repository-root build context. This is the previously
-recorded task-2 Docker-context mismatch, not an application failure. The
-commands above use the existing production-shaped QA Dockerfile with the same
-Python/base/system/runtime requirements and pytest added only for verification.
-
-## Scope and teardown
-
-No deployment or Home Assistant/Open WebUI configuration change is authorized.
-Remove only the disposable objects after evidence is saved:
+## Teardown
 
 ~~~bash
 docker stop home-ai-progress-source-provider home-ai-progress-source-webui
 docker network rm "$QA_NETWORK"
 case "$QA_DATA" in /tmp/openwebui-progress-source.*) find "$QA_DATA" -depth -delete ;; *) exit 1 ;; esac
+case "$PLAYWRIGHT_HOME" in /tmp/openwebui-progress-source-playwright.*) find "$PLAYWRIGHT_HOME" -depth -delete ;; *) exit 1 ;; esac
 ~~~
