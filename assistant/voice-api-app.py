@@ -1040,10 +1040,12 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
     evidence = json.dumps(results, ensure_ascii=False).casefold()
     if research_mode == "deep":
         # Detection is deliberately broader than acceptance: no vocabulary of
-        # known offices or people can exempt a new current-role claim.
-        role_claim_patterns = (
-            r"(?P<name>[^.!?;\n]+?)\s+(?:is|serves as|remains)\s+(?:the\s+)?current\s+(?P<title>[^.!?;\n]+)",
-            r"\b(?:the\s+)?current\s+(?P<title>[^.!?;\n]+?)\s+(?:is|remains)\s+(?P<name>[^.!?;\n]+)",
+        # known offices or people can exempt a new present-tense role claim.
+        # Prefer explicit reverse claims so their role and person are not
+        # also interpreted as a person-first relationship in the other order.
+        role_claim_pattern = (
+            r"\b(?:the\s+)?current\s+(?P<reverse_title>[^.!?;\n]+?)\s+(?:is|remains)\s+(?P<reverse_name>[^.!?;\n]+)"
+            r"|(?P<name>[^.!?;\n]+?)\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?(?P<title>[^.!?;\n]+)"
         )
 
         def normalized(value: str) -> str:
@@ -1071,9 +1073,11 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
             and str(item.get("result", {}).get("content") or "").strip()
         ]
         claimed_holders = [
-            (normalized(match.group("name")), normalized(match.group("title")))
-            for pattern in role_claim_patterns
-            for match in re.finditer(pattern, answer, re.I)
+            (
+                normalized(match.group("name") or match.group("reverse_name")),
+                normalized(match.group("title") or match.group("reverse_title")),
+            )
+            for match in re.finditer(role_claim_pattern, answer, re.I)
         ]
 
         def fetched_evidence_supports_current_role(name: str, title: str) -> bool:
@@ -1083,21 +1087,24 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
             # canonical person-first form supplies positive evidence.
             person = r"(?P<name>[^\W\d_][\w'’ -]*?)"
             relation = re.compile(
-                rf"{person} is (?P<negative>not |no longer )?(?:the )?current {re.escape(title)}(?![\w-])"
+                rf"{person} is (?P<negative>not |no longer )?(?:the )?(?:current )?{re.escape(title)}(?![\w-])"
             )
             reverse_relation = re.compile(
-                rf"(?:the )?current {re.escape(title)} is {person}\.?"
+                rf"(?:the )?(?:current )?{re.escape(title)} is {person}(?=$|[^\w'’ -])"
             )
             supporting_domains = set()
             for domain, content in fetched_articles:
                 if not domain:
                     continue
-                for sentence in re.split(r"(?<=[.!?])\s+|[\r\n]+", content):
+                # A newline or colon may introduce an attributed quotation;
+                # only terminal punctuation starts a fresh source assertion.
+                for sentence in re.split(r"(?<=[.!?])\s+", content):
                     sentence = normalized(sentence)
                     assertion = relation.match(sentence)
-                    reverse = reverse_relation.fullmatch(sentence)
-                    if reverse and reverse.group("name") != name:
-                        return False
+                    reverse = reverse_relation.match(sentence)
+                    if reverse:
+                        if normalized(reverse.group("name")) != name or sentence[reverse.end():] not in {"", "."}:
+                            return False
                     if not assertion:
                         continue
                     # A matching relationship followed by extra prose may be
