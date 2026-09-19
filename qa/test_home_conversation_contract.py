@@ -1,8 +1,12 @@
 """Side-effect-free contracts for conversational Home Assistant targeting."""
 
+import ast
 import asyncio
 import importlib.util
 from pathlib import Path
+import re
+
+import pytest
 
 
 def _load_tools():
@@ -12,6 +16,15 @@ def _load_tools():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _normalize_home_tool_arguments():
+    path = Path(__file__).parents[1] / "assistant" / "voice-api-app.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(node for node in tree.body if getattr(node, "name", None) == "normalize_home_tool_arguments")
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["normalize_home_tool_arguments"]
 
 
 def _entity(entity_id, state, name, area, *, modes=None, brightness=None):
@@ -203,3 +216,253 @@ def test_bulk_scope_survives_authorization_filtering(monkeypatch):
     assert result["status"] == "forbidden"
     assert result["target_entity_ids"] == []
     assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
+
+
+def test_bulk_switch_control_only_writes_default_safe_switches(monkeypatch):
+    monkeypatch.delenv("HOME_BULK_SAFE_ENTITIES", raising=False)
+    module = _load_tools()
+    entities = [
+        _entity("light.office_light", "on", "Office Light", "Office"),
+        _entity("switch.neon_light_socket_1", "on", "Neon Socket 1", "Office"),
+        _entity("switch.neon_lights_socket_1", "on", "Neon Socket 2", "Office"),
+        _entity("switch.neon_lights_socket_1_2", "on", "Neon Socket 3", "Office"),
+        _entity("switch.router", "on", "Router", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        payloads = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            self.payloads.append(json)
+            return FakeResponse()
+
+    module._home_assistant_entities = inventory
+    module._home_assistant_token = lambda: "test-token"
+    module.HOME_WRITE_ALLOWED_ENTITIES.add("switch.router")
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    result = asyncio.run(module.home_control({"entity_or_area": "all switches", "action": "turn_off"}))
+
+    assert result["status"] == "partial"
+    assert result["target_entity_ids"] == [
+        "switch.neon_light_socket_1",
+        "switch.neon_lights_socket_1",
+        "switch.neon_lights_socket_1_2",
+    ]
+    assert FakeAsyncClient.payloads == [{"entity_id": [
+        "switch.neon_light_socket_1",
+        "switch.neon_lights_socket_1",
+        "switch.neon_lights_socket_1_2",
+    ]}]
+    assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
+
+
+def test_bulk_switch_control_preserves_protected_when_safe_switch_is_unavailable(monkeypatch):
+    monkeypatch.delenv("HOME_BULK_SAFE_ENTITIES", raising=False)
+    module = _load_tools()
+    entities = [
+        _entity("switch.neon_light_socket_1", "unavailable", "Neon Socket 1", "Office"),
+        _entity("switch.router", "on", "Router", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class ForbiddenHttpClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unavailable and protected switches must not receive a service call")
+
+    module._home_assistant_entities = inventory
+    module.HOME_WRITE_ALLOWED_ENTITIES.add("switch.router")
+    monkeypatch.setattr(module.httpx, "AsyncClient", ForbiddenHttpClient)
+    result = asyncio.run(module.home_control({"entity_or_area": "all switches", "action": "turn_off"}))
+
+    assert result["status"] == "partial"
+    assert result["target_entity_ids"] == []
+    assert [item["entity_id"] for item in result["unavailable"]] == ["switch.neon_light_socket_1"]
+    assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
+
+
+@pytest.mark.parametrize("utterance", [
+    "Turn off everything except switches.",
+    "Turn off everything except the outlets.",
+    "Turn off everything except the plugs.",
+])
+def test_switch_exclusion_routes_only_lights(monkeypatch, utterance):
+    arguments = _normalize_home_tool_arguments()("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+        "entity_ids": ["light.office_light", "switch.neon_light_socket_1"],
+    }, utterance)
+    module = _load_tools()
+    entities = [
+        _entity("light.office_light", "on", "Office Light", "Office"),
+        _entity("switch.neon_light_socket_1", "on", "Neon Socket 1", "Office"),
+        _entity("switch.router", "on", "Router", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        payloads = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            self.payloads.append(json)
+            return FakeResponse()
+
+    module._home_assistant_entities = inventory
+    module._home_assistant_token = lambda: "test-token"
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    result = asyncio.run(module.home_control(arguments))
+
+    assert arguments == {
+        "action": "turn_off", "entity_or_area": "all lights",
+        "entity_ids": ["light.office_light"],
+    }
+    assert result["target_entity_ids"] == ["light.office_light"]
+    assert FakeAsyncClient.payloads == [{"entity_id": ["light.office_light"]}]
+
+
+def test_mixed_whole_home_control_writes_lights_and_safe_switches(monkeypatch):
+    arguments = _normalize_home_tool_arguments()("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+    }, "Turn off all lights and switches.")
+    module = _load_tools()
+    entities = [
+        _entity("light.office_light", "on", "Office Light", "Office"),
+        _entity("switch.neon_light_socket_1", "on", "Neon Socket 1", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        payloads = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            self.payloads.append(json)
+            return FakeResponse()
+
+    module._home_assistant_entities = inventory
+    module._home_assistant_token = lambda: "test-token"
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    result = asyncio.run(module.home_control(arguments))
+
+    assert arguments["entity_or_area"] == "everything"
+    assert result["target_entity_ids"] == ["light.office_light", "switch.neon_light_socket_1"]
+    assert FakeAsyncClient.payloads == [
+        {"entity_id": ["light.office_light"]},
+        {"entity_id": ["switch.neon_light_socket_1"]},
+    ]
+
+
+@pytest.mark.parametrize("utterance", [
+    "Turn off all switches.",
+    "Turn off all light switches.",
+])
+def test_switch_bulk_filters_mixed_exact_ids_before_tools_control(monkeypatch, utterance):
+    arguments = _normalize_home_tool_arguments()("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+        "entity_ids": ["light.office_light", "switch.neon_light_socket_1"],
+    }, utterance)
+    module = _load_tools()
+    entities = [
+        _entity("light.office_light", "on", "Office Light", "Office"),
+        _entity("switch.neon_light_socket_1", "on", "Neon Socket 1", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        payloads = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            self.payloads.append(json)
+            return FakeResponse()
+
+    module._home_assistant_entities = inventory
+    module._home_assistant_token = lambda: "test-token"
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    result = asyncio.run(module.home_control(arguments))
+
+    assert FakeAsyncClient.payloads == [{"entity_id": ["switch.neon_light_socket_1"]}]
+    assert arguments["entity_or_area"] == "all switches"
+    assert arguments["entity_ids"] == ["switch.neon_light_socket_1"]
+    assert result["target_entity_ids"] == ["switch.neon_light_socket_1"]
+
+
+def test_switch_bulk_empty_filtered_exact_ids_sends_no_command(monkeypatch):
+    arguments = _normalize_home_tool_arguments()("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+        "entity_ids": ["light.office_light"],
+    }, "Turn off all switches.")
+    module = _load_tools()
+
+    async def inventory():
+        return [_entity("light.office_light", "on", "Office Light", "Office")], {}
+
+    class ForbiddenHttpClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("an empty exact set must not send a Home Assistant command")
+
+    module._home_assistant_entities = inventory
+    monkeypatch.setattr(module.httpx, "AsyncClient", ForbiddenHttpClient)
+    result = asyncio.run(module.home_control(arguments))
+
+    assert arguments["entity_ids"] == []
+    assert result["status"] == "not_found"

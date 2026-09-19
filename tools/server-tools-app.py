@@ -181,7 +181,10 @@ HOME_ENTITY_GROUPS = {
         "switch.neon_light_socket_1",
     },
 }
-HOME_BULK_SAFE_ENTITIES = {value.strip() for value in os.getenv("HOME_BULK_SAFE_ENTITIES", "").split(",") if value.strip()}
+HOME_BULK_SAFE_ENTITIES = {value.strip() for value in os.getenv(
+    "HOME_BULK_SAFE_ENTITIES",
+    "switch.neon_light_socket_1,switch.neon_lights_socket_1,switch.neon_lights_socket_1_2",
+).split(",") if value.strip()}
 _HOME_EXISTING_WRITE_POLICY = {
     "light.office_light", "light.bedroom_lamp", "light.music_star_light",
     "light.light_fixture_1", "light.light_fixture_2", "light.light_fixture_3",
@@ -4375,6 +4378,13 @@ async def home_control(args: dict[str, Any]) -> dict[str, Any]:
     unavailable = [item for item in matches if item.get("state") in {"unavailable", "unknown"}]
     skipped = list(pre_skipped) + (unavailable if len(matches) > 1 else [])
     if unavailable and not skipped:
+        if protected:
+            return {
+                "status": "partial", "outcome": "no_action", "target_entity_ids": [],
+                "unavailable": [_home_entity_view(item) for item in unavailable],
+                "protected": [_home_entity_view(item) for item in protected],
+                "message": "No permitted switches were available; protected switches were excluded.",
+            }
         return {"status": "unavailable", "devices": [_home_entity_view(item) for item in unavailable]}
     matches = [item for item in matches if item not in skipped]
     by_domain: dict[str, list[str]] = {}
