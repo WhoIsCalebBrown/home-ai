@@ -21,6 +21,7 @@ def _load_helpers():
         "_safe_markdown_text",
         "_safe_markdown_destination",
         "openai_tool_trace_footer",
+        "remove_openai_display_metadata",
     }
     assignment_names = {"_OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES"}
 
@@ -244,3 +245,16 @@ def test_rich_footer_escapes_hostile_markdown_labels_and_destinations():
     assert r"\[spoof\]\(https\:\/\/evil\.example\)" in footer
     assert "news\\_\\*\\`\\[spoof\\]\\(x\\)\\.example" in footer
     assert "https://example.com/%5D%28https://evil.example/%29%2A_%60%5C" in footer
+
+
+def test_display_metadata_fallback_removes_only_owned_rich_boundaries():
+    module = _load_helpers()
+    displayed = (
+        "**Working**\n- Searching recent Canadian headlines…\n\n---\n\n"
+        "Here is the answer.\n\n<!-- home-ai-display-trace -->\n"
+        "Research activity\n- Opened CBC News\n"
+        "Sources\n- [Canada update](https://cbc.ca/news/update)"
+    )
+    assert module.remove_openai_display_metadata(displayed) == "Here is the answer."
+    ordinary = "I was working on this.\n\n---\n\nThe separator is intentional."
+    assert module.remove_openai_display_metadata(ordinary) == ordinary

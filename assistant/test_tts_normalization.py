@@ -18,6 +18,37 @@ def test_media_tool_trace_is_removed_from_speech():
     assert app.remove_openai_tool_trace("Tools used media_plan_goal — ok") == ""
 
 
+def test_rich_sources_and_persistent_progress_are_never_spoken():
+    displayed = (
+        "**Working**\n- Searching recent Canadian headlines…\n"
+        "- Reading CBC News…\n\n---\n\n"
+        "Here is the Canadian roundup.\n\n<!-- home-ai-display-trace -->\n"
+        "Research activity\n- Opened CBC News\n"
+        "Sources\n- [Canada update](https://cbc.ca/news/update)"
+    )
+    assert app.remove_openai_display_metadata(displayed) == "Here is the Canadian roundup."
+
+
+def test_fallback_does_not_delete_ordinary_working_or_separator_text():
+    answer = "I was working on this.\n\n---\n\nThe separator is part of the answer."
+    assert app.remove_openai_display_metadata(answer) == answer
+
+
+def test_progress_trace_and_source_only_fragments_are_silent():
+    progress_only = "**Working**\n- Searching recent Canadian headlines…\n\n---\n\n"
+    trace_only = (
+        "<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
+        "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
+    )
+    source_only = (
+        "<!-- home-ai-display-trace -->\n---\n**Sources**\n"
+        "- [Canada update](https://cbc.ca/news/update)"
+    )
+    assert app.remove_openai_display_metadata(progress_only) == ""
+    assert app.remove_openai_display_metadata(trace_only) == ""
+    assert app.remove_openai_display_metadata(source_only) == ""
+
+
 class _SpeechRequest:
     def __init__(self, payload):
         self.payload = payload
@@ -45,13 +76,36 @@ def test_openai_speech_keeps_display_only_trace_silent_and_uses_registered_answe
     assert synthesized == []
 
     spoken = "That's White Chicks (2004)."
-    displayed = spoken + "\n\n---\n**Tools used**\n- `media_plan_goal` — ok"
+    displayed = spoken + (
+        "\n\n<!-- home-ai-display-trace -->\n---\n**Research activity**\n"
+        "- Opened CBC News\nSources\n- [Canada update](https://cbc.ca/news/update)"
+    )
     app.register_openai_tts_text(displayed, spoken)
     response = asyncio.run(app.openai_speech(_SpeechRequest({"input": displayed})))
 
     assert response.status_code == 200
     assert response.body == b"RIFF"
     assert synthesized == [spoken]
+
+
+def test_openai_speech_does_not_synthesize_progress_or_rich_trace_fragments(monkeypatch):
+    monkeypatch.setattr(app, "_require_openai_auth", lambda request: None)
+    synthesized = []
+
+    async def fake_synthesize_pocket(text):
+        synthesized.append(text)
+        return b"RIFF"
+
+    monkeypatch.setattr(app, "synthesize_pocket", fake_synthesize_pocket)
+    fragments = [
+        "**Working**\n- Reading CBC News…\n\n---\n\n",
+        "<!-- home-ai-display-trace -->\n---\n**Research activity**\n- Opened CBC News",
+        "<!-- home-ai-display-trace -->\n---\n**Sources**\n- CBC News",
+    ]
+    for fragment in fragments:
+        response = asyncio.run(app.openai_speech(_SpeechRequest({"input": fragment})))
+        assert response.status_code == 204
+    assert synthesized == []
 
 
 def main() -> None:

@@ -6806,15 +6806,42 @@ def openai_tool_trace_footer(trace: list[dict]) -> str:
     return "\n\n<!-- home-ai-display-trace -->\n---\n**Research activity**\n" + "\n".join(rows)
 
 
-def remove_openai_tool_trace(text: str) -> str:
-    """Keep Open WebUI diagnostics visible but exclude them from Pocket speech."""
-    cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", text, flags=re.I | re.S)
-    # Open WebUI may submit the footer as a separate TTS input, flattening
-    # Markdown newlines. This fallback is only for the speech endpoint when
-    # the structured display->speech registry cannot match a streamed piece.
+def remove_openai_display_metadata(text: str) -> str:
+    """Remove only server-owned display metadata from an unmatched TTS input.
+
+    The display-to-speech registry is authoritative. This fallback is
+    deliberately narrow because an arbitrary ``---`` or the word ``working``
+    can be ordinary answer content. The persistent preamble has an exact
+    server-owned header, bullet-line shape, and separator; the rich footer has
+    its exact generated marker. The older saved-message footer
+    patterns remain below for compatibility with responses created before the
+    marker was added.
+    """
+    cleaned = str(text or "")
+    preamble = re.match(
+        r"\A[ \t\r\n]*\*\*Working\*\*[ \t]*\r?\n"
+        r"(?:[ \t]*-[^\r\n]*(?:\r?\n|$))+"
+        r"[ \t]*(?:\r?\n)?---[ \t]*(?:\r?\n|$)",
+        cleaned,
+    )
+    if preamble:
+        cleaned = cleaned[preamble.end():]
+
+    marker = re.search(r"<!-- home-ai-display-trace -->", cleaned)
+    if marker:
+        cleaned = cleaned[:marker.start()]
+
+    # Legacy saved messages used an aria-hidden HTML wrapper or a flattened
+    # ``Tools used`` footer before the stable trace marker existed.
+    cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", cleaned, flags=re.I | re.S)
     cleaned = re.sub(r"\s*---\s*\**Tools used\**.*$", " ", cleaned, flags=re.I | re.S)
     cleaned = re.sub(r"\s*\**Tools used\**\s*(?:[-–—]?\s*[a-z0-9_]+\s*[-–—]?\s*\w+\s*)+$", " ", cleaned, flags=re.I | re.S)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip()
+
+
+def remove_openai_tool_trace(text: str) -> str:
+    """Compatibility alias for callers using the old sanitizer name."""
+    return remove_openai_display_metadata(text)
 
 
 async def _wav_to_mp3(wav: bytes) -> bytes:
@@ -7034,7 +7061,7 @@ async def openai_speech(request: Request):
         # spoken channel never receives that metadata.
         text = spoken_text_for_openai_display(text)
         if text:
-            text = remove_openai_tool_trace(text)
+            text = remove_openai_display_metadata(text)
         if not text:
             # Display-only tool diagnostics can arrive as their own TTS
             # request. Treat that request as intentionally silent.
