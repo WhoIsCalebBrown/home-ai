@@ -4,10 +4,16 @@ import ast
 import json
 import re
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
+from urllib.parse import urlsplit
+
+import pytest
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
-needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "social_acknowledgement_response", "plural_disambiguation_reply", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "library_category_followup", "library_count_category", "referential_media_library_question", "referential_media_request", "retained_media_goal", "canonical_identity_matches", "enforce_retained_media_identity", "collective_library_query", "referential_web_query", "storage_state_followup", "operation_for_plan", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer"}
+needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "social_acknowledgement_response", "plural_disambiguation_reply", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "informational_media_continuation", "media_acquisition_request_frame", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "library_category_followup", "library_count_category", "referential_media_library_question", "referential_media_request", "retained_media_goal", "canonical_identity_matches", "enforce_retained_media_identity", "collective_library_query", "referential_web_query", "storage_state_followup", "operation_for_plan", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer", "research_profile", "research_fetch_candidates", "research_evidence_shape", "deep_research_ready"}
+needed.update({"current_news_intent", "current_role_relationships", "research_article_freshness", "fetched_current_role_supported", "normalized_research_url", "research_publisher", "research_authoritative", "canadian_news_evidence", "canadian_news_relevant"})
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -18,7 +24,8 @@ def is_needed_assignment(node):
 nodes = [node for node in tree.body if getattr(node, "name", None) in needed or is_needed_assignment(node)]
 from semantic_routing import has_referential_language
 
-namespace = {"json": json, "re": re, "time": time, "provenance": {}, "has_referential_language": has_referential_language}
+namespace = {"json": json, "re": re, "time": time, "datetime": datetime, "urlsplit": urlsplit, "provenance": {}, "has_referential_language": has_referential_language}
+namespace.update({"timedelta": timedelta, "ZoneInfo": ZoneInfo})
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "voice-api-app.py", "exec"), namespace)
 SOURCE_NAMES = namespace["SOURCE_NAMES"]
 evidence_supported_answer = namespace["evidence_supported_answer"]
@@ -88,6 +95,83 @@ _descriptive_media_clue = namespace["_descriptive_media_clue"]
 canonical_media_year_answer = namespace["canonical_media_year_answer"]
 web_search_query_from_text = namespace["web_search_query_from_text"]
 web_recovery_queries = namespace["web_recovery_queries"]
+research_profile = namespace["research_profile"]
+research_fetch_candidates = namespace["research_fetch_candidates"]
+research_evidence_shape = namespace["research_evidence_shape"]
+deep_research_ready = namespace["deep_research_ready"]
+
+
+@pytest.mark.parametrize("content,date,days,accepted", [
+    ("Canada announces new research funding.", "2026-09-18", 1, False),
+    ("Canada announces new research funding.", "2026-09-18", 2, True),
+    ("Ontario expands hospital capacity.", "2026-09-17", 2, False),
+    ("Ontario expands hospital capacity.", "2026-09-17", 3, True),
+    ("Unrelated overseas football results.", "2026-09-19", 3, False),
+    ("Canada announces new research funding.", "2026-09-20", 3, False),
+    ("Canada announces new research funding.", "unknown", 3, False),
+    ("Canada announces new research funding.", None, 3, False),
+])
+def test_canadian_news_scope_requires_fetched_relevance_and_window(content, date, days, accepted):
+    # Removing either the geography or publication-window gate admits noise.
+    item = {"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://cbc.ca/news/article", "content": content, "date": date,
+    }}
+    evidence = namespace["canadian_news_evidence"]([item], datetime(2026, 9, 19, 12, tzinfo=ZoneInfo("America/Toronto")).timestamp(), days)
+    assert evidence == ([item] if accepted else [])
+
+
+@pytest.mark.parametrize("published,accepted", [
+    ("2026-09-18T23:30:00-10:00", True),
+    ("2026-09-18T23:30:00-04:00", False),
+    ("2026-09-19T00:15:00+14:00", False),
+    ("2026-09-19T23:59:00Z", False),
+    ("2026-09-19T09:00:00", False),
+    ("2026-09-19", True),
+])
+def test_canadian_news_timestamp_uses_toronto_date_and_rejects_future(published, accepted):
+    now = datetime.fromisoformat("2026-09-19T12:00:00+00:00").timestamp()
+    item = {"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://cbc.ca/news/article", "content": "Canada announced new funding.", "published": published,
+    }}
+    assert namespace["canadian_news_evidence"]([item], now, 1) == ([item] if accepted else [])
+
+
+@pytest.mark.parametrize("content,accepted", [
+    ("A Labrador won the dog show in London.", False),
+    ("Ontario, California approved new city transport services.", False),
+    ("The province of Ontario approved new city transport services.", True),
+    ("Newfoundland and Labrador announced new hospital funding.", True),
+])
+def test_canadian_news_ambiguous_place_names_need_canadian_context(content, accepted):
+    item = {"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://news.example/article", "content": content, "date": "2026-09-19",
+    }}
+    now = datetime.fromisoformat("2026-09-19T12:00:00+00:00").timestamp()
+    assert namespace["canadian_news_evidence"]([item], now, 1) == ([item] if accepted else [])
+
+
+@pytest.mark.parametrize("prompt,article,accepted", [
+    ("What are today’s top technology headlines in Canada? Give me an in-depth review.", "Canadian hockey players are competing in the final.", False),
+    ("I want technology news in Canada today.", "Canadian hockey players want a championship.", False),
+    ("Briefly review Canadian technology news.", "Canadian hockey players briefly visited the arena.", False),
+    ("I want an in-depth review of today’s news in Canada", "Canada announced new funding.", True),
+    ("What are the biggest stories in Canadian news today?", "Canada reported housing construction figures.", True),
+    ("Please research Canada's news thoroughly today.", "Canada reported housing construction figures.", True),
+    ("Canadian technology news today", "Canada's software sector announced new jobs.", True),
+    ("Canadian tech news today", "Canada announced semiconductor manufacturing capacity.", True),
+    ("Canadian technology news today", "Canadian computer hardware manufacturers reported new products.", True),
+    ("Canadian technology news today", "Canadian researchers published artificial intelligence benchmarks.", True),
+    ("Canadian political news today", "Canada's parliament passed new legislation.", True),
+    ("Canadian economic news today", "Canada reported inflation and employment figures.", True),
+    ("Canadian business news today", "Canadian companies expanded trade operations.", True),
+    ("Canadian healthcare news today", "Canada opened a new hospital.", True),
+    ("Canadian scientific news today", "Canadian researchers announced a new discovery.", True),
+    ("Canadian sports news today", "Canada hosted a hockey tournament.", True),
+    ("Canadian entertainment news today", "Canada hosted a film festival.", True),
+    ("Canadian entertainment news today", "Canadian hockey players are competing in the final.", False),
+])
+def test_canadian_news_topic_taxonomy_requires_category_evidence(prompt, article, accepted):
+    assert namespace["canadian_news_relevant"](article, prompt) is accepted
 
 
 def test_download_followup_uses_recorded_sources():
@@ -880,6 +964,174 @@ def test_current_news_followup_about_ai_uses_web():
     assert preflight_plan("Anything interesting with AI specifically?") == [("web_search", {"query": "Anything interesting with AI specifically"})]
 
 
+def test_in_depth_canadian_news_selects_deep_profile():
+    profile = research_profile("Give me an in-depth review of today's news in Canada")
+    assert profile["mode"] == "deep"
+    assert profile["minimum_searches"] == 3
+    assert profile["minimum_fetches"] == 2
+
+
+def test_deep_research_requires_successful_independent_fetches():
+    evidence = [
+        {"tool": "web_search", "status": "ok", "result": {"results": [{"url": "https://a.example/1"}]}},
+        {"tool": "web_search", "status": "ok", "result": {"results": [{"url": "https://b.example/2"}]}},
+        {"tool": "web_search", "status": "ok", "result": {"results": [{"url": "https://c.example/3"}]}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://a.example/1", "content": "article one"}},
+    ]
+    assert not deep_research_ready(evidence, candidate_urls_exist=True)
+    evidence.append({"tool": "web_fetch", "status": "ok", "result": {"url": "https://b.example/2", "content": "article two"}})
+    assert deep_research_ready(evidence, candidate_urls_exist=True)
+
+
+@pytest.mark.parametrize("second_url,second_content", [
+    ("https://alias.publisher.example/news", "A different article."),
+    ("https://other.example/news", "The same syndicated article."),
+    ("https://other.example/news", "  THE SAME\n syndicated article.  "),
+])
+def test_deep_research_does_not_count_shared_publishers_or_repeated_coverage(second_url, second_content):
+    evidence = [{"tool": "web_search", "status": "ok", "result": {"results": []}} for _ in range(3)]
+    evidence += [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://publisher.example/news", "content": "The same syndicated article."}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": second_url, "content": second_content}},
+    ]
+    assert not deep_research_ready(evidence, candidate_urls_exist=True)
+    evidence.append({"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/news", "content": "Independent additional coverage."}})
+    assert deep_research_ready(evidence, candidate_urls_exist=True)
+
+
+def test_research_fetch_candidates_strip_fragments_and_group_publisher_subdomains():
+    result = {"results": [
+        {"url": "https://alias.publisher.example/article#section"},
+        {"url": "https://other.example/article#heading"},
+        {"url": "https://other.example/article#duplicate"},
+    ]}
+    assert research_fetch_candidates(result, set(), {"publisher.example"}, 2) == [
+        "https://other.example/article", "https://alias.publisher.example/article",
+    ]
+
+
+@pytest.mark.parametrize("answer,source,competing,accepted", [
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nBob Roe is the prime minister.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nThe prime minister is Bob Roe.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nAlice Doe is not the prime minister.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nBob Roe is the prime minister following the election.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Alice Doe is the prime minister according to a disproven report.", False),
+    ("The prime minister is Alice Doe.", "Alice Doe is the prime minister.", "Economic context.", True),
+    ("The prime minister is Alice Doe.", "Economic context.", "Other context.", False),
+    ("Alice Doe is the prime minister.", "The prime minister is Alice Doe.", "Economic context.", True),
+    ("Alice Doe is Foreign Minister.", "Alice Doe is the Foreign Minister.", "Economic context.", True),
+    ("Alice Doe is Foreign Minister.", "Economic context.", "Other context.", False),
+    ("Prime Minister Alice Doe announced a policy.", "Economic context.", "Other context.", False),
+    ("Prime Minister Alice Doe announced a policy.", "Alice Doe is the prime minister.", "Economic context.", True),
+    ("Regional Ombudsperson Alice Doe announced a policy.", "Economic context.", "Other context.", False),
+    ("Regional Ombudsperson Alice Doe announced a policy.", "Alice Doe is the regional ombudsperson.", "Economic context.", True),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Prime Minister Bob Roe announced a policy.", False),
+    ("Inflation is slowing.", "Economic context.", "Other context.", True),
+    ("The economy is growing.", "Economic context.", "Other context.", True),
+    ("The outlook remains uncertain.", "Economic context.", "Other context.", True),
+    ("Research funding is increasing.", "Economic context.", "Other context.", True),
+    ("Alice Doe is speaking today.", "Economic context.", "Other context.", True),
+    ("The United States announced new funding.", "Economic context.", "Other context.", True),
+    ("Alice Doe is the prime minister.", "A false report claimed:\nAlice Doe is the prime minister.", "Economic context.", False),
+])
+def test_deep_research_current_role_relationships(answer, source, competing, accepted):
+    results = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/news", "content": source}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/news", "content": competing}},
+    ]
+    result = evidence_supported_answer(answer, "Current news in depth", results, research_mode="deep")
+    assert result == (answer if accepted else "I can't safely verify that current office-holder from the fetched evidence.")
+
+
+@pytest.mark.parametrize("metadata", [{"published": "2015-10-19T00:00:00Z"}, {"date": "2015-10-19"}])
+def test_deep_research_historical_official_article_needs_current_corroboration(metadata):
+    answer = "Alice Doe is the prime minister."
+    evidence = [{"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://canada.gc.ca/announcement", "content": answer, **metadata,
+    }}]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") != answer
+    today = datetime.now().date().isoformat()
+    evidence.append({"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://independent.example/news", "content": answer + " A new policy accompanies the appointment.", "published": today,
+    }})
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
+
+
+def test_deep_research_historical_conflict_does_not_overrule_current_official_article():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/current", "content": answer, "published": datetime.now().date().isoformat()}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/archive", "content": "Bob Roe is the prime minister.", "published": "2015-10-19"}},
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
+
+
+def test_deep_research_copied_articles_do_not_corroborate_current_roles():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": url, "content": answer}}
+        for url in ("https://one.example/news", "https://two.example/news")
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") != answer
+
+
+def test_deep_research_fresh_authority_is_not_lost_to_an_older_duplicate():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/archive", "content": answer, "published": "2015-10-19"}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/current", "content": answer, "published": datetime.now().date().isoformat()}},
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
+
+
+def test_research_fetch_candidates_deduplicates_and_prioritizes_diverse_authoritative_sources():
+    result = {
+        "results": [
+            {"url": "https://commercial.example/first"},
+            {"url": "https://commercial.example/second"},
+            {"url": "https://www.canada.gc.ca/releases/one"},
+            {"url": "https://independent.example/report"},
+            {"url": "https://commercial.example/first"},
+        ]
+    }
+    assert research_fetch_candidates(result, set(), set(), 3) == [
+        "https://canada.gc.ca/releases/one",
+        "https://commercial.example/first",
+        "https://independent.example/report",
+    ]
+
+
+def test_research_fetch_candidates_choose_a_new_domain_before_a_second_authoritative_url():
+    result = {
+        "results": [
+            {"url": "https://canada.gc.ca/releases/one"},
+            {"url": "https://canada.gc.ca/releases/two"},
+            {"url": "https://commercial.example/report"},
+        ]
+    }
+    assert research_fetch_candidates(result, set(), set(), 2) == [
+        "https://canada.gc.ca/releases/one",
+        "https://commercial.example/report",
+    ]
+
+
+def test_research_evidence_shape_counts_successful_distinct_fetches():
+    evidence = [
+        {"tool": "web_search", "status": "ok", "result": {"results": []}},
+        {"tool": "web_search", "status": "error", "result": {}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://a.example/1", "content": "first"}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://a.example/1", "content": "duplicate"}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://b.example/2", "content": "second"}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://c.example/3", "content": ""}},
+    ]
+    assert research_evidence_shape(evidence) == {
+        "successful_searches": 1,
+        "successful_fetches": 3,
+        "distinct_fetched_urls": 2,
+        "distinct_fetched_domains": 2,
+    }
+
+
 def test_conversational_news_request_becomes_a_clean_search_query():
     # A verbose, conversational phrasing must not be sent to the search
     # backend verbatim: request-verb scaffolding and literal "today"/"now"
@@ -1517,6 +1769,90 @@ def test_media_intent_classifies_the_five_operation_shapes():
     assert media_intent("Do I have The Room on Plex?") == "MEDIA_LIBRARY_QUERY"
     assert media_intent("Do you know the movie The Room?") == "MEDIA_DISCOVERY"
     assert media_intent("Play The Room.") == "MEDIA_PLAY"
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("What's that movie where two cops dress as blonde women?", "MEDIA_DISCOVERY"),
+    ("Do I have White Chicks in Plex?", "MEDIA_LIBRARY_QUERY"),
+    ("Can you request White Chicks?", "MEDIA_REQUEST"),
+    ("How is my White Chicks request doing?", "MEDIA_STATUS"),
+    ("Play White Chicks in the living room", "MEDIA_PLAY"),
+])
+def test_media_operation_contract(text, expected):
+    assert media_intent(text, {}) == expected
+
+
+def test_media_operation_contract_precedence_negatives():
+    assert media_intent("What is White Chicks about?", {}) is None
+    assert media_intent("Can you play the trailer?", {}) == "MEDIA_PLAY"
+    assert media_intent("How is my White Chicks download doing?", {}) == "MEDIA_STATUS"
+    operation, scope = operation_for_plan(
+        "What is White Chicks about?", {}, [("media_plan_goal", {"goal": "What is White Chicks about?"})]
+    )
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
+def test_media_operation_contract_accepts_nominal_media_requests():
+    text = "I want the movie where they get trapped"
+    assert media_intent(text, {}) == "MEDIA_REQUEST"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_REQUEST"
+    assert scope == {}
+
+
+def test_media_operation_contract_keeps_informational_i_need_media_questions_read_only():
+    text = "I need to know which movie Brad Pitt is in"
+    assert media_intent(text, {}) == "MEDIA_DISCOVERY"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
+@pytest.mark.parametrize("text", [
+    "I want to know what movie to request",
+    "I need to know how to get the movie",
+])
+def test_media_operation_contract_keeps_informational_media_questions_non_request(text):
+    assert media_intent(text, {}) is None
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation != "MEDIA_REQUEST"
+    assert scope == {}
+
+
+def test_media_operation_contract_keeps_ambiguous_i_want_to_see_descriptive_media_read_only():
+    text = "I want to see the movie where they get trapped"
+    assert media_intent(text, {}) == "MEDIA_DISCOVERY"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
+def test_media_operation_contract_keeps_plot_verbs_as_discovery():
+    assert media_intent("What's that movie where they get trapped?", {}) == "MEDIA_DISCOVERY"
+
+
+def test_media_operation_contract_rejects_non_media_descriptive_questions():
+    assert media_intent("What is photosynthesis about?", {}) is None
+    assert media_intent("Who is Jane Doe?", {}) is None
+    for text in ("What is OpenAI Codex about?", "What is Jane Doe about?", "What is North Korea about?"):
+        assert media_intent(text, {}) is None
+
+
+def test_descriptive_media_operation_is_preserved_for_media_plan_goal():
+    text = "What's that movie where two cops dress as blonde women?"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
+def test_trying_to_remember_media_plan_goal_preserves_discovery_operation():
+    text = "I'm trying to remember a movie from 1999"
+    planned = preflight_plan(text)
+    assert planned == [("media_plan_goal", {"goal": text})]
+    operation, scope = operation_for_plan(text, {}, planned)
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
 
 
 def test_media_intent_titleless_request_is_still_media_request():

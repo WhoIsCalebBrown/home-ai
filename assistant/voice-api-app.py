@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextvars
+import contextlib
 import hashlib
 import hmac
 import io
@@ -11,21 +12,27 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
+import anyio
 import httpx
 import yaml
 from semantic_routing import discovery_context, has_referential_language, narrow_capability_entries, retrieval_confidence, semantic_query
 from subject_model import PendingOffer, ResolvedSubject, UnresolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action, unresolved_subject_from_dict
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
 from wyoming.tts import Synthesize
 from tts_audio import prepend_silence
+from trace_projection import MAX_SOURCES_PER_SEARCH, MAX_TRACE_ENTRIES, clean_text, project_trace, safe_display_url
+from progress_events import ProgressPreamble, emit_tool_progress, progress_sink_context
+from openwebui_speech import display_atoms, resolve_part
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -59,6 +66,7 @@ DISCOVERY_AUDIT_LOG = os.getenv("DISCOVERY_AUDIT_LOG", "/app/pronunciation/disco
 OPENAI_COMPAT_API_KEY = os.getenv("OPENAI_COMPAT_API_KEY", "")
 OPENAI_COMPAT_API_KEY_FILE = os.getenv("OPENAI_COMPAT_API_KEY_FILE", "")
 OPENAI_COMPAT_MODEL = os.getenv("OPENAI_COMPAT_MODEL", "home-ai")
+OPENAI_STREAM_TIMEOUT_SECONDS = 180
 
 
 def _openai_compat_key() -> str:
@@ -257,24 +265,59 @@ turn_trace_context = contextvars.ContextVar("turn_trace_context", default={})
 # tool trace. Keep the corresponding speech-only response separately so its
 # TTS request does not parse UI/diagnostic markup.
 openai_tts_text_by_display_digest: dict[str, tuple[float, str]] = {}
+openai_tts_atoms_by_display_digest: dict[str, list[tuple[str, str]]] = {}
 OPENAI_TTS_TEXT_TTL = 15 * 60
+OPENAI_TTS_MAX_ENTRIES = 256
+
+
+def _purge_openai_tts_registry(now: float) -> None:
+    for key, (created, _) in list(openai_tts_text_by_display_digest.items()):
+        if now - created > OPENAI_TTS_TEXT_TTL:
+            openai_tts_text_by_display_digest.pop(key, None)
+    for key in list(openai_tts_atoms_by_display_digest):
+        if key not in openai_tts_text_by_display_digest:
+            openai_tts_atoms_by_display_digest.pop(key, None)
 
 
 def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
     digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
     now = time.time()
+    _purge_openai_tts_registry(now)
+    if OPENAI_TTS_MAX_ENTRIES <= 0:
+        return
+    if digest not in openai_tts_text_by_display_digest:
+        while len(openai_tts_text_by_display_digest) >= OPENAI_TTS_MAX_ENTRIES:
+            oldest_key = min(
+                openai_tts_text_by_display_digest,
+                key=lambda key: openai_tts_text_by_display_digest[key][0],
+            )
+            openai_tts_text_by_display_digest.pop(oldest_key, None)
+            openai_tts_atoms_by_display_digest.pop(oldest_key, None)
     openai_tts_text_by_display_digest[digest] = (now, spoken_text)
-    for key, (created, _) in list(openai_tts_text_by_display_digest.items()):
-        if now - created > OPENAI_TTS_TEXT_TTL:
-            openai_tts_text_by_display_digest.pop(key, None)
+    openai_tts_atoms_by_display_digest[digest] = display_atoms(display_text, spoken_text)
+
+
+def _registered_openai_speech(display_text: str) -> str | None:
+    now = time.time()
+    _purge_openai_tts_registry(now)
+    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
+    entry = openai_tts_text_by_display_digest.get(digest)
+    if entry and now - entry[0] <= OPENAI_TTS_TEXT_TTL:
+        return entry[1]
+    silent_match = False
+    for key in reversed(openai_tts_text_by_display_digest):
+        resolved = resolve_part(display_text, openai_tts_atoms_by_display_digest.get(key, []))
+        if resolved:
+            return resolved
+        silent_match |= resolved == ""
+    if silent_match:
+        return ""
+    return None
 
 
 def spoken_text_for_openai_display(display_text: str) -> str:
-    digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
-    entry = openai_tts_text_by_display_digest.get(digest)
-    if entry and time.time() - entry[0] <= OPENAI_TTS_TEXT_TTL:
-        return entry[1]
-    return display_text
+    registered = _registered_openai_speech(display_text)
+    return display_text if registered is None else registered
 
 
 async def check_tools_backend() -> None:
@@ -1035,9 +1078,123 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
             f"{torbox.get('errored', 0)} errored, and {torbox.get('pulling', 0)} pulling.")
 
 
-def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None) -> str:
+def current_role_relationships(text: str) -> list[tuple[str, str, bool]]:
+    """Detect plausible named-person relationships, never arbitrary copulas.
+
+    Detection is intentionally broader than positive source support. Proper
+    names, either copular direction, and title-before-name syntax work without
+    a dictionary of people or offices. Capitalized multiword names distinguish
+    these constructions from ordinary prose such as 'Inflation is slowing'.
+    """
+    word = r"[A-ZÀ-ÖØ-Þ][^\W\d_]*(?:['’\-][^\W\d_]+)*"
+    person = rf"{word}(?:[ \t]+{word}){{1,4}}"
+    negative = r"(?P<negative>(?i:not|no longer)\s+)?"
+    forward = re.compile(rf"(?P<name>{person})\s+(?i:is|serves as|remains)\s+{negative}(?P<title>[^.!?;:\n,()—]+)")
+    reverse = re.compile(rf"(?P<title>[^.!?;:\n,()—]+?)\s+(?i:is|remains)\s+{negative}(?P<name>{person})(?![\w'’\-])")
+    titled = re.compile(rf"(?<![\w'’\-])(?P<words>{word}(?:[ \t]+{word}){{2,6}})\s+(?=[a-z])")
+    relationships = []
+    for clause in re.split(r"[.!?;:\n]", text):
+        occupied = []
+        for pattern in (reverse, forward):
+            for match in pattern.finditer(clause):
+                if any(start < match.end() and match.start() < end for start, end in occupied):
+                    continue
+                if (pattern is reverse and re.fullmatch(person, match["title"].strip())
+                        and not re.match(r"(?:the|current)\b", match["title"], re.I)):
+                    continue  # Two proper-name-shaped sides default to person first.
+                name = " ".join(match["name"].casefold().split())
+                title = " ".join(match["title"].casefold().split())
+                if pattern is forward and re.match(r"\w{2,}ing(?:\s|$)", title):
+                    continue  # A progressive verb is not a nominal office.
+                title = re.sub(r"^(?:the\b\s*)?(?:current\b\s*)?", "", title)
+                if not re.fullmatch(r"[^\W\d_][\w'’ -]*", title):
+                    continue
+                relationships.append((name, title, bool(match["negative"])))
+                occupied.append(match.span())
+        for match in titled.finditer(clause):
+            if any(start < match.end() and match.start() < end for start, end in occupied):
+                continue
+            words = match["words"].split()
+            title = " ".join(words[:-2]).casefold()
+            title = re.sub(r"^(?:the\b\s*)?(?:current\b\s*)?", "", title)
+            if title:
+                relationships.append((" ".join(words[-2:]).casefold(), title, False))
+    return list(dict.fromkeys(relationships))
+
+
+def research_article_freshness(result: dict, now: float) -> str:
+    """Treat known old/unparseable dates as historical, never current proof.
+
+    Undated official pages remain usable as live institutional pages. Dated
+    office-holder reports are current only within 31 days; historical official
+    assertions require a separate, explicitly current corroborating article.
+    """
+    value = result.get("published") or result.get("date")
+    if not value:
+        return "undated"
+    try:
+        published = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).date()
+        age = (datetime.fromtimestamp(now).date() - published).days
+        return "current" if 0 <= age <= 31 else "historical"
+    except ValueError:
+        return "historical"
+
+
+def fetched_current_role_supported(name: str, title: str, results: list[dict], now: float) -> bool:
+    """Require a direct, current and authoritative/corroborated relationship."""
+    support = []
+    seen_content = set()
+    current_authority = False
+    # Complete direct sentences supply support in either direction. A colon,
+    # quote, newline introduction or qualification cannot become positive proof.
+    person_first = rf"{re.escape(name)} (?:is|serves as|remains) (?:the )?(?:current )?{re.escape(title)}\.?"
+    role_first = rf"(?:the )?(?:current )?{re.escape(title)} (?:is|remains) {re.escape(name)}\.?"
+    for item in results:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        url = normalized_research_url(result.get("url"))
+        content = str(result.get("content") or "").strip()
+        if item.get("tool") != "web_fetch" or item.get("status") != "ok" or not url or not content:
+            continue
+        freshness = research_article_freshness(result, now)
+        direct_support = False
+        for sentence in re.split(r"(?<=[.!?])\s+", content):
+            canonical = " ".join(sentence.casefold().split())
+            direct = bool(re.fullmatch(person_first, canonical) or re.fullmatch(role_first, canonical))
+            if freshness != "historical":
+                for other_name, other_title, negated in current_role_relationships(sentence):
+                    if other_title != title and not other_title.startswith(title + " "):
+                        continue
+                    if (negated and other_name == name) or (not negated and other_name != name):
+                        return False
+                    if not negated and other_name == name and not direct:
+                        return False  # A qualification/attribution is unresolved.
+            direct_support = direct_support or direct
+        signature = " ".join(content.casefold().split())
+        current_authority = current_authority or (direct_support and research_authoritative(url) and freshness != "historical")
+        if direct_support and signature not in seen_content:
+            support.append((research_publisher(url), research_authoritative(url), freshness))
+            seen_content.add(signature)
+    if current_authority:
+        return True
+    current_publishers = {publisher for publisher, _, freshness in support if freshness != "historical"}
+    if len(current_publishers) >= 2:
+        return True
+    return any(
+        authority and freshness == "historical" and any(
+            other != publisher and other_freshness == "current"
+            for other, _, other_freshness in support
+        )
+        for publisher, authority, freshness in support
+    )
+
+
+def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None, research_mode: str = "quick") -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
+    if research_mode == "deep" and current_news_intent(user_text):
+        if any(not fetched_current_role_supported(name, title, results, time.time())
+               for name, title, negated in current_role_relationships(answer) if not negated):
+            return "I can't safely verify that current office-holder from the fetched evidence."
     web_items = [item for item in results if item.get("tool") == "web_search"]
     if web_items and re.search(r"\b(?:don't|do not|cannot|can't)\s+(?:have|access)|\bno access to (?:live )?(?:news|the web)|\bcan't tell you what's happening", answer, re.I):
         successful = [item for item in web_items if item.get("status") == "ok" and isinstance(item.get("result"), dict)]
@@ -1855,6 +2012,11 @@ async def emit_answer(ws: WebSocket, request_id: str, text: str, client_id: str 
         await speak(ws, request_id, chunk, prepared=True)
 
 
+async def emit_trace(ws: WebSocket, request_id: str, live_results: list[dict]) -> None:
+    """Send only the bounded display projection to graphical clients."""
+    await ws.send_json({"type": "trace", "request_id": request_id, "entries": project_trace(live_results)})
+
+
 def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) -> dict:
     """Repair only bounded, obvious Home Assistant argument omissions from Qwen."""
     if name != "home_control" or not isinstance(arguments, dict):
@@ -2027,12 +2189,14 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
         trace_id = str(correlation.get("trace_id") or request_id)
         turn_id = str(correlation.get("turn_id") or request_id)
         async with httpx.AsyncClient(timeout=15) as http:
+            await emit_tool_progress(name, arguments, "started")
             response = await http.post(f"{TOOLS_URL}/invoke", json={
                 "name": name, "arguments": arguments, "client_id": client_id,
                 "session_id": client_id, "confirmed": confirmed, "action_id": action_id,
                 "trace_id": trace_id, "turn_id": turn_id, "tool_call_id": tool_call_id},
                 headers=_tools_service_headers())
             if response.status_code == 404:
+                await emit_tool_progress(name, arguments, "failed")
                 return {"tool": name, "status": "error", "transport_ok": True, "operation_ok": False,
                         "tool_call_id": tool_call_id, "result": {"error": "That tool is not enabled.", "evidence_available": False}}
             response.raise_for_status()
@@ -2049,8 +2213,11 @@ async def invoke_tool(name: str, arguments: dict, client_id: str, request_id: st
                              "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                              "sources_checked": result.get("sources_checked", []) if isinstance(result, dict) else [],
                              "result_keys": sorted(result.keys()) if isinstance(result, dict) else []})
+            phase = "finished" if payload.get("status") == "ok" and payload.get("operation_ok", True) is not False else "failed"
+            await emit_tool_progress(name, arguments, phase, result)
             return payload
     except Exception as exc:
+        await emit_tool_progress(name, arguments, "failed")
         return {"tool": name, "status": "error", "transport_ok": False, "operation_ok": False,
                 "tool_call_id": locals().get("tool_call_id"),
                 "result": {"error": "Tool service unavailable", "detail": type(exc).__name__, "evidence_available": False,
@@ -2271,6 +2438,21 @@ def media_acquisition_language(text: str) -> bool:
     )
 
 
+def informational_media_continuation(text: str) -> bool:
+    """Recognize requests to learn about media rather than acquire it."""
+    return bool(re.match(
+        r"\s*i\s+(?:want|need)\s+to\s+(?:know|find\s+out|remember|learn|"
+        r"figure\s+out|identify|understand|see|check)\b",
+        text,
+        re.I,
+    ) or re.search(
+        r"\bfind\s+out\b|\b(?:give|get|request|want|need|obtain)\s+"
+        r"(?:me\s+)?(?:some\s+)?(?:information|info|details|facts|a\s+summary)\b",
+        text,
+        re.I,
+    ))
+
+
 def media_goal_request(text: str) -> bool:
     """True only for library-goal language, never direct file delivery/playback.
 
@@ -2287,9 +2469,46 @@ def media_goal_request(text: str) -> bool:
     return (
         media_acquisition_language(text)
         and media_identity_signal(text)
+        and not informational_media_continuation(text)
         and not direct_file_request(text)
         and not playback_request(text)
         and not media_status_question(text)
+    )
+
+
+def media_acquisition_request_frame(text: str) -> bool:
+    """Recognize an acquisition verb used as the user's actual request.
+
+    Plot descriptions routinely contain words such as ``get``; acquisition
+    requires an imperative or an explicit request frame. Unqualified ``find``
+    asks for identification/search and does not authorize acquisition. This
+    narrower predicate is used where a title-shaped subject is present.
+    """
+    # Keep these bounded informational continuations ahead of the
+    # descriptive `I want/need ... movie` frame.
+    if informational_media_continuation(text):
+        return False
+    if re.search(
+        r"\b(?:do\s+not|don't|dont|not|never|without)\s+"
+        r"(?:get|give|grab|add|find|request|want|obtain|requesting|adding|getting)\b",
+        text,
+        re.I,
+    ):
+        return False
+    return bool(
+        re.match(
+            r"\s*i\s+(?:want|need)\s+(?:(?:a|an|the)\s+)?"
+            r"(?:[\w'-]+\s+){0,6}?(?:movie|film|show|series|season|episode|album|music|anime)\b",
+            text,
+            re.I,
+        )
+        or re.match(
+            r"\s*(?:(?:can|could|would|will)\s+(?:you|i)\s+|"
+            r"i\s+(?:want|need)\s+(?:to\s+)?|i(?:'d| would)\s+like\s+(?:to\s+)?|"
+            r"please\s+)?(?:get|give|grab|add|request|want|obtain)\b",
+            text,
+            re.I,
+        )
     )
 
 
@@ -2305,7 +2524,7 @@ def media_library_query(text: str) -> bool:
                 or re.search(r"\bplex\b.*\b(?:do i have|do we have|is there)\b", text, re.I))
 
 
-def media_intent(text: str) -> str | None:
+def media_intent(text: str, context: dict | None = None) -> str | None:
     """Classify which media OPERATION an utterance is asking for, before
     any title/media-identity resolution happens. Not every sentence that
     contains a potential title means "request this" -- a status check, a
@@ -2317,7 +2536,9 @@ def media_intent(text: str) -> str | None:
     named, testable classification rather than duplicating their logic --
     each of those predicates remains the actual routing authority; this
     function documents and verifies their combined, mutually-exclusive
-    intent surface for the media domain.
+    intent surface for the media domain. ``context`` is accepted so callers
+    can classify an operation against the same per-turn contract they use to
+    stage it; current explicit utterances remain authoritative.
     """
     if direct_file_request(text):
         return None
@@ -2327,9 +2548,13 @@ def media_intent(text: str) -> str | None:
         return "MEDIA_STATUS"
     if media_library_query(text):
         return "MEDIA_LIBRARY_QUERY"
-    if media_goal_request(text):
+    if re.search(r"\b(?:find|search|look)\b.*\b(?:online|web|internet)\b", text, re.I):
+        return "MEDIA_DISCOVERY"
+    descriptive_clue = _descriptive_media_clue(text)
+    descriptive_media = descriptive_clue and media_identity_signal(text)
+    if media_acquisition_request_frame(text) and (media_identity_signal(text) or descriptive_clue):
         return "MEDIA_REQUEST"
-    if discovery_question(text) and media_identity_signal(text):
+    if descriptive_media or (discovery_question(text) and media_identity_signal(text)):
         return "MEDIA_DISCOVERY"
     return None
 
@@ -2402,7 +2627,8 @@ def referential_media_request(text: str, context: dict | None = None) -> bool:
     if not isinstance(context.get("canonical_identity"), dict):
         return False
     return bool(re.fullmatch(
-        r"\s*(?:(?:okay|ok|well|then)[,.]?\s+)?(?:please\s+)?"
+        r"\s*(?:no[?.,!]\s*)?(?:(?:okay|ok|well|then)[,.]?\s+)?"
+        r"(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
         r"(?:get|add|request|grab)\s+(?:it|that|this|the\s+one)\s*[?!.,]*\s*",
         text,
         re.I,
@@ -2537,11 +2763,16 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
     # here made an unrelated successful turn silently re-promote stale state;
     # the bounded branches below are the only places where an elliptical
     # follow-up is allowed to carry an operation forward.
-    operation = media_intent(text)
+    operation = media_intent(text, context)
     scope: dict = {}
     names = {name for name, _ in planned}
-    if "media_plan_goal" in names and (referential_media_request(text, context) or media_acquisition_language(text)):
-        operation = "MEDIA_REQUEST"
+    if "media_plan_goal" in names:
+        if operation != "MEDIA_DISCOVERY" and (referential_media_request(text, context) or media_acquisition_request_frame(text)):
+            operation = "MEDIA_REQUEST"
+        elif referential_media_library_question(text, context):
+            operation = "MEDIA_LIBRARY_QUERY"
+        elif operation is None:
+            operation = "MEDIA_DISCOVERY"
     elif "plex_library_counts" in names:
         operation = "PLEX_LIBRARY_COUNT"
         category = library_count_category(text)
@@ -2554,8 +2785,6 @@ def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]
         operation = "STORAGE_CAPACITY"
         if arguments.get("target"):
             scope["target"] = arguments["target"]
-    elif "media_plan_goal" in names and referential_media_library_question(text, context):
-        operation = "MEDIA_LIBRARY_QUERY"
     elif "web_search" in names and referential_web_query(text, context):
         operation = "MEDIA_WEB_RESEARCH"
     return operation, scope
@@ -2624,7 +2853,7 @@ def media_status_question(text: str) -> bool:
     # because the movie's own multi-word capitalized TITLE matched the
     # same two-Title-Case-words shape used to detect a person's name.
     strong_status_marker = re.search(
-        r"\brequest\b.{0,25}\b(?:going|done|finish(?:ed)?|status|ready)\b"
+        r"\b(?:request|download(?:ing|ed)?)\b.{0,25}\b(?:going|doing|done|finish(?:ed)?|status|ready)\b"
         r"|\bstatus\s+of\b"
         r"|\bdownload(?:ed|ing)?\s+yet\b",
         routed_text, re.I,
@@ -3860,14 +4089,232 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     return list(dict((name, args) for name, args in plan).items())
 
 
-def research_profile(text: str) -> dict[str, int | str]:
+def current_news_intent(text: str) -> bool:
+    """News freshness and answer depth are independent user intentions."""
+    return bool(re.search(r"\b(news|headlines|current events|latest developments|recent developments|what(?:'s| is) happening)\b", text, re.I))
+
+
+def research_profile(text: str) -> dict[str, int | str | bool]:
     """Choose a bounded web-research budget from explicit user intent."""
     lowered = text.casefold()
     if re.search(r"\b(in[- ]depth|deep dive|deeply|comprehensive|thorough|full picture|detailed review|properly research|research this)\b", lowered):
-        return {"mode": "deep", "iterations": 8, "max_calls": 16, "num_predict": 720}
+        news = current_news_intent(text)
+        return {"mode": "deep", "current_news": news, "iterations": 8, "max_calls": 16, "num_predict": 720, "minimum_searches": 3 if news else 0, "minimum_fetches": 2 if news else 0}
     if re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered):
-        return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360}
-    return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180}
+        return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360, "minimum_searches": 1, "minimum_fetches": 1}
+    return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180, "minimum_searches": 1, "minimum_fetches": 0}
+
+
+def normalized_research_url(value: object) -> str:
+    """Validate an article URL and discard only its fragment."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        host = (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
+        if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+                or not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", host)):
+            return ""
+        port = parsed.port
+        netloc = host + (f":{port}" if port and port != {"http": 80, "https": 443}[parsed.scheme] else "")
+        return parsed._replace(netloc=netloc, fragment="").geturl()
+    except ValueError:
+        return ""
+
+
+def research_publisher(value: str) -> str:
+    """Conservatively group subdomains in every evidence/selection boundary.
+
+    Last-two-label grouping may undercount multi-label public suffixes, but
+    cannot call two publisher subdomains independent without a suffix database.
+    """
+    host = urlsplit(value).hostname if "://" in value else value
+    return ".".join(str(host or "").casefold().rstrip(".").split(".")[-2:])
+
+
+def research_authoritative(url: str) -> bool:
+    host = urlsplit(url).hostname or ""
+    return any(host == suffix or host.endswith("." + suffix)
+               for suffix in ("gov", "gc.ca", "gov.uk", "gov.au", "gov.nz"))
+
+
+def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: set[str], limit: int) -> list[str]:
+    """Choose normalized fetch URLs, favoring primary sources and coverage diversity."""
+    normalized_seen_urls = {
+        normalized for value in seen_urls if (normalized := normalized_research_url(value))
+    }
+    normalized_seen_domains = {research_publisher(value) for value in seen_domains}
+    options = []
+    for index, item in enumerate(result.get("results", []) if isinstance(result, dict) else []):
+        url = normalized_research_url(item.get("url") if isinstance(item, dict) else None)
+        if not url or url in normalized_seen_urls:
+            continue
+        domain = research_publisher(url)
+        if any(existing[1] == url for existing in options):
+            continue
+        options.append((index, url, domain, research_authoritative(url)))
+
+    selected = []
+    selected_domains = set(normalized_seen_domains)
+    while options and len(selected) < max(limit, 0):
+        def candidate_rank(option: tuple[int, str, str, bool]) -> tuple[int, int, int]:
+            return (
+                0 if option[2] not in selected_domains else 1,
+                0 if option[3] else 1,
+                option[0],
+            )
+
+        choice = min(
+            options,
+            key=candidate_rank,
+        )
+        options.remove(choice)
+        selected.append(choice[1])
+        selected_domains.add(choice[2])
+    return selected
+
+
+def research_evidence_shape(live_results: list[dict]) -> dict[str, int]:
+    """Summarize successful web evidence without making network calls."""
+    successful_searches = 0
+    successful_fetches = 0
+    fetched_urls = set()
+    fetched_domains = set()
+    fetched_content = set()
+    for item in live_results:
+        if not isinstance(item, dict) or item.get("status") != "ok":
+            continue
+        if item.get("tool") == "web_search":
+            successful_searches += 1
+            continue
+        if item.get("tool") != "web_fetch":
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if not str(result.get("content") or "").strip():
+            continue
+        successful_fetches += 1
+        url = normalized_research_url(result.get("url"))
+        signature = " ".join(str(result["content"]).casefold().split())
+        if not url or url in fetched_urls or signature in fetched_content:
+            continue
+        fetched_urls.add(url)
+        fetched_domains.add(research_publisher(url))
+        fetched_content.add(signature)
+    return {
+        "successful_searches": successful_searches,
+        "successful_fetches": successful_fetches,
+        "distinct_fetched_urls": len(fetched_urls),
+        "distinct_fetched_domains": len(fetched_domains),
+    }
+
+
+def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) -> bool:
+    """Require independently fetched evidence before a deep-research answer."""
+    evidence = research_evidence_shape(live_results)
+    if evidence["successful_searches"] < 3:
+        return False
+    if evidence["successful_fetches"] == 0:
+        return False
+    if not candidate_urls_exist:
+        return True
+    return (
+        evidence["successful_fetches"] >= 2
+        and evidence["distinct_fetched_urls"] >= 2
+        and evidence["distinct_fetched_domains"] >= 2
+    )
+
+
+def canadian_news_relevant(text: str, user_text: str) -> bool:
+    """Require Canadian context and any explicitly requested news topic."""
+    # These place names also occur abroad or as animal breeds. Remove explicit
+    # foreign uses; Labrador alone is not geographic evidence.
+    geography = re.sub(r"\bOntario\s*[,]?\s*(?:California|Oregon|CA|United States|USA)\b", "", text, flags=re.I)
+    if not re.search(
+        r"\b(?:canada|canadians?|ottawa|ontario|qu[eé]bec|alberta|british columbia|"
+        r"manitoba|saskatchewan|nova scotia|new brunswick|newfoundland|"
+        r"prince edward island|nunavut|yukon|northwest territories|"
+        r"(?:province|region|territory) of labrador|labrador (?:region|peninsula|coast))\b",
+        geography, re.I,
+    ):
+        return False
+    # Only recognized category phrases impose a topical constraint. Request
+    # words such as "are", "want", or "briefly" never become article evidence,
+    # and generic news requests need no growing list of conversational fillers.
+    categories = {
+        r"technology|technological|tech|AI|artificial intelligence":
+            r"technolog(?:y|ies|ical)|tech|software|hardware|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cybersecurity|cyberattacks?",
+        r"politics|political|government":
+            r"politic(?:s|al)|government|parliament|parliamentary|elections?|legislation|legislative",
+        r"economy|economics|economic":
+            r"econom(?:y|ics|ic)|inflation|interest rates?|employment|GDP",
+        r"business|commerce|financial|finance":
+            r"business(?:es)?|companies|corporate|commerce|trade|financ(?:e|ial)|markets?",
+        r"health|healthcare|medical":
+            r"health(?:care)?|hospitals?|medical|medicine|diseases?",
+        r"science|scientific":
+            r"science|scientific|scientists?|research(?:ers)?|discovery|discoveries",
+        r"sports?|athletics":
+            r"sports?|hockey|football|soccer|baseball|basketball|tennis|athletics|athletes?",
+        r"entertainment|arts|culture|cultural":
+            r"entertainment|arts|culture|cultural|films?|movies?|cinema|music|theatre|theater|festivals?",
+    }
+    topics = [evidence for requested, evidence in categories.items()
+              if re.search(r"\b(?:" + requested + r")\b", user_text, re.I)]
+    return not topics or any(re.search(r"\b(?:" + topic + r")\b", text, re.I) for topic in topics)
+
+
+def canadian_news_evidence(live_results: list[dict], now: float, recency_days: int, user_text: str = "") -> list[dict]:
+    """Keep dated Canadian articles; searches count as work, never as proof.
+
+    Publisher nationality and discovery snippets alone cannot establish the
+    article's scope. Unknown dates cannot establish same-day coverage either.
+    This is a roundup eligibility filter, never the officeholder guard's input.
+    Calendar dates and timestamped instants use America/Toronto consistently.
+    """
+    local_now = datetime.fromtimestamp(now, ZoneInfo("America/Toronto"))
+    today = local_now.date()
+    evidence = []
+    for item in live_results:
+        if item.get("tool") == "web_search":
+            evidence.append(item)
+            continue
+        if item.get("tool") != "web_fetch" or item.get("status") != "ok":
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        content = str(result.get("content") or "").strip()
+        if not content or not canadian_news_relevant(str(result.get("title") or "") + " " + content, user_text):
+            continue
+        try:
+            value = str(result.get("published") or result.get("date") or "").strip()
+            published = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                date = published.date()
+            else:
+                # Unzoned timestamps use the same explicit local calendar as
+                # date-only metadata; compare instants before taking the date.
+                published = published.replace(tzinfo=local_now.tzinfo) if published.tzinfo is None else published
+                if published.timestamp() > now:
+                    continue
+                date = published.astimezone(local_now.tzinfo).date()
+        except ValueError:
+            continue
+        if 0 <= (today - date).days < recency_days:
+            evidence.append(item)
+    return evidence
+
+
+def deep_research_synthesis_instruction(shape: dict[str, int]) -> str:
+    """Tell final synthesis how to use a ready deep-research evidence set."""
+    source_count = shape.get("distinct_fetched_domains", 0)
+    return (
+        "The user explicitly requested depth, so the normal short-answer default does not apply. "
+        "Organize several distinct supported developments with their context and significance. "
+        "A multi-paragraph answer is appropriate when the supported developments need it. "
+        f"Base the roundup on the {source_count} independent publishers with distinct fetched coverage in the current evidence. "
+        "Current office-holder claims require fetched evidence. Use only fetched evidence for current "
+        "office-holders and institutional facts; search snippets do not establish those facts. "
+        "Historical articles require current corroboration for current claims. Respect the available publication dates. "
+        "Omit conflicts that cannot be resolved from fetched sources. "
+        "Never mention internal tool names or the research process."
+    )
 
 
 def compact_research_result(name: str, result: dict, *, deep: bool = False) -> dict:
@@ -3886,6 +4333,8 @@ def compact_research_result(name: str, result: dict, *, deep: bool = False) -> d
 
 def research_tool_instruction(profile: dict[str, int | str]) -> str:
     mode = profile["mode"]
+    if mode == "deep" and not profile.get("current_news"):
+        return "The user requested a detailed answer. Use live tools only if the subject requires external evidence."
     if mode == "quick":
         return "Use the web minimally for this lookup: one focused search and fetch at most the strongest source if needed."
     if mode == "normal":
@@ -3976,12 +4425,12 @@ def is_confirmation(text: str) -> bool:
     ))
 
 
-def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> None:
-    """Retain the exact planner-issued media binding for a later approval turn."""
+def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> dict | None:
+    """Retain and return the exact planner-issued media authorization."""
     if not result.get("confirmation_required"):
         return
     record = result.get("confirmation_record")
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or not record.get("confirmation_id"):
         return
     arguments = dict(record.get("arguments") or {})
     if not arguments.get("workflow_id") or not arguments.get("canonical_external_id"):
@@ -3994,7 +4443,7 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
     pending[client_id] = {
         "name": "media_standard_request" if record.get("operation", "").startswith("cli_debrid.") else "media_execute_goal",
         "arguments": arguments,
-        "action_id": record.get("confirmation_id") or str(uuid.uuid4()),
+        "action_id": record["confirmation_id"],
         "conversation_id": client_id,
         "session_id": client_id,
         "expires": time.time() + 120,
@@ -4020,6 +4469,74 @@ def stage_media_confirmation(client_id: str, request_id: str, result: dict) -> N
         },
     })
     conversation_context[client_id] = prior
+    return pending[client_id]
+
+
+def media_request_outcome(action: dict, result: dict) -> str:
+    """Record and render executor evidence; transport success is not ingestion."""
+    client_id = action["session_id"]
+    details = result.get("result") if isinstance(result.get("result"), dict) else {}
+    outer_status = result.get("status")
+    status = details.get("status")
+    reason = details.get("reason") or details.get("error")
+    media_state = dict(conversation_context.get(client_id, {}))
+    media_state.update({
+        "domain": "media", "kind": "media_workflow", "group": "media",
+        "referent_type": "media_workflow", "referent_ids": [action.get("canonical_external_id")],
+        "latest_media_workflow": {
+            "workflow_id": action.get("workflow_id"),
+            "canonical_external_id": action.get("canonical_external_id"),
+            "media_type": action.get("arguments", {}).get("media_type"),
+            "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
+            "mode": "standard", "execution_status": status or outer_status, "reason": reason,
+        },
+    })
+    conversation_context[client_id] = media_state
+    if outer_status != "ok":
+        return "I couldn't hand that request off to your media queue."
+    if status == "submitted" and details.get("ingestion_confirmed"):
+        return "Done. It's looking for it now."
+    if status == "no_op":
+        if reason and reason.startswith("ALREADY_AVAILABLE"):
+            return "You already have that -- no need to request it again."
+        return "That's already been taken care of, no action needed."
+    if status == "failed_ingestion":
+        return "I couldn't hand that off to your media queue."
+    if status in {"rejected", "disabled"}:
+        if reason in {"STANDARD_SEASON_WRITES_DISABLED", "STANDARD_EPISODE_SCOPE_UNSUPPORTED"}:
+            return "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
+        if reason == "STANDARD_MOVIE_WRITES_DISABLED":
+            return "Movie requests aren't turned on for me yet."
+        if reason in {"STANDARD_MEDIA_WRITES_DISABLED", "STANDARD_MEDIA_BACKEND_NOT_READY", "BRIDGE_SECRET_MISSING"}:
+            return "The media request system isn't available right now, so nothing was requested."
+        if reason in {"CONFIRMATION_BINDING_REQUIRED", "CONFIRMATION_SESSION_OR_STATUS_INVALID"}:
+            return "That confirmation expired or didn't match up -- go ahead and ask again."
+        return "I couldn't hand that off to your media system."
+    return "I couldn't confirm that media request was accepted."
+
+
+async def execute_bound_media_request(client_id: str, request_id: str, action: dict) -> str:
+    """Consume only a stored planner action, never reconstructed title arguments."""
+    result = await invoke_tool(action["name"], action["arguments"], client_id, request_id,
+                               confirmed=True, action_id=action["action_id"])
+    return media_request_outcome(action, result)
+
+
+async def complete_media_plan(client_id: str, request_id: str, result: dict, operation: str | None) -> str | None:
+    """An explicit standard request authorizes its now-unambiguous bound plan."""
+    plan = result.get("result") if isinstance(result.get("result"), dict) else {}
+    if (result.get("status") != "ok" or operation != "MEDIA_REQUEST"
+            or plan.get("ambiguous") or not plan.get("canonical_identity")):
+        return None
+    action = stage_media_confirmation(client_id, request_id, plan)
+    if action and action["name"] == "media_standard_request":
+        # Claim the exact newly staged action before the first await. The
+        # executor remains authoritative for session/hash checks and dedup.
+        pending.pop(client_id)
+        return await execute_bound_media_request(client_id, request_id, action)
+    if plan.get("confirmation_required") and not action:
+        return "I couldn't confirm that media request was accepted."
+    return None
 
 
 # Which argument key names the subject of a call to this tool. This is the
@@ -4353,7 +4870,7 @@ def canonical_media_year_answer(context: dict, text: str) -> str | None:
 _DISAMBIGUATION_TTL_SECONDS = 90
 
 
-def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str) -> None:
+def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: str, original_operation: str | None = None) -> None:
     """Persist an ambiguous media_plan_goal's candidate set so the next
     turn's natural-language reply ("the new one", "2021", "the movie") can
     resolve against it, instead of the assistant losing the candidates the
@@ -4364,6 +4881,7 @@ def stage_disambiguation(client_id: str, candidates: list[dict], original_goal: 
     context = dict(conversation_context.get(client_id, {}))
     context["pending_disambiguation"] = {
         "candidates": candidates, "original_goal": original_goal, "created_at": time.time(),
+        "original_operation": original_operation or operation_for_plan(original_goal, context, [("media_plan_goal", {})])[0],
     }
     conversation_context[client_id] = context
 
@@ -4388,12 +4906,48 @@ def stage_title_clarification(client_id: str, original_goal: str) -> None:
     pending_offers/pending_disambiguation -- not a fourth state-tracking
     style."""
     context = dict(conversation_context.get(client_id, {}))
-    context["pending_title_clarification"] = {"original_goal": original_goal, "created_at": time.time()}
+    context["pending_title_clarification"] = {
+        "original_goal": original_goal, "created_at": time.time(),
+        "original_operation": operation_for_plan(original_goal, context, [("media_plan_goal", {})])[0],
+    }
     conversation_context[client_id] = context
 
 
 def _title_clarification_expired(entry: dict) -> bool:
     return time.time() - float(entry.get("created_at", 0)) > _TITLE_CLARIFICATION_TTL_SECONDS
+
+
+def affirmative_media_selection(text: str, candidates: list[dict]) -> bool:
+    """Require selection language before carrying a prior request's authority.
+
+    Mentioning a candidate's year in a question or rejection is identity
+    evidence, not permission to execute the original request.
+    """
+    if media_acquisition_request_frame(text):
+        return True
+    selection = text.strip().casefold().rstrip(".!?")
+    selection = re.sub(r"^(?:yes|yeah|yep|okay|ok|sure)[,.]?\s+", "", selection)
+    selection = re.sub(r"^(?:i\s+(?:mean|meant|choose|prefer)|let's\s+go\s+with)\s+", "", selection)
+    if re.fullmatch(
+        r"(?:the\s+)?(?:(?:19|20)\d{2}|new|newer|newest|latest|recent|old|older|oldest|"
+        r"original|first|second|movie|film|album|record|show|series|anime|game)"
+        r"(?:\s+(?:one|movie|film|version))?",
+        selection,
+    ):
+        return True
+    for candidate in candidates:
+        title = str(candidate.get("title") or "").strip().casefold()
+        year = candidate.get("year")
+        if title and selection in {title, f"{title} {year}", f"{title} from {year}", f"{title} ({year})"}:
+            return True
+        people = candidate.get("people") or []
+        if isinstance(people, str):
+            people = [people]
+        if isinstance(people, list) and any(
+            selection == f"the {str(person).strip().casefold()} one" for person in people
+        ):
+            return True
+    return False
 
 
 def resolve_disambiguation_reply(text: str, candidates: list[dict]) -> dict | None:
@@ -4482,7 +5036,12 @@ def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     # An explicit request is already in the confirmation path when it is
     # actionable.  Never turn that same request into a read-only offer that
     # asks an equivalent question a second time.
-    operation = conversation_context.get(client_id, {}).get("_pending_operation") or conversation_context.get(client_id, {}).get("latest_operation")
+    context = conversation_context.get(client_id, {})
+    # `operation` is the authoritative classification for this turn.  The
+    # retained fields describe older work and are only fallbacks for generic
+    # continuation offers.  A current discovery or library read must never
+    # turn an informational answer into an acquisition-related follow-up.
+    operation = context.get("_pending_operation") or context.get("operation") or context.get("latest_operation")
     if operation in {"MEDIA_REQUEST", "MEDIA_DISCOVERY", "MEDIA_LIBRARY_QUERY"}:
         return None
     identity = plan_result.get("canonical_identity") or {}
@@ -4551,7 +5110,7 @@ async def stream_final(ws: WebSocket, request_id: str, messages: list[dict], ful
     async def emit_sentence(value: str) -> None:
         if value.strip():
             nonlocal full
-            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain) if guard_user_text else value.strip()
+            safe = evidence_supported_answer(value.strip(), guard_user_text, guard_results or [], guard_domain, research_mode) if guard_user_text else value.strip()
             safe = round_weather_temperatures(safe, guard_user_text, guard_domain) if guard_user_text else repair_decimal_spacing(safe)
             separator = "" if not full or full.endswith((" ", "\n")) else " "
             full += separator + safe
@@ -4931,6 +5490,9 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 enriched_title = f"{unresolved_subject.title_or_name}. {user_text.strip()}"
             enriched = unresolved_subject.enrich(title_or_name=enriched_title, **(enrichment_hint or {}))
             enriched_goal = enriched.resolution_goal_text()
+            enriched_operation = operation_for_plan(user_text, conversation_context.get(client_id, {}), [("media_plan_goal", {})])[0]
+            if enriched_operation == "MEDIA_REQUEST":
+                enriched_goal = f"get {enriched_goal}"
             result = await invoke_tool("media_plan_goal", {"goal": enriched_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_enriched = [result]
@@ -4941,13 +5503,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if not resolved_text:
                     resolved_text = f"I found {plan_result['canonical_identity'].get('title', enriched.title_or_name)}."
                 if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                    executed = await complete_media_plan(client_id, request_id, result, enriched_operation)
+                    resolved_text = executed or resolved_text
                 elif not plan_result.get("ambiguous"):
                     offer_question = stage_media_offer(client_id, plan_result)
                     if offer_question:
                         resolved_text = f"{resolved_text} {offer_question}"
             elif plan_result.get("ambiguous") and plan_result.get("candidates"):
-                stage_disambiguation(client_id, plan_result["candidates"], enriched_goal)
+                stage_disambiguation(client_id, plan_result["candidates"], enriched_goal, enriched_operation)
                 resolved_text = media_plan_response(user_text, live_results_enriched) or "I found more than one possible match. Which one do you mean?"
             else:
                 # Still unresolved even after enrichment: keep the subject
@@ -4961,7 +5524,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 conversation_context[client_id] = context_after
                 resolved_text = f"I still couldn't confirm a match for {enriched.title_or_name}, even with that detail."
             store_provenance(client_id, live_results_enriched)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_enriched)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="unresolved_subject_enrichment")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -4987,7 +5550,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             context_cleared = dict(conversation_context.get(client_id, {}))
             context_cleared.pop("pending_title_clarification", None)
             conversation_context[client_id] = context_cleared
-            result = await invoke_tool("media_plan_goal", {"goal": candidate_title, "session_id": client_id}, client_id, request_id)
+            clarified_operation = operation_for_plan(user_text, context_cleared, [("media_plan_goal", {})])[0]
+            if (clarified_operation == "MEDIA_DISCOVERY"
+                    and user_text.strip().strip(" .!?").casefold() == candidate_title.casefold()
+                    and not re.match(r"\s*(?:do|does|did|what|which|who|when|where|why|how|is|are|can|could|would|will)\b", user_text, re.I)):
+                clarified_operation = title_clarification.get("original_operation")
+            clarified_goal = f"get {candidate_title}" if clarified_operation == "MEDIA_REQUEST" else candidate_title
+            result = await invoke_tool("media_plan_goal", {"goal": clarified_goal, "session_id": client_id}, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             live_results_clarified = [result]
             if plan_result.get("canonical_identity"):
@@ -4997,20 +5566,21 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 if not resolved_text:
                     resolved_text = f"I found {plan_result['canonical_identity'].get('title', candidate_title)}."
                 if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                    executed = await complete_media_plan(client_id, request_id, result, clarified_operation)
+                    resolved_text = executed or resolved_text
                 elif not plan_result.get("ambiguous"):
                     offer_question = stage_media_offer(client_id, plan_result)
                     if offer_question:
                         resolved_text = f"{resolved_text} {offer_question}"
             elif plan_result.get("ambiguous") and plan_result.get("candidates"):
-                stage_disambiguation(client_id, plan_result["candidates"], candidate_title)
+                stage_disambiguation(client_id, plan_result["candidates"], candidate_title, clarified_operation)
                 resolved_text = media_plan_response(user_text, live_results_clarified) or "I found more than one possible match. Which one do you mean?"
             else:
                 resolved_text = media_plan_response(user_text, live_results_clarified) or f"I still couldn't find anything called '{candidate_title}'."
                 if plan_result.get("current_state") != "NO_TITLE_GIVEN":
                     stage_unresolved_media_subject(client_id, candidate_title, media_type=extract_media_type_hint(user_text))
             store_provenance(client_id, live_results_clarified)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_clarified)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="title_clarification_reply")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5038,7 +5608,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # block every media-type-word reply from ever resolving.
         disambiguation_domain = explicit_domain(user_text)
         has_competing_intent = disambiguation_domain is not None and disambiguation_domain != "media"
-        resolved = None if has_competing_intent else resolve_disambiguation_reply(user_text, candidates)
+        affirmative_selection = affirmative_media_selection(user_text, candidates)
+        resolved = None if has_competing_intent or not affirmative_selection else resolve_disambiguation_reply(user_text, candidates)
         if resolved is not None:
             context_cleared = dict(conversation_context.get(client_id, {}))
             context_cleared.pop("pending_disambiguation", None)
@@ -5047,8 +5618,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             year = resolved.get("year")
             media_type = resolved.get("media_type")
             type_word = {"movie": "movie", "tv": "show", "anime": "anime", "album": "album"}.get(str(media_type), "")
-            original_goal = str(disambiguation.get("original_goal") or "")
-            action_prefix = "get " if media_acquisition_language(original_goal) else ""
+            original_operation = media_intent(user_text, context_cleared) or disambiguation.get("original_operation")
+            action_prefix = "get " if original_operation == "MEDIA_REQUEST" else ""
             disambiguated_goal = f"{action_prefix}{title}{f' from {year}' if year else ''} {type_word}".strip()
             result = await invoke_tool("media_plan_goal", {"goal": disambiguated_goal, "session_id": client_id}, client_id, request_id)
             live_results_resolved = [result]
@@ -5059,14 +5630,14 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if resolved_text is None:
                 post_direct_resolved = direct_structured_answer(user_text, live_results_resolved)
                 resolved_text = post_direct_resolved or f"I found {title}."
-                if plan_result.get("confirmation_required"):
-                    stage_media_confirmation(client_id, request_id, plan_result)
+                executed = await complete_media_plan(client_id, request_id, result, original_operation)
+                resolved_text = executed or resolved_text
             elif plan_result and not plan_result.get("confirmation_required") and not plan_result.get("ambiguous"):
                 offer_question = stage_media_offer(client_id, plan_result)
                 if offer_question:
                     resolved_text = f"{resolved_text} {offer_question}"
             store_provenance(client_id, live_results_resolved)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": "media_plan_goal", "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, live_results_resolved)
             await emit_answer(ws, request_id, resolved_text, client_id=client_id, origin="disambiguation_resolved")
             history.append({"role": "assistant", "content": resolved_text})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5153,8 +5724,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             result = await invoke_tool(offer.operation, offer_arguments, client_id, request_id)
             plan_result = result.get("result") if isinstance(result.get("result"), dict) else {}
             if offer.operation == "media_plan_goal" and plan_result:
-                stage_media_confirmation(client_id, request_id, plan_result)
                 full = direct_structured_answer(user_text, [{"tool": "media_plan_goal", "status": result.get("status"), "result": plan_result}])
+                offer_operation = operation_for_plan(user_text, conversation_context.get(client_id, {}), [("media_plan_goal", {})])[0]
+                executed = await complete_media_plan(client_id, request_id, result, offer_operation)
+                full = executed or full
                 if not full:
                     full = "I couldn't confirm that without changing anything."
             else:
@@ -5216,73 +5789,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             else:
                 full = f"I couldn't restart {display_target}."
         elif action_name == "media_standard_request":
-            details = result.get("result", {}) if isinstance(result.get("result"), dict) else {}
-            outer_status = result.get("status")
-            execution_status = details.get("status")
-            execution_reason = details.get("reason") or details.get("error")
-            media_state = dict(conversation_context.get(client_id, {}))
-            media_state.update({
-                "domain": "media", "kind": "media_workflow", "group": "media",
-                "referent_type": "media_workflow",
-                "referent_ids": [action.get("canonical_external_id")],
-                "latest_media_workflow": {
-                    "workflow_id": action.get("workflow_id"),
-                    "canonical_external_id": action.get("canonical_external_id"),
-                    "media_type": action.get("arguments", {}).get("media_type"),
-                    "title": action.get("arguments", {}).get("confirmation_context", {}).get("title"),
-                    "mode": "standard",
-                    "execution_status": execution_status or outer_status,
-                    "reason": execution_reason,
-                },
-            })
-            conversation_context[client_id] = media_state
-            status = execution_status
-            if outer_status != "ok":
-                full = "I couldn't hand that request off to your media queue."
-            elif status == "submitted" and details.get("ingestion_confirmed"):
-                full = "Done. It's looking for it now."
-            elif status == "no_op":
-                # Real production bug found in a 65-conversation live sweep:
-                # "You already have Whiplash in Plex" -> confirmed with a
-                # plain "yes" -> "It's already on the way." -- misleading;
-                # "no_op" here almost always means the opposite of "in
-                # progress" (ALREADY_AVAILABLE_IN_BOTH_LIBRARIES/
-                # _PERMANENTLY/_STANDARD -- see tools/server-tools-app.py's
-                # media_standard_request), i.e. it's already fully done,
-                # not "on its way." Only the genuinely ambiguous reason
-                # (an active workflow that could be either in-progress or
-                # already satisfied) keeps neutral wording.
-                no_op_reason = execution_reason
-                if no_op_reason and no_op_reason.startswith("ALREADY_AVAILABLE"):
-                    full = "You already have that -- no need to request it again."
-                else:
-                    full = "That's already been taken care of, no action needed."
-            elif status == "failed_ingestion":
-                full = "I couldn't hand that off to your media queue."
-            elif status in {"rejected", "disabled"}:
-                # Real production gap found live: "Can you get me the show
-                # Silo" -> confirmed -> "I couldn't hand that off to your
-                # media system." -- technically honest (this server has TV
-                # show requests deliberately turned off,
-                # STANDARD_SEASON_WRITES_ENABLED=false), but gave the user
-                # zero explanation why, which reads as a broken/opaque
-                # failure rather than a real, nameable limitation. A user
-                # with zero knowledge of the system's internals has no way
-                # to know movies work but shows don't, or that a session
-                # simply expired, unless told directly.
-                reason = execution_reason
-                if reason in {"STANDARD_SEASON_WRITES_DISABLED", "STANDARD_EPISODE_SCOPE_UNSUPPORTED"}:
-                    full = "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
-                elif reason == "STANDARD_MOVIE_WRITES_DISABLED":
-                    full = "Movie requests aren't turned on for me yet."
-                elif reason in {"STANDARD_MEDIA_WRITES_DISABLED", "STANDARD_MEDIA_BACKEND_NOT_READY", "BRIDGE_SECRET_MISSING"}:
-                    full = "The media request system isn't available right now, so nothing was requested."
-                elif reason in {"CONFIRMATION_BINDING_REQUIRED", "CONFIRMATION_SESSION_OR_STATUS_INVALID"}:
-                    full = "That confirmation expired or didn't match up -- go ahead and ask again."
-                else:
-                    full = "I couldn't hand that off to your media system."
-            else:
-                full = "I couldn't confirm that media request was accepted."
+            full = media_request_outcome(action, result)
         else:
             messages = [{"role": "system", "content": SYSTEM}, *history[-12:], {"role": "tool", "name": action["name"], "content": json.dumps(result.get("result", {}), separators=(",", ":"))}, {"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE}]
             full = await generate_final(messages)
@@ -5343,7 +5850,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             full = direct or "I couldn't retry the previous Home Assistant command."
             await emit_answer(ws, request_id, full, client_id=client_id)
             history.append({"role": "assistant", "content": full})
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": result.get("tool"), "status": result.get("status"), "sources_checked": []}]})
+            await emit_trace(ws, request_id, [result])
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         if social_acknowledgement(user_text):
@@ -5407,6 +5914,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         context["retrieval_confidence"] = retrieval_confidence(candidates)
         profile = research_profile(user_text)
+        deep_news = profile["mode"] == "deep" and bool(profile.get("current_news"))
+        same_day_canada = bool(deep_news and re.search(r"\bcanad(?:a|ian)\b", user_text, re.I)
+                               and re.search(r"\b(?:today|tonight|this morning)\b", user_text, re.I))
+        research_now = time.time()
+        news_window = 1
+        news_disclosure = ""
         context["research_mode"] = profile["mode"]
         context["research_budget"] = {key: value for key, value in profile.items() if key != "num_predict"}
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
@@ -5544,7 +6057,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if live_results and re.search(r"\b(how many|count|storage|space|free|left|summary|overview)\b", user_text, re.I):
             if any(item.get("tool") in {"list_containers", "get_storage_status"} and item.get("status") == "ok" for item in live_results):
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 count = next((item.get("result", {}).get("count") for item in live_results if item.get("tool") == "list_containers"), None)
                 overview = next((item.get("result", {}) for item in live_results if item.get("tool") == "get_server_overview"), {})
                 if re.search(r"\b(summary|overview)\b", user_text, re.I) and count is not None:
@@ -5571,7 +6084,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if event_result is not None:
                 store_provenance(client_id, live_results)
                 full = grounded_camera_presence_answer(event_result)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, full, client_id=client_id)
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -5582,7 +6095,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 direct = grounded_recent_activity_answer(activity_result)
                 if direct:
                     store_provenance(client_id, live_results)
-                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_trace(ws, request_id, live_results)
                     await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_recent_activity")
                     history.append({"role": "assistant", "content": direct})
                     await ws.send_json({"type": "done", "request_id": request_id})
@@ -5593,7 +6106,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 direct = grounded_event_timing_answer(details_result)
                 if direct:
                     store_provenance(client_id, live_results)
-                    await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                    await emit_trace(ws, request_id, live_results)
                     await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_event_timing")
                     history.append({"role": "assistant", "content": direct})
                     await ws.send_json({"type": "done", "request_id": request_id})
@@ -5603,7 +6116,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             direct = grounded_investigation_answer(investigation, user_text)
             if direct:
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, direct, client_id=client_id)
                 history.append({"role": "assistant", "content": direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -5611,7 +6124,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         identification_direct = canonical_identification_answer(live_results) if context.get("operation") == "MEDIA_DISCOVERY" else None
         if identification_direct:
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, identification_direct, client_id=client_id, origin="canonical_media_identification")
             history.append({"role": "assistant", "content": identification_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5619,7 +6132,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         library_direct = canonical_library_answer(live_results) if context.get("operation") == "MEDIA_LIBRARY_QUERY" else None
         if library_direct:
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, library_direct, client_id=client_id, origin="canonical_media_library")
             history.append({"role": "assistant", "content": library_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5658,7 +6171,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     if guessed_title:
                         stage_unresolved_media_subject(client_id, guessed_title, media_type=extract_media_type_hint(user_text))
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, media_direct, client_id=client_id, origin="deterministic_media_plan_guard")
             history.append({"role": "assistant", "content": media_direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5667,9 +6180,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         if direct:
             for item in live_results:
                 if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
-                    stage_media_confirmation(client_id, request_id, item.get("result") or {})
+                    executed = await complete_media_plan(client_id, request_id, item, context.get("operation"))
+                    if executed:
+                        direct = executed
+                        break
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, direct, client_id=client_id, origin="deterministic_structured")
             history.append({"role": "assistant", "content": direct})
             await ws.send_json({"type": "done", "request_id": request_id})
@@ -5745,14 +6261,80 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # Do not ask Qwen to improvise around a total live-tool outage.
             full = unavailable_live_answer(user_text)
             store_provenance(client_id, live_results)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+            await emit_trace(ws, request_id, live_results)
             await emit_answer(ws, request_id, full, client_id=client_id, origin="all_live_tools_failed")
             history.append({"role": "assistant", "content": full})
             await ws.send_json({"type": "done", "request_id": request_id})
             return
         full = ""
         research_calls = 0
-        researched_urls: set[str] = set()
+        attempted_research_urls: set[str] = set()
+        successful_research_domains: set[str] = set()
+        research_candidates: dict[str, dict] = {}
+
+        def news_evidence() -> list[dict]:
+            return canadian_news_evidence(live_results, research_now, news_window, user_text) if same_day_canada else live_results
+
+        def research_call_limit() -> int:
+            # Reserve one wider search and two independent article fetches.
+            return int(profile["max_calls"]) - (3 if same_day_canada and news_window == 1 else 0)
+
+        def retain_search_date(fetched: dict, requested_url: str) -> dict:
+            """Keep discovery dates on automatic and model-requested fetches."""
+            fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+            candidate = research_candidates.get(normalized_research_url(requested_url), {})
+            date = candidate.get("published") or candidate.get("date")
+            if date and not fetched_result.get("published") and not fetched_result.get("date"):
+                fetched_result = {**fetched_result, "date": date}
+            final_url = normalized_research_url(fetched_result.get("url"))
+            if final_url:
+                research_candidates.setdefault(final_url, {**candidate, "url": final_url})
+            return {**fetched, "result": fetched_result}
+
+        async def fetch_search_evidence(search_result: dict | None = None, *, finish: bool = False) -> None:
+            """Retain discovery candidates until tried; failures earn no evidence."""
+            nonlocal research_calls
+            if search_result and search_result.get("status") == "ok" and isinstance(search_result.get("result"), dict):
+                for candidate in search_result["result"].get("results", []):
+                    if isinstance(candidate, dict) and (url := normalized_research_url(candidate.get("url"))):
+                        research_candidates.setdefault(url, {**candidate, "url": url})
+            max_calls = research_call_limit()
+            fetch_limit = {"quick": 0, "normal": 1, "deep": 2}.get(str(profile["mode"]), 0)
+            useful_fetches = 0
+            while useful_fetches < (max_calls if finish else fetch_limit):
+                shape = research_evidence_shape(news_evidence())
+                reserve = max(0, int(profile["minimum_searches"]) - shape["successful_searches"]) if deep_news else 0
+                if research_calls >= max_calls - reserve or (finish and deep_research_ready(news_evidence(), True)):
+                    break
+                candidates = research_fetch_candidates(
+                    {"results": list(research_candidates.values())}, attempted_research_urls,
+                    successful_research_domains, 1,
+                )
+                if not candidates:
+                    break
+                url = candidates[0]
+                attempted_research_urls.add(url)
+                fetched = await invoke_tool(
+                    "web_fetch",
+                    enrich_research_arguments("web_fetch", {"url": url}, profile, user_text),
+                    client_id,
+                    request_id,
+                )
+                research_calls += 1
+                fetched = retain_search_date(fetched, url)
+                fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+                live_results.append(fetched)
+                messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(
+                    compact_research_result("web_fetch", fetched_result, deep=profile["mode"] == "deep"),
+                    separators=(",", ":"),
+                )})
+                if fetched.get("status") == "ok" and str(fetched_result.get("content") or "").strip():
+                    fetched_url = normalized_research_url(fetched_result.get("url") or url)
+                    if fetched_url:
+                        attempted_research_urls.add(fetched_url)
+                        successful_research_domains.add(research_publisher(fetched_url))
+                    useful_fetches += int(research_evidence_shape(news_evidence())["distinct_fetched_urls"] > shape["distinct_fetched_urls"])
+
         for _ in range(int(profile["iterations"])):
             discovery_audit({
                 "event": "ollama_request",
@@ -5779,20 +6361,28 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 message = response.json().get("message", {})
             calls = message.get("tool_calls") or []
             if not calls:
-                completed_searches = sum(1 for item in live_results if item.get("tool") == "web_search")
-                minimum_searches = 2 if profile["mode"] == "normal" else 3 if profile["mode"] == "deep" else 1
-                if profile["mode"] in {"normal", "deep"} and completed_searches < minimum_searches and research_calls < int(profile["max_calls"]):
+                minimum_searches = 2 if profile["mode"] == "normal" else int(profile["minimum_searches"]) if deep_news else 0
+                while (research_evidence_shape(live_results)["successful_searches"] < minimum_searches
+                       and research_calls < research_call_limit()):
                     recovery_queries = web_recovery_queries(user_text)
-                    query = recovery_queries[min(completed_searches, len(recovery_queries) - 1)]
-                    followup_recency = 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
+                    search_attempts = sum(1 for item in live_results if item.get("tool") == "web_search")
+                    query = recovery_queries[min(search_attempts, len(recovery_queries) - 1)]
+                    followup_recency = 1 if same_day_canada or re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
                     followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": followup_recency, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
                     research_calls += 1
                     live_results.append(followup)
                     messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
-                    continue
+                    await fetch_search_evidence(followup)
+                if deep_news and not deep_research_ready(news_evidence(), bool(research_candidates)):
+                    await fetch_search_evidence(finish=True)
                 break
-            messages.append(message)
-            for call in calls[: min(4, int(profile["max_calls"]) - research_calls)]:
+            # This is a dispatch record, not final-answer evidence. Retain
+            # tool_calls for the chat protocol while dropping model prose that
+            # could otherwise reintroduce an ungrounded search-snippet claim.
+            messages.append({**message, "role": "assistant", "content": ""})
+            for call in calls[:4]:
+                if research_calls >= research_call_limit():
+                    break
                 fn = call.get("function", {})
                 name, arguments = fn.get("name"), fn.get("arguments", {})
                 if name in MODEL_FACING_EXCLUDED_TOOLS:
@@ -5825,27 +6415,18 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     arguments = json.loads(arguments)
                 arguments = normalize_home_tool_arguments(name, arguments, user_text)
                 arguments = enrich_research_arguments(name, arguments, profile, user_text)
+                if same_day_canada and name == "web_search":
+                    arguments["recency_days"] = 1
                 result = await invoke_tool(name, arguments, client_id, request_id)
                 research_calls += 1
+                if name == "web_fetch":
+                    result = retain_search_date(result, str(arguments.get("url") or ""))
                 if name == "home_control":
                     conversation_context.setdefault(client_id, {})["latest_home_action"] = {
                         "name": name, "arguments": dict(arguments), "result": result.get("result"),
                         "status": result.get("status"), "timestamp": time.time()
                     }
                 live_results.append(result)
-                if name == "web_search" and result.get("status") == "ok" and isinstance(result.get("result"), dict):
-                    candidates_for_fetch = result["result"].get("results") or []
-                    fetch_limit = 2 if profile["mode"] == "deep" else 1 if profile["mode"] == "normal" else 0
-                    for candidate in candidates_for_fetch:
-                        url = str(candidate.get("url") or "").strip()
-                        if not url or url in researched_urls or research_calls >= int(profile["max_calls"]) or fetch_limit <= 0:
-                            continue
-                        researched_urls.add(url)
-                        fetched = await invoke_tool("web_fetch", {"url": url, "max_chars": 9000 if profile["mode"] == "deep" else 6000, "extract": "article"}, client_id, request_id)
-                        research_calls += 1
-                        live_results.append(fetched)
-                        messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(compact_research_result("web_fetch", fetched.get("result", {}) if isinstance(fetched.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
-                        fetch_limit -= 1
                 if result.get("status") == "confirmation_required":
                     pending[client_id] = {"name": name, "arguments": arguments, "action_id": result.get("action_id") or str(uuid.uuid4()), "conversation_id": client_id, "session_id": client_id, "expires": time.time() + 60}
                     messages.append({"role": "tool", "name": name, "content": json.dumps(compact_research_result(name, result.get("result", {}) if isinstance(result.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
@@ -5854,15 +6435,68 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     if isinstance(result.get("result"), dict) and (result["result"].get("sources_checked") or result["result"].get("investigation")):
                         store_provenance(client_id, [result])
                     record_tool_referent(client_id, name, arguments, result)
-            if research_calls >= int(profile["max_calls"]):
+                if name == "web_search":
+                    await fetch_search_evidence(result)
+            if research_calls >= research_call_limit():
                 break
+        if same_day_canada and not deep_research_ready(news_evidence(), True):
+            today = datetime.fromtimestamp(research_now, ZoneInfo("America/Toronto")).date()
+            news_window = 3 if today.weekday() == 6 else 2
+            start_date = (today - timedelta(days=news_window - 1)).isoformat()
+            end_date = today.isoformat()
+            news_disclosure = (
+                "Same-day coverage is limited in the sources I could verify for Canada. "
+                f"I broadened the coverage window to {start_date} through {end_date}."
+            )
+            followup = await invoke_tool("web_search", {
+                "query": web_search_query_from_text(user_text), "max_results": 20,
+                "recency_days": news_window, "search_type": "news",
+            }, client_id, request_id)
+            research_calls += 1
+            # Prioritize the wider search's new candidates over exhausted
+            # same-day candidates; retained fetched evidence remains available.
+            research_candidates = {url: candidate for url, candidate in research_candidates.items()
+                                   if url in attempted_research_urls}
+            live_results.append(followup)
+            await fetch_search_evidence(followup, finish=True)
+        trace_results = live_results
+        if same_day_canada:
+            # The display projection is bounded to twelve entries. Put used
+            # articles first so a late recovery's dated links survive noisy
+            # discovery, without changing raw provenance or evidence dates.
+            used_articles = [item for item in news_evidence() if item.get("tool") == "web_fetch"]
+            trace_results = [
+                {**item, "result": {**item["result"], "published": item["result"].get("published") or item["result"].get("date")}}
+                for item in used_articles
+            ] + [item for item in live_results if item not in used_articles]
+        if deep_news:
+            candidate_urls_exist = any(
+                item.get("tool") == "web_search"
+                and item.get("status") == "ok"
+                and isinstance(item.get("result"), dict)
+                and research_fetch_candidates(item["result"], set(), set(), 1)
+                for item in live_results
+            )
+            if not deep_research_ready(news_evidence(), True if same_day_canada else candidate_urls_exist):
+                full = "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+                if news_disclosure:
+                    full = news_disclosure + " I still couldn't verify enough independent Canadian coverage for a reliable in-depth roundup."
+                store_provenance(client_id, live_results)
+                await emit_trace(ws, request_id, trace_results)
+                await emit_answer(ws, request_id, full, client_id=client_id, origin="deep_research_incomplete")
+                history.append({"role": "assistant", "content": full})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
         if live_results:
             post_direct = direct_structured_answer(user_text, live_results)
             if post_direct:
                 for item in live_results:
                     if item.get("tool") == "media_plan_goal" and item.get("status") == "ok":
                         plan_result = item.get("result") or {}
-                        stage_media_confirmation(client_id, request_id, plan_result)
+                        executed = await complete_media_plan(client_id, request_id, item, context.get("operation"))
+                        if executed:
+                            post_direct = executed
+                            break
                         # media_plan_goal is almost always reached through
                         # this Qwen tool-call loop, not the deterministic
                         # preflight list (semantic_preflight_allowed only
@@ -5912,7 +6546,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                                 else:
                                     post_direct = "I found more than one possible match: " + ", ".join(labels) + ". Which one do you mean?"
                 store_provenance(client_id, live_results)
-                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": []} for x in live_results]})
+                await emit_trace(ws, request_id, live_results)
                 await emit_answer(ws, request_id, post_direct, client_id=client_id, origin="deterministic_structured_after_tool")
                 history.append({"role": "assistant", "content": post_direct})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -5926,6 +6560,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # question) must never ground the answer, even though it was
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
+            if same_day_canada:
+                grounding_results = canadian_news_evidence(grounding_results, research_now, news_window, user_text)
+            if deep_news:
+                # Search snippets are discovery hints only. A deep-news final
+                # answer may use article text but must not treat a snippet as
+                # current evidence for office-holders or institutional facts.
+                grounding_results = [item for item in grounding_results if item.get("tool") != "web_search"]
             instruction = PLEX_RULE if any(x.get("tool") == "plex_search" for x in grounding_results) else ""
             if any(x.get("tool") == "weather_forecast" for x in grounding_results):
                 instruction = (instruction + "\n" if instruction else "") + WEATHER_SYNTHESIS_RULE
@@ -5933,7 +6574,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if evidence_messages:
                 evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
                 messages.extend(evidence_messages)
-            await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+            await emit_trace(ws, request_id, trace_results)
         else:
             grounding_results = live_results
         # The Qwen tool-dispatch loop above appends a raw {"role": "tool",
@@ -5950,11 +6591,40 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 message for message in messages
                 if not (message.get("role") == "tool" and message.get("name") not in relevant_tool_names)
             ]
+        if same_day_canada:
+            # Filtering by tool name alone would retain an off-scope fetch
+            # alongside valid fetches. Rebuild those messages from scoped proof.
+            messages = [message for message in messages
+                        if message.get("role") != "tool" and not message.get("tool_calls")]
+            messages.extend({"role": "tool", "name": "web_fetch", "content": json.dumps(
+                compact_research_result("web_fetch", item["result"], deep=True), separators=(",", ":"),
+            )} for item in grounding_results if item.get("tool") == "web_fetch")
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if deep_news:
+            messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(news_evidence()))})
+            if same_day_canada:
+                messages.append({"role": "system", "content": (
+                    "Keep the roundup relevant to Canada and the user's requested topic. "
+                    "Identify each development's publication date and fetched source. "
+                    "Use only the supplied fetched articles; do not fill gaps from model memory. "
+                    + (news_disclosure + " This disclosure is already shown; do not repeat it. Do not describe older coverage as today's news."
+                       if news_disclosure else "The evidence is limited to today's dated coverage.")
+                )})
+        elif profile["mode"] == "deep":
+            messages.append({"role": "system", "content": "The user explicitly requested depth, so the normal short-answer default does not apply. Give a detailed explanation with context and examples as appropriate to the subject."})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
+        if news_disclosure:
+            await emit_answer(ws, request_id, news_disclosure)
+        guard_results = grounding_results
+        if same_day_canada:
+            # Roundup geography/topic/date eligibility cannot suppress current
+            # role conflicts. The unchanged role guard determines relevance,
+            # authority and freshness from all fetched web evidence itself.
+            guard_results = [item for item in filter_relevant_tool_results(live_results, context)
+                             if item.get("tool") == "web_fetch"]
+        full = await stream_final(ws, request_id, messages, full_seed=news_disclosure, guard_user_text=user_text, guard_results=guard_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})
@@ -6208,35 +6878,41 @@ def _is_openwebui_housekeeping_request(body: dict) -> bool:
     return any(pattern.search(text) for pattern in _OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES)
 
 
-async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
-    user_text = _latest_user_message(body)
-    if not user_text:
+def _prepare_openai_turn(body: dict, request: Request) -> tuple[str, dict]:
+    """Resolve identity before streaming headers, reusing it inside the turn."""
+    if not _latest_user_message(body):
         raise HTTPException(400, detail="At least one user message is required")
+    prepared = getattr(request, "_home_ai_prepared_turn", None)
+    if prepared is not None:
+        return prepared
     client_id = _openai_session_id(request, body)
+    correlation = {} if _is_openwebui_housekeeping_request(body) else {
+        "frontend": "openwebui" if client_id.startswith("openwebui:") else "openai-compatible",
+        "frontend_user_id": str(request.headers.get("x-openwebui-user-id") or "")[:80],
+        "frontend_chat_id": str(request.headers.get("x-openwebui-chat-id") or "")[:120],
+        "home_ai_session_id": client_id,
+        "request_id": "req-" + uuid.uuid4().hex,
+        "turn_id": "turn-" + uuid.uuid4().hex,
+        "trace_id": "trace-" + uuid.uuid4().hex,
+    }
+    # Correlation events contain opaque IDs only: never prompts, bearer
+    # tokens, authorization headers, or tool payloads.
+    setattr(request, "_home_ai_correlation", correlation)
+    setattr(request, "_home_ai_prepared_turn", (client_id, correlation))
+    return client_id, correlation
+
+
+async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, list[dict]]:
+    client_id, correlation = _prepare_openai_turn(body, request)
+    user_text = _latest_user_message(body)
     if _is_openwebui_housekeeping_request(body):
-        # Answer directly from the given messages with a single tool-free
-        # completion -- OpenWebUI still gets a valid title/tags/follow-ups
-        # response, but no real backend service is ever touched.
+        # Frontend housekeeping gets one tool-free completion.
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
         answer = await generate_final(messages)
         if not answer:
             raise HTTPException(502, detail="Home-AI produced no assistant response")
         return answer, client_id, []
-    request_id = "req-" + uuid.uuid4().hex
-    turn_id = "turn-" + uuid.uuid4().hex
-    trace_id = "trace-" + uuid.uuid4().hex
-    correlation = {
-        "frontend": "openwebui" if client_id.startswith("openwebui:") else "openai-compatible",
-        "frontend_user_id": str(request.headers.get("x-openwebui-user-id") or "")[:80],
-        "frontend_chat_id": str(request.headers.get("x-openwebui-chat-id") or "")[:120],
-        "home_ai_session_id": client_id,
-        "request_id": request_id,
-        "turn_id": turn_id,
-        "trace_id": trace_id,
-    }
-    # Correlation events contain opaque IDs only: never prompts, bearer
-    # tokens, authorization headers, or tool payloads.
-    setattr(request, "_home_ai_correlation", correlation)
+    request_id = correlation["request_id"]
     discovery_audit({"event": "openai_turn_start", **correlation})
     sink = _OpenAIResponseSocket()
     token = tts_suppressed.set(True)
@@ -6257,7 +6933,7 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     # boundary to split on -- without it, two joined duplicate answers read
     # as a single run-on sentence ("running.You've") that never collapses.
     answer = collapse_repeated_sentences(" ".join(str(item.get("text", "")) for item in sink.messages if item.get("type") == "text").strip())
-    trace = next((item.get("tools", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
+    trace = next((item.get("entries", []) for item in reversed(sink.messages) if item.get("type") == "trace"), [])
     if not answer:
         raise HTTPException(502, detail="Home-AI produced no assistant response")
     discovery_audit({"event": "openai_turn_complete", **correlation,
@@ -6267,30 +6943,238 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
     return answer, client_id, trace
 
 
+def _safe_markdown_text(value: object, limit: int) -> str:
+    """Render projected remote text as Markdown text, never Markdown syntax."""
+    return re.sub(r"([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])", r"\\\1", clean_text(value, limit))
+
+
+def _safe_markdown_destination(url: str) -> str:
+    """Percent-encode destination characters that can alter Markdown links."""
+    parsed = urlsplit(url)
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        quote(parsed.path, safe="/:@&=+$,;%-._~!"),
+        quote(parsed.query, safe="=&;%-._~!"),
+        "",
+    ))
+
+
 def openai_tool_trace_footer(trace: list[dict]) -> str:
-    """Make the existing bounded trace visible in Open WebUI chat output."""
-    if not trace:
+    """Render the bounded server trace as Open WebUI-safe Markdown."""
+    if not isinstance(trace, list) or not trace:
         return ""
-    rows = []
-    for item in trace:
-        tool = str(item.get("tool") or "unknown")
-        status = str(item.get("status") or "unknown").replace("_", " ")
-        rows.append(f"- `{tool}` — {status}")
-    # Keep this as ordinary Markdown because Open WebUI may display raw HTML
-    # rather than sanitizing it into a hidden DOM region. The speech endpoint
-    # removes this diagnostic section before sending text to Pocket.
-    return "\n\n---\n**Tools used**\n" + "\n".join(rows)
+    rows: list[str] = []
+    seen_urls: set[str] = set()
+    statuses = {"complete", "no results", "failed"}
+    for item in trace[:MAX_TRACE_ENTRIES]:
+        if not isinstance(item, dict):
+            continue
+        action = _safe_markdown_text(item.get("action"), 100) or "Used an assistant tool"
+        status = str(item.get("status") or "")
+        rows.append(f"- {action} — {status if status in statuses else 'complete'}")
+        sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+        for source in sources[:MAX_SOURCES_PER_SEARCH]:
+            if not isinstance(source, dict):
+                continue
+            url = safe_display_url(source.get("url")) if isinstance(source.get("url"), str) else None
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            title = _safe_markdown_text(source.get("title"), 180)
+            domain = _safe_markdown_text(source.get("domain"), 253)
+            label = title or domain or "Source"
+            if url:
+                markdown_url = _safe_markdown_destination(url)
+                label = f"[{label}]({markdown_url})"
+            rows.append(f"  - {label}" + (f" — {domain}" if title and domain else ""))
+    if not rows:
+        return ""
+    # This exact marker is the display/speech boundary consumed by Task 5.
+    return "\n\n<!-- home-ai-display-trace -->\n---\n**Research activity**\n" + "\n".join(rows)
+
+
+def remove_openai_display_metadata(text: str) -> str:
+    """Remove only server-owned display metadata from an unmatched TTS input.
+
+    The display-to-speech registry is authoritative. This fallback is
+    deliberately narrow because an arbitrary ``---`` or the word ``working``
+    can be ordinary answer content. The persistent preamble has an exact
+    server-owned header, bullet-line shape, and separator; the rich footer has
+    its exact generated marker. The older saved-message footer
+    patterns remain below for compatibility with responses created before the
+    marker was added.
+    """
+    cleaned = str(text or "")
+
+    def valid_progress_label(label: str) -> bool:
+        fixed = {
+            "Searching the web…",
+            "Reading a source…",
+            "Checking the forecast…",
+            "Checking Plex…",
+            "Checking your home…",
+            "Working…",
+            "Reading CBC…",
+            "Reading Reuters…",
+            "Reading BBC…",
+        }
+        if label in fixed:
+            return True
+        host = label.removeprefix("Reading ").removesuffix("…")
+        if len(host) > 80 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+            host,
+        ):
+            return False
+        return safe_display_url(f"https://{host}/") == f"https://{host}/"
+
+    def strip_progress(value: str) -> str:
+        header = re.match(r"\A[ \t\r\n]*\*\*Working\*\*[ \t]*\r?\n", value)
+        if not header:
+            return value
+        remainder = value[header.end():]
+        consumed = 0
+        labels: list[str] = []
+        separator_end: int | None = None
+        for raw_line in remainder.splitlines(keepends=True):
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
+                consumed += len(raw_line)
+                continue
+            if line.strip() == "---":
+                separator_end = consumed + len(raw_line)
+                break
+            match = re.fullmatch(r"[ \t]*-[ \t]+(.+?)[ \t]*", line)
+            label = match.group(1) if match else ""
+            if len(labels) >= 4 or not match or label in labels or not valid_progress_label(label):
+                return value
+            labels.append(label)
+            consumed += len(raw_line)
+        if not labels:
+            return value
+        if separator_end is not None:
+            return remainder[separator_end:]
+        if remainder[consumed:].strip():
+            return value
+        # A live stream can hand TTS a complete set of server-shaped progress
+        # lines before the separator arrives. It is still display-only.
+        return ""
+
+    cleaned = strip_progress(cleaned)
+
+    action_status = re.compile(
+        r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|"
+        r"Checked your home|Used an assistant tool) — (?:complete|no results|failed)"
+    )
+    source_link = re.compile(
+        r"[ \t]*-[ \t]+\[(?:\\.|[^\]\r\n])+\]\(https?://[^)\s]+\)"
+        r"(?:[ \t]+—[^\r\n]*)?[ \t]*"
+    )
+
+    def valid_rich_footer(value: str) -> bool:
+        lines = value.strip().splitlines()
+        if len(lines) < 2 or lines[0].strip() != "---":
+            return False
+        heading = lines[1].strip()
+        if heading in {"**Sources**", "Sources"}:
+            source_count = sum(bool(source_link.fullmatch(line)) for line in lines[2:] if line.strip())
+            return source_count > 0 and all(
+                not line.strip() or source_link.fullmatch(line) for line in lines[2:]
+            )
+        if heading not in {"**Research activity**", "Research activity"}:
+            return False
+        activity_count = 0
+        plain_activity = False
+        source_count = 0
+        source_heading = False
+        for line in lines[2:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in {"**Sources**", "Sources"}:
+                source_heading = True
+            elif action_status.fullmatch(re.sub(r"^-\s+", "", stripped)):
+                activity_count += 1
+            elif source_link.fullmatch(line):
+                source_count += 1
+            elif not source_heading and re.fullmatch(r"[ \t]*-[ \t]+[^\r\n]+", line):
+                plain_activity = True
+            else:
+                return False
+        if source_heading and source_count == 0:
+            return False
+        return activity_count > 0 or (plain_activity and source_heading and source_count > 0)
+
+    marker = None
+    for candidate in re.finditer(
+        r"(?m)^[ \t]*<!-- home-ai-display-trace -->[ \t]*(?:\r?\n|$)", cleaned
+    ):
+        if valid_rich_footer(cleaned[candidate.end():]):
+            marker = candidate
+            break
+    if marker:
+        cleaned = cleaned[:marker.start()]
+
+    # Some Open WebUI speech requests contain the rich footer after Markdown
+    # comments have been removed. Validate the entire bounded footer grammar,
+    # not merely its heading and an arbitrary bullet.
+    if not marker:
+        boundaries = [0] + [match.start() + 2 for match in re.finditer(r"\n\n", cleaned)]
+        for start in boundaries:
+            if valid_rich_footer(cleaned[start:]):
+                cleaned = cleaned[:start]
+                break
+
+    # Flattened clients can turn those same boundary newlines into spaces.
+    if not marker:
+        flat_source = r"\[(?:\\.|[^\]\r\n])+\]\(https?://[^)\s]+\)(?: — [^\s]+)?"
+
+        def generated_flat_rows(tail: str) -> bool:
+            rows = re.split(r"\s+-\s+", tail)
+            if rows.pop(0) != "--- **Research activity**" or len(rows) > MAX_TRACE_ENTRIES * 4:
+                return False
+            actions = 0
+            sources = 0
+            for row in rows:
+                if action_status.fullmatch(row):
+                    actions += 1
+                    sources = 0
+                elif actions and sources < MAX_SOURCES_PER_SEARCH:
+                    # Candidate rows have no link. Require the same escaped,
+                    # bounded text shape the renderer emits for remote fields.
+                    unescaped = re.sub(r"\\(.)", r"\1", row)
+                    if not re.fullmatch(flat_source, row) and _safe_markdown_text(unescaped, 436) != row:
+                        return False
+                    sources += 1
+                else:
+                    return False
+            return 0 < actions <= MAX_TRACE_ENTRIES
+        for candidate in re.finditer(r"(?:\A|\n\n|\s+)(?=---\s+\*\*Research activity\*\*)", cleaned):
+            start = candidate.end()
+            tail = re.sub(r"\s+", " ", cleaned[start:].strip())
+            known = generated_flat_rows(tail)
+            linked = re.fullmatch(
+                r"--- \*\*Research activity\*\* - [^\s].* Sources - "
+                r"\[[^\]]+\]\(https?://[^)\s]+\)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*",
+                tail,
+            )
+            if known or linked:
+                cleaned = cleaned[:start]
+                break
+
+    # Legacy saved messages used an aria-hidden HTML wrapper or a flattened
+    # ``Tools used`` footer before the stable trace marker existed.
+    cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"\s*---\s*\**Tools used\**.*$", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"\s*\**Tools used\**\s*(?:[-–—]?\s*[a-z0-9_]+\s*[-–—]?\s*\w+\s*)+$", " ", cleaned, flags=re.I | re.S)
+    return cleaned.strip()
 
 
 def remove_openai_tool_trace(text: str) -> str:
-    """Keep Open WebUI diagnostics visible but exclude them from Pocket speech."""
-    cleaned = re.sub(r"\s*<div\s+aria-hidden=\"true\">.*?</div>\s*", " ", text, flags=re.I | re.S)
-    # Open WebUI may submit the footer as a separate TTS input, flattening
-    # Markdown newlines. This fallback is only for the speech endpoint when
-    # the structured display->speech registry cannot match a streamed piece.
-    cleaned = re.sub(r"\s*---\s*\**Tools used\**.*$", " ", cleaned, flags=re.I | re.S)
-    cleaned = re.sub(r"\s*\**Tools used\**\s*(?:[-–—]?\s*[a-z0-9_]+\s*[-–—]?\s*\w+\s*)+$", " ", cleaned, flags=re.I | re.S)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    """Compatibility alias for callers using the old sanitizer name."""
+    return remove_openai_display_metadata(text)
 
 
 async def _wav_to_mp3(wav: bytes) -> bytes:
@@ -6322,6 +7206,9 @@ async def openai_chat_completions(request: Request):
         model = str(body.get("model") or OPENAI_COMPAT_MODEL)
         if model != OPENAI_COMPAT_MODEL:
             raise HTTPException(404, detail=f"Unknown model: {model}")
+        if body.get("stream"):
+            session_id, _ = _prepare_openai_turn(body, request)
+            return _openai_stream_response(body, request, session_id)
         answer, session_id, trace = await _openai_chat_turn(body, request)
     except HTTPException as exc:
         return _openai_error(str(exc.detail), "invalid_request", exc.status_code)
@@ -6341,22 +7228,153 @@ async def openai_chat_completions(request: Request):
         "X-Home-AI-Turn": str(correlation.get("turn_id") or ""),
         "X-Home-AI-Trace": str(correlation.get("trace_id") or ""),
     }
-    if body.get("stream"):
-        async def events():
-            chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
-                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": answer}, "finish_reason": None}]}
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            final = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": OPENAI_COMPAT_MODEL,
-                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            yield f"data: {json.dumps(final)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", **response_headers})
     return JSONResponse(
         content={"id": completion_id, "object": "chat.completion", "created": created, "model": OPENAI_COMPAT_MODEL,
                  "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
                  "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
         headers=response_headers,
     )
+
+
+async def _join_openai_cleanup(*tasks: asyncio.Task) -> None:
+    """Finish owned cleanup before propagating additional caller cancellation."""
+    interrupted = False
+    with anyio.CancelScope(shield=True):
+        joined = asyncio.gather(*tasks, return_exceptions=True)
+        while not joined.done():
+            try:
+                # AnyIO shielding alone does not stop direct Task.cancel()
+                # from propagating through an await into an owned task.
+                await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                interrupted = True
+    if interrupted:
+        raise asyncio.CancelledError()
+
+
+class _OpenAIStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send) -> None:
+        # ASGI 2.4 send errors only detect disconnects while sending. Keep a
+        # receive watcher for every version, including idle tool/queue waits.
+        streaming = asyncio.create_task(self.stream_response(send))
+        disconnected = asyncio.create_task(self.listen_for_disconnect(receive))
+        try:
+            completed, _ = await asyncio.wait(
+                {streaming, disconnected}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in completed:
+                await task
+        except OSError:
+            if tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split("."))) >= (2, 4):
+                raise ClientDisconnect()
+            raise
+        finally:
+            # Own and join both tasks even if the outer request is cancelled.
+            # An already-cancelling stream may be awaiting HTTP cleanup.
+            for task in (streaming, disconnected):
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await _join_openai_cleanup(streaming, disconnected)
+        if self.background is not None:
+            await self.background()
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            # ASGI 2.4 send errors can leave the iterator suspended at yield.
+            # Close our async generator explicitly so its responder is joined.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
+def _openai_stream_response(body: dict, request: Request, session_id: str) -> StreamingResponse:
+    """Send progress while a supervised turn runs, with bounded pending state."""
+    queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=32)
+    preamble = ProgressPreamble()
+    completion_id = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    correlation = getattr(request, "_home_ai_correlation", {})
+
+    progress_display = ""
+
+    async def progress_sink(event: dict) -> None:
+        nonlocal progress_display
+        content = preamble.add(event)
+        if content:
+            progress_display += content
+            register_openai_tts_text(content, "")
+            register_openai_tts_text(progress_display, "")
+            # Progress is optional and must never backpressure a tool. Only
+            # four bounded fragments can enter this queue in one request.
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(("progress", content))
+
+    async def run_turn() -> None:
+        token = progress_sink_context.set(progress_sink)
+        try:
+            # Keep timeout cancellation on this task so disconnect cleanup can
+            # recognize an in-progress cancellation and avoid interrupting it.
+            async with asyncio.timeout(OPENAI_STREAM_TIMEOUT_SECONDS):
+                answer, _, trace = await _openai_chat_turn(body, request)
+            display = answer + openai_tool_trace_footer(trace)
+            # Register the plain final content too, for clients splitting SSE
+            # content chunks into separate speech requests.
+            register_openai_tts_text(display, answer)
+            queue.put_nowait(("answer", display))
+        except asyncio.CancelledError:
+            # A responder can itself be cancelled. Wake a still-connected
+            # consumer; disconnect cleanup will simply discard this event.
+            queue.put_nowait(("answer", "Home-AI could not complete this request."))
+            raise
+        except Exception as exc:
+            print(f"OPENAI_COMPAT_CHAT_FAILED error={type(exc).__name__}", flush=True)
+            queue.put_nowait(("answer", "Home-AI could not complete this request."))
+        finally:
+            progress_sink_context.reset(token)
+
+    def frame(delta: dict, finish_reason: str | None = None) -> str:
+        chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                 "model": OPENAI_COMPAT_MODEL,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    async def events():
+        # Do not start model/tool work until the role has been sent.
+        yield frame({"role": "assistant"})
+        responder = asyncio.create_task(run_turn())
+        progress_parts: list[str] = []
+        try:
+            while True:
+                kind, content = await queue.get()
+                if kind == "progress":
+                    progress_parts.append(content)
+                    yield frame({"content": content})
+                    continue
+                if progress_parts:
+                    separator = "\n---\n\n"
+                    register_openai_tts_text(
+                        "".join(progress_parts) + separator + content,
+                        spoken_text_for_openai_display(content),
+                    )
+                    yield frame({"content": separator})
+                yield frame({"content": content})
+                yield frame({}, "stop")
+                yield "data: [DONE]\n\n"
+                break
+        finally:
+            if not responder.done() and not responder.cancelling():
+                responder.cancel()
+            # A send error may already be closing this generator when a
+            # disconnect cancels its parent task. Finish HTTP cleanup first.
+            await _join_openai_cleanup(responder)
+
+    return _OpenAIStreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Home-AI-Session": session_id,
+        "X-Home-AI-Request": str(correlation.get("request_id") or ""),
+        "X-Home-AI-Turn": str(correlation.get("turn_id") or ""),
+        "X-Home-AI-Trace": str(correlation.get("trace_id") or ""),
+    })
 
 
 @app.post("/v1/audio/transcriptions")
@@ -6380,9 +7398,8 @@ async def openai_speech(request: Request):
         # tool diagnostics for Open WebUI. Resolve the exact response through
         # the server-side display->speech registry before synthesis, so the
         # spoken channel never receives that metadata.
-        text = spoken_text_for_openai_display(text)
-        if text:
-            text = remove_openai_tool_trace(text)
+        registered = _registered_openai_speech(text)
+        text = remove_openai_display_metadata(text) if registered is None else registered
         if not text:
             # Display-only tool diagnostics can arrive as their own TTS
             # request. Treat that request as intentionally silent.

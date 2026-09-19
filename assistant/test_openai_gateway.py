@@ -15,8 +15,13 @@ def _load_helpers():
     names = {
         "OPENAI_COMPAT_MODEL",
         "_openai_session_id",
+        "_prepare_openai_turn",
         "_latest_user_message",
         "_is_openwebui_housekeeping_request",
+        "_safe_markdown_text",
+        "_safe_markdown_destination",
+        "openai_tool_trace_footer",
+        "remove_openai_display_metadata",
     }
     assignment_names = {"_OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES"}
 
@@ -30,6 +35,10 @@ def _load_helpers():
         node for node in tree.body
         if isinstance(node, ast.Import)
         and any(alias.name in {"re", "uuid"} for alias in node.names)
+    ]
+    selected += [
+        node for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module in {"trace_projection", "urllib.parse"}
     ]
     selected += [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names) or is_needed_assignment(node)]
     namespace["Request"] = object
@@ -113,6 +122,19 @@ def test_legacy_response_token_can_be_echoed_without_double_prefix():
     assert module._openai_session_id(request, {"messages": []}) == "legacy:client-generated-session-123"
 
 
+def test_prepared_stream_headers_keep_the_same_legacy_session_and_correlation():
+    module = _load_helpers()
+    request = Request()
+    body = {"messages": [{"role": "user", "content": "Check the weather."}]}
+    first = module._prepare_openai_turn(body, request)
+    assert module._prepare_openai_turn(body, request) == first
+    client_id, correlation = first
+    assert correlation["home_ai_session_id"] == client_id
+    assert correlation["request_id"].startswith("req-")
+    assert correlation["turn_id"].startswith("turn-")
+    assert correlation["trace_id"].startswith("trace-")
+
+
 # --- OpenWebUI internal housekeeping detection (real production bug: these ---
 # --- were being routed through the full tool-discovery/execution pipeline ---
 
@@ -171,3 +193,68 @@ def test_unrecognized_task_shape_is_not_swallowed():
     and a pattern is added deliberately."""
     module = _load_helpers()
     assert module._is_openwebui_housekeeping_request(_body("### Task:\nSummarize this document for me.")) is False
+
+
+def test_rich_footer_names_opened_sources_without_raw_tool_data():
+    module = _load_helpers()
+    footer = module.openai_tool_trace_footer([{
+        "tool": "web_fetch", "action": "Opened source", "status": "complete",
+        "sources": [{
+            "title": "Canada update", "domain": "cbc.ca",
+            "url": "https://cbc.ca/news/update", "kind": "fetched",
+        }],
+    }])
+    assert "<!-- home-ai-display-trace -->" in footer
+    assert "Opened source" in footer
+    assert "[Canada update](https://cbc.ca/news/update)" in footer
+    assert "web_fetch" not in footer
+
+
+def test_rich_footer_deduplicates_and_bounds_safe_projected_sources():
+    module = _load_helpers()
+    trace = [{
+        "tool": "web_fetch", "action": "Opened source", "status": "complete",
+        "sources": [{
+            "title": "Safe source", "domain": "example.com",
+            "url": "https://example.com/story?token=secret", "kind": "fetched",
+            "query": "household terms", "content": "never display",
+        }] * 4,
+    }] * 13
+    footer = module.openai_tool_trace_footer(trace)
+    assert footer.count("Safe source") == 1
+    assert footer.count("Opened source") <= 12
+    assert "token=secret" not in footer
+    assert "household terms" not in footer
+    assert "never display" not in footer
+
+
+def test_rich_footer_escapes_hostile_markdown_labels_and_destinations():
+    module = _load_helpers()
+    footer = module.openai_tool_trace_footer([{
+        "action": "**Bold** _italic_ `code` [spoof](https://evil.example)",
+        "status": "complete",
+        "sources": [{
+            "title": "**Bold** _italic_ `code` [spoof](https://evil.example)\\",
+            "domain": "news_*`[spoof](x).example",
+            "url": "https://example.com/](https://evil.example/)*_`\\",
+        }],
+    }])
+    assert "\\*\\*Bold\\*\\*" in footer
+    assert "\\_italic\\_" in footer
+    assert "\\`code\\`" in footer
+    assert r"\[spoof\]\(https\:\/\/evil\.example\)" in footer
+    assert "news\\_\\*\\`\\[spoof\\]\\(x\\)\\.example" in footer
+    assert "https://example.com/%5D%28https://evil.example/%29%2A_%60%5C" in footer
+
+
+def test_display_metadata_fallback_removes_only_owned_rich_boundaries():
+    module = _load_helpers()
+    displayed = (
+        "**Working**\n- Searching the web…\n\n---\n\n"
+        "Here is the answer.\n\n<!-- home-ai-display-trace -->\n---\n"
+        "**Research activity**\n- Opened source — complete\n"
+        "Sources\n- [Canada update](https://cbc.ca/news/update)"
+    )
+    assert module.remove_openai_display_metadata(displayed) == "Here is the answer."
+    ordinary = "I was working on this.\n\n---\n\nThe separator is intentional."
+    assert module.remove_openai_display_metadata(ordinary) == ordinary

@@ -28,9 +28,28 @@ The model is `home-ai`; requests are translated into the existing
 `respond()`/session path. Open WebUI never calls Ollama, Plex, Frigate, media
 backends, or Home-AI Tools directly.
 
-`stream=true` is supported as an OpenAI-compatible SSE response. The current
-Assistant produces a completed response and emits one final content delta; it
-does not claim token-level streaming.
+`stream=true` is supported as an OpenAI-compatible SSE response. Before a
+tool-backed final answer, the Assistant can emit an ordinary persisted Markdown
+`**Working**` preamble with no more than four distinct safe major-stage lines.
+It then emits `---`, the answer, and the server-owned rich source trace. This
+is deliberately not token-level streaming. The preamble remains in the saved
+Open WebUI conversation by design. The bounded speech registry removes it and
+the source trace from current messages, including the pinned client's stripped
+and split Read Aloud inputs. Isolated plain fragments from history after the
+registry's 15-minute lifetime or a server restart lack that provenance; the
+[acceptance evidence](qa/openwebui-progress-source-acceptance.md) records this
+limit and the complete-footer fallback.
+
+## Transient-status compatibility gate (BLOCKED)
+
+The pinned Open WebUI 0.11.3 image was probed on 2026-09-19 using a disposable
+provider and a normal chat-completion chunk with a namespaced
+`delta.home_ai_status` object and no `delta.content`. The UI did not render
+`Reading Example News…` before the final answer. It persisted only `Final probe
+answer.` after reload, so this event shape is **not** a proven transient status
+contract. Do not ship live progress based on it. See
+`docs/qa/openwebui-status-probe.md` for the pinned digest, frames, and required
+approval alternatives.
 
 ## Session mapping
 
@@ -112,3 +131,13 @@ Not yet claimed as complete:
 
 These are intentionally separate from the backend integration and do not
 require changing the Home-AI brain or any third-party image.
+
+## Progress and source acceptance
+
+The pinned Open WebUI image remains unchanged. The repeatable disposable
+acceptance procedure, including authenticated stream timestamps, browser reload
+evidence, clickable-link and hostile-title checks, TTS boundary check, and
+screenshot hashes, is recorded in
+`docs/qa/openwebui-progress-source-acceptance.md`. It is a QA release gate;
+it is not authorization to change this container, its production provider, or
+Home Assistant configuration.

@@ -56,12 +56,17 @@ contextual_entity_resolution, resolved_followup_text, the confirmation
 real, unmodified production code.
 """
 
+import asyncio
+import contextlib
 import importlib.util
 import json
 import re
 import sys
 import time
 import uuid
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +235,13 @@ class FakeToolsBackend:
         self.submitted_writes: list[dict] = []
         self.consumed_confirmations: set[str] = set()
         self.call_log: list[tuple[str, dict]] = []
+        self.media_execution_calls: list[dict] = []
+        self.planner_confirmations: list[dict] = []
+        self.web_search_fixtures: list[list[dict] | None] = []
+        self.web_fetch_failures: set[str] = set()
+        self.web_fetch_final_urls: dict[str, str] = {}
+        self.web_fetch_contents: dict[str, str] = {}
+        self.web_fetch_metadata: dict[str, dict] = {}
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
@@ -321,6 +333,13 @@ class FakeToolsBackend:
                        "verified": True, "protected": protected, "target_entity_ids": targets}
             return {"tool": name, "status": "ok", "result": payload}
         if name == "web_search":
+            if self.web_search_fixtures:
+                fixture = self.web_search_fixtures.pop(0)
+                if fixture is None:
+                    return {"tool": name, "status": "error", "result": {"error": "fixture search failure"}}
+                return {"tool": name, "status": "ok", "result": {
+                    "results": [dict(item) for item in fixture],
+                }}
             query = str(arguments.get("query", ""))
             entries = None
             for title, hits in self.web_index.items():
@@ -332,6 +351,19 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": {
                 "results": [{"title": e["canonical_identity"]["title"], "url": "https://example.invalid/x",
                              "snippet": f"{e['canonical_identity']['title']} is a {e['media_type']}."} for e in entries],
+            }}
+        if name == "web_fetch":
+            url = str(arguments.get("url", ""))
+            if url in self.web_fetch_failures:
+                return {"tool": name, "status": "error", "result": {
+                    "url": url,
+                    "error": "fixture fetch failure",
+                }}
+            final_url = self.web_fetch_final_urls.get(url, url)
+            return {"tool": name, "status": "ok", "result": {
+                "url": final_url,
+                "content": self.web_fetch_contents.get(url, f"Fixture article body for {final_url}."),
+                **self.web_fetch_metadata.get(url, {}),
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
@@ -439,7 +471,13 @@ class FakeToolsBackend:
                                   "media_type": media_type, "season_scope": []},
                     "operation": operation, "canonical_external_id": canonical_id,
                     "canonical_media_type": media_type, "title": identity.get("title"),
+                    "session_id": client_id, "status": "PENDING",
+                    "arguments_hash": f"arguments-{confirmation_id}",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+                    "manager": operation.split(".", 1)[0],
                 }
+                self.planner_confirmations.append(result["confirmation_record"])
             return {"tool": name, "status": "ok", "result": result}
         if name == "media_execute_goal":
             # Real /invoke: TOOLS.get("media_execute_goal") is None -> HTTP
@@ -491,6 +529,8 @@ class FakeToolsBackend:
             state = entry["state"] if entry else "ABSENT"
             return {"tool": name, "status": "ok", "result": {"matched": state not in {"ABSENT", "NOT_FOUND"}, "current_state": state, "canonical_identity": identity}}
         if name == "media_standard_request":
+            self.media_execution_calls.append({"arguments": dict(arguments), "confirmed": confirmed,
+                                               "action_id": action_id, "session_id": client_id})
             workflow_id = arguments.get("workflow_id")
             confirmation_context = arguments.get("confirmation_context") or {}
             confirmation_id = confirmation_context.get("confirmation_id")
@@ -502,6 +542,8 @@ class FakeToolsBackend:
                 return {"tool": name, "status": "ok", "result": {"status": "rejected", "reason": "CONFIRMATION_ALREADY_CONSUMED", "write_executed": False}}
             if confirmation_id:
                 self.consumed_confirmations.add(confirmation_id)
+            if any(write.get("workflow_id") == workflow_id for write in self.submitted_writes):
+                return {"tool": name, "status": "ok", "result": {"status": "no_op", "reason": "STANDARD_WORKFLOW_ALREADY_ACTIVE_OR_SATISFIED", "write_executed": False}}
             self.submitted_writes.append({"workflow_id": workflow_id, "arguments": dict(arguments)})
             return {"tool": name, "status": "ok", "result": {"status": "submitted", "write_executed": True, "ingestion_confirmed": True, "workflow_id": workflow_id}}
         if name == "get_storage_status":
@@ -826,11 +868,10 @@ async def test_unresolved_home_exclusion_clarifies_without_control(session):
     assert session.backend.submitted_writes == before
 
 
-# --- Scenario: discover -> offer -> accept -> cross-capability -> offer ->
-# explicit write intent -> strict confirmation -> fake write (spec #2, #24) --
+# --- Scenario: discover -> library read -> explicit request -> fake write ---
 
 @pytest.mark.asyncio
-async def test_full_discover_offer_accept_write_conversation(session):
+async def test_full_discover_library_request_confirmation_conversation(session):
     session.backend.seed_web("Cowboy Bebop", media_type="anime", tmdb_id="30991")
 
     reply1 = await session.turn(
@@ -841,30 +882,30 @@ async def test_full_discover_offer_accept_write_conversation(session):
         final_text="Cowboy Bebop is an anime series.",
     )
     assert "cowboy bebop" in reply1.casefold()
+    assert session.client_id not in session.app.pending_offers
 
     subject_before = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
     assert subject_before and "cowboy bebop" in subject_before.casefold()
 
     reply2 = await session.turn(
-        "Is Cowboy Bebop in my library?",
+        "Do I have Cowboy Bebop in Plex?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
         ]}}],
         final_text="It's not in Plex yet.",
     )
     assert session.client_id not in session.app.pending  # no write confirmation yet
+    assert session.client_id not in session.app.pending_offers
     assert not session.backend.submitted_writes
 
     reply3 = await session.turn(
-        "Yeah, get it.",
+        "Can you get it?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Cowboy Bebop"}}},
         ]}}],
     )
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, "media_plan_goal's confirmation_required result must stage a real PendingConfirmation"
-    assert action["name"] in {"media_standard_request", "media_execute_goal"}
-    assert not session.backend.submitted_writes  # still no write -- confirmation only
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending
 
     reply4 = await session.turn("Go for it.")
     assert len(session.backend.submitted_writes) == 1, "exactly one execution"
@@ -883,15 +924,14 @@ async def test_disabled_tv_writes_gives_a_clear_reason_not_a_dead_end(session):
     # limitation -- but the old message gave zero explanation, reading
     # like a broken/opaque failure instead of "shows aren't enabled yet."
     session.backend.seed_library("Silo", media_type="tv", state="ABSENT", tvdb_id="371980")
-    await session.turn(
+    session.backend.media_standard_request_override = {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False}
+    reply = await session.turn(
         "Can you get me the show Silo",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get the show Silo", "media_type": "tv"}}},
         ]}}],
     )
-    assert session.app.pending.get(session.client_id) is not None, "must have staged a real confirmation"
-    session.backend.media_standard_request_override = {"status": "disabled", "reason": "STANDARD_SEASON_WRITES_DISABLED", "write_executed": False}
-    reply = await session.turn("yes")
+    assert session.client_id not in session.app.pending
     assert reply == "TV show requests aren't turned on for me yet -- only movie requests are currently enabled."
     assert not session.backend.submitted_writes
 
@@ -1029,6 +1069,7 @@ async def test_web_to_plex_to_request_same_subject(session):
     )
     referent = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
     assert referent and "segua" in referent.casefold()
+    assert not session.backend.submitted_writes, "an online lookup is read-only"
 
     await session.turn(
         "Do I have it?",
@@ -1045,8 +1086,8 @@ async def test_web_to_plex_to_request_same_subject(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
     await session.turn("Go ahead.")
     assert len(session.backend.submitted_writes) == 1
@@ -1107,8 +1148,8 @@ async def test_weather_media_web_plex_request_full_chain(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Segua"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
 
 # --- Red team: Tools failure during offer execution must never write (#23) --
@@ -1460,13 +1501,16 @@ async def test_concurrent_sessions_do_not_leak_subjects_or_offers(app, backend):
 
     action_a = app.pending.get(client_a)
     action_b = app.pending.get(client_b)
-    assert action_a is not None and action_b is not None
-    assert action_a["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert action_a is None and action_b is not None
+    assert len(backend.submitted_writes) == 1
+    dune_write = backend.submitted_writes[0]
+    assert dune_write["arguments"]["confirmation_context"]["title"] == "Dune"
+    assert dune_write["arguments"]["session_id"] == client_a
     assert action_b["arguments"]["confirmation_context"]["title"] == "Rodeo"
-    assert action_a["arguments"] != action_b["arguments"]
+    assert dune_write["arguments"] != action_b["arguments"]
     assert app.conversation_context.get(client_a, {}).get("latest_media_workflow", {}).get("title") != "Rodeo"
 
-    # Confirm session A; session B's pending confirmation must be untouched.
+    # A stale approval in session A must not consume session B's confirmation.
     app.httpx = _FakeHttpxModule([{"message": {"content": "", "tool_calls": []}}], "Done, got Dune.")
     await app.respond(ws_a, client_a, str(uuid.uuid4()), "Go for it.")
     assert len(backend.submitted_writes) == 1
@@ -1771,6 +1815,837 @@ async def test_active_camera_context_survives_an_interleaved_media_question(sess
     )
 
 
+# --- Bounded deep-news evidence recovery ----------------------------------
+# A model that returns no follow-up calls after discovery must not prevent
+# recovery-search evidence from being fetched. These fixtures use multiple
+# domains so a first-search-only fetch block cannot accidentally satisfy the
+# deep-research readiness contract.
+
+def _quiet_news_fixtures(session, monkeypatch, *, day=18, strong=False, still_sparse=False, corroborated=None):
+    """Synthetic network responses; real respond/gates/synthesis stay enabled."""
+    now = datetime(2026, 9, day, 12, tzinfo=ZoneInfo("America/Toronto")).timestamp()
+    monkeypatch.setattr(session.app, "time", SimpleNamespace(**{**vars(time), "time": lambda: now}))
+    noise = [{"url": "https://unrelated-world.example/football", "date": f"2026-09-{day}",
+              "title": "Overseas football results"},
+             {"url": "https://world-noise.example/markets", "date": f"2026-09-{day}",
+              "title": "Overseas markets"}]
+    urls = ["https://cbc.ca/news/funding", "https://reuters.com/world/canada/housing"]
+    date = f"2026-09-{day if strong else day - 1}"
+    coverage = [{"url": url, "date": date, "title": title} for url, title in zip(
+        urls, ["Canada research funding", "Canada housing update"])]
+    session.backend.web_search_fixtures = ([coverage, [], []] if strong else
+                                          [noise, [], [], noise if still_sparse else coverage + noise])
+    session.backend.web_fetch_contents[noise[0]["url"]] = "Overseas football teams won their matches."
+    session.backend.web_fetch_contents[noise[1]["url"]] = "Overseas markets reported a quiet session."
+    session.backend.web_fetch_contents[urls[0]] = "Canada announced research funding."
+    session.backend.web_fetch_contents[urls[1]] = "Canada reported new housing construction figures."
+    if corroborated is not None:
+        session.backend.web_fetch_contents[urls[0]] += " Alice Doe is the prime minister."
+        if corroborated:
+            session.backend.web_fetch_contents[urls[1]] += " Alice Doe is the prime minister."
+    return urls, date
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day,window", [(18, 2), (20, 3)])
+async def test_quiet_canada_news_widens_once_with_disclosure_and_dated_sources(session, monkeypatch, day, window):
+    urls, date = _quiet_news_fixtures(session, monkeypatch, day=day)
+    reply = await session.turn("Give me an in-depth review of the recent news in Canada today",
+                               final_text="The fetched coverage describes funding and housing developments.")
+    searches = [args for name, args in session.backend.call_log if name == "web_search"]
+    assert [args["recency_days"] for args in searches] == [1, 1, 1, window]
+    assert all("canada" in args["query"].casefold() for args in searches)
+    assert "same-day coverage is limited" in reply.casefold()
+    assert "Canada" in reply and f"2026-09-{day}" in reply
+    assert session.last_stream_payload is not None
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(urls)
+    assert all(item["date"] == date for item in evidence)
+    assert "unrelated-world.example" not in json.dumps(session.last_stream_payload["messages"])
+    traces = [event for event in session.ws.sent if event.get("type") == "trace"]
+    assert all(url in json.dumps(traces) for url in urls)
+    fetched_sources = [source for event in traces for entry in event["entries"] for source in entry["sources"]
+                       if source["kind"] == "fetched" and source["url"] in urls]
+    assert {source["published"] for source in fetched_sources} == {date}
+    assert len(session.backend.call_log) <= 16
+
+
+def _dated_canadian_fetches(session):
+    """Give scheduler fixtures explicit article geography and publication dates."""
+    for batch in session.backend.web_search_fixtures:
+        for candidate in batch or []:
+            url = candidate["url"]
+            session.backend.web_fetch_contents[url] = f"Canadian technology reporting for {url}."
+            session.backend.web_fetch_metadata[url] = {"date": datetime.now(ZoneInfo("America/Toronto")).date().isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_strong_same_day_evidence_never_widens(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, strong=True)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Canada announced funding and housing developments.")
+    assert session.last_stream_payload is not None
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+    assert "same-day coverage is limited" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_world_noise_stays_sparse_after_one_retry(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, still_sparse=True)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="An invented worldwide roundup must not be used.")
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    assert session.last_stream_payload is None
+    assert "same-day coverage is limited" in reply.casefold()
+    assert "Canada" in reply and "enough" in reply
+    assert "invented" not in reply and "worldwide" not in reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corroborated", [False, True])
+async def test_quiet_canada_news_widening_preserves_current_holder_corroboration(session, monkeypatch, corroborated):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=corroborated)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" in reply.casefold()
+    if corroborated:
+        assert "Alice Doe is the prime minister." in reply
+    else:
+        assert "can't safely verify that current office-holder" in reply
+        assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_reserves_retry_budget_and_overrides_model_window(session, monkeypatch):
+    urls, date = _quiet_news_fixtures(session, monkeypatch)
+    session.backend.web_search_fixtures[0] = [
+        {"url": f"https://world-{index}.example/sport", "date": "2026-09-18"}
+        for index in range(20)
+    ]
+    reply = await session.turn(
+        "Give me an in-depth review of Canada news today",
+        ollama_script=[{"message": {"tool_calls": [{"function": {"name": "web_search", "arguments": {
+            "query": "Canada news", "recency_days": 30,
+        }}}]}}], final_text="The articles describe Canadian funding and housing.",
+    )
+    assert len(session.backend.call_log) == 16
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" in reply.casefold()
+    sources = [source for event in session.ws.sent if event.get("type") == "trace"
+               for entry in event["entries"] for source in entry["sources"] if source["kind"] == "fetched"]
+    assert set(urls) <= {source["url"] for source in sources}
+    assert all(source["published"] == date for source in sources if source["url"] in urls)
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_model_fetched_noise_cannot_leak_into_synthesis(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch)
+    await session.turn(
+        "Give me an in-depth review of Canada news today",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada news"}}},
+            {"function": {"name": "web_fetch", "arguments": {"url": "https://unrelated-world.example/football"}}},
+        ]}}], final_text="The articles describe Canadian funding and housing.",
+    )
+    assert session.last_stream_payload is not None
+    assert "unrelated-world.example" not in json.dumps(session.last_stream_payload["messages"])
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_dated_roundup_does_not_discard_current_role_conflicts(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=True)
+    url = "https://canada.gc.ca/current-government"
+    session.backend.web_search_fixtures[0].append({"url": url, "title": "Canada government"})
+    session.backend.web_fetch_contents[url] = "Bob Roe is the prime minister. Canada government directory."
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "can't safely verify that current office-holder" in reply
+    assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_geography_cannot_hide_institutional_role_conflict(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=True)
+    url = "https://pm.gc.ca/current-government"
+    session.backend.web_search_fixtures[0].append({"url": url})
+    session.backend.web_fetch_contents[url] = "Bob Roe is the prime minister."
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "can't safely verify that current office-holder" in reply
+    assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_ambiguous_geography_cannot_make_roundup_ready(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "A Labrador won the dog show in London."
+    session.backend.web_fetch_contents[urls[1]] = "Ontario, California approved new city transport services."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn("Give me an in-depth review of Canada news today", final_text="Unsupported roundup.")
+    assert session.last_stream_payload is None
+    assert "still couldn't verify enough" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic", ["technology ", "", "top "])
+async def test_quiet_canada_news_requested_topic_controls_evidence_gate(session, monkeypatch, topic):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canada's hockey team won a league match."
+    session.backend.web_fetch_contents[urls[1]] = "Canadian hockey players prepared for their next tournament."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn(f"Give me an in-depth review of Canada {topic}news today", final_text="The hockey season continued.")
+    if topic == "technology ":
+        assert session.last_stream_payload is None
+        assert "still couldn't verify enough" in reply
+        assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    else:
+        assert session.last_stream_payload is not None
+        assert "same-day coverage is limited" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_topic_cannot_be_bypassed_by_request_word_overlap(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canadian hockey players are competing in a league final."
+    session.backend.web_fetch_contents[urls[1]] = "Canada's hockey teams are preparing for a tournament."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn("What are today’s top technology headlines in Canada? Give me an in-depth review.",
+                               final_text="The hockey teams are competing.")
+    assert session.last_stream_payload is None
+    assert "still couldn't verify enough" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [
+    "I want an in-depth review of today’s news in Canada",
+    "What are today’s biggest headlines in Canada? Give me an in-depth review.",
+])
+async def test_quiet_canada_news_generic_language_keeps_broad_strong_coverage(session, monkeypatch, prompt):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    reply = await session.turn(prompt, final_text="Canada reported funding and housing developments.")
+    assert session.last_stream_payload is not None
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(urls)
+    assert "same-day coverage is limited" not in reply.casefold()
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_technology_synonyms_satisfy_requested_category(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canada announced semiconductor manufacturing investment."
+    session.backend.web_fetch_contents[urls[1]] = "Canadian software developers launched a new platform."
+    reply = await session.turn("What are today’s top technology headlines in Canada? Give me an in-depth review.",
+                               final_text="Canada reported semiconductor and software developments.")
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" not in reply.casefold()
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_wider_topic_matches_only_enter_synthesis(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canadian hockey teams finished a league match."
+    session.backend.web_fetch_contents[urls[1]] = "Canada hosted a hockey tournament."
+    wider_urls = ["https://tech-one.example/chips", "https://tech-two.example/software"]
+    session.backend.web_search_fixtures.append([
+        {"url": wider_urls[0], "date": "2026-09-17"}, {"url": wider_urls[1], "date": "2026-09-17"},
+    ])
+    session.backend.web_fetch_contents[wider_urls[0]] = "Canada announced new semiconductor technology funding."
+    session.backend.web_fetch_contents[wider_urls[1]] = "Canadian software companies expanded their engineering teams."
+    reply = await session.turn("Give me an in-depth review of Canada technology news today", final_text="Technology coverage included chips and software.")
+    assert "same-day coverage is limited" in reply.casefold()
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(wider_urls)
+    assert "hockey" not in json.dumps(session.last_stream_payload["messages"]).casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_now,window,start,end", [
+    ("2026-03-09T00:30:00", 2, "2026-03-08", "2026-03-09"),
+    ("2026-11-01T23:30:00", 3, "2026-10-30", "2026-11-01"),
+])
+async def test_quiet_canada_news_dst_disclosure_matches_toronto_calendar(session, monkeypatch, local_now, window, start, end):
+    now = datetime.fromisoformat(local_now).replace(tzinfo=ZoneInfo("America/Toronto")).timestamp()
+    monkeypatch.setattr(session.app, "time", SimpleNamespace(**{**vars(time), "time": lambda: now}))
+    session.backend.web_search_fixtures = [[], [], [], []]
+    reply = await session.turn("Give me an in-depth review of Canada news today", final_text="Unsupported roundup.")
+    assert f"{start} through {end}" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, window]
+
+
+@pytest.mark.asyncio
+async def test_deep_news_recovery_fetches_results_from_each_search(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Initial discovery", "url": "https://wire.test/initial", "snippet": "Initial report."}],
+        [{"title": "Recovery source", "url": "https://public.test/recovery", "snippet": "Independent report."}],
+        [{"title": "Follow-up source", "url": "https://regional.test/follow-up", "snippet": "Regional report."}],
+    ]
+    _dated_canadian_fetches(session)
+
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    profile = session.app.research_profile(user_text)
+    search_calls = [arguments for name, arguments in session.backend.call_log if name == "web_search"]
+    fetch_calls = [arguments for name, arguments in session.backend.call_log if name == "web_fetch"]
+    assert session.last_stream_payload is not None
+    fetched_results = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+    ]
+    fetched_domains = {
+        re.match(r"https?://([^/]+)", str(result["url"])).group(1)
+        for result in fetched_results
+    }
+
+    assert len(search_calls) == 3, "deep recovery must issue all three successful discovery searches"
+    assert len(fetch_calls) >= 2, "recovery-search results must be fetched as evidence, not only searched"
+    assert len(fetched_domains) >= 2, "deep evidence must include fetched sources from different domains"
+    assert len(session.backend.call_log) <= profile["max_calls"]
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_prefers_a_new_final_redirect_domain(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    redirect_url = "https://a.test/redirect"
+    session.backend.web_search_fixtures = [
+        [{"title": "Redirecting source", "url": redirect_url, "snippet": "Initial report."}],
+        [
+            {"title": "First recovery source", "url": "https://d.test/first", "snippet": "First host."},
+            {"title": "Same final domain", "url": "https://b.test/second", "snippet": "Duplicate host."},
+            {"title": "Independent source", "url": "https://c.test/independent", "snippet": "Independent host."},
+        ],
+        [],
+    ]
+    session.backend.web_fetch_final_urls[redirect_url] = "https://b.test/final"
+    _dated_canadian_fetches(session)
+
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    assert session.last_stream_payload is not None
+    fetched_results = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+    ]
+    final_domains = {
+        re.match(r"https?://([^/]+)", str(result["url"])).group(1)
+        for result in fetched_results
+    }
+    assert final_domains == {"b.test", "c.test", "d.test"}
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_fetch_failure_still_reaches_successful_evidence(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    failed_url = "https://failed.test/initial"
+    later_url = "https://later.test/initial"
+    recovery_url = "https://recovery.test/update"
+    session.backend.web_search_fixtures = [
+        [
+            {"title": "Failed fetch", "url": failed_url, "snippet": "Unavailable report."},
+            {"title": "Later candidate", "url": later_url, "snippet": "Available report."},
+        ],
+        [{"title": "Recovery evidence", "url": recovery_url, "snippet": "Recovery report."}],
+        [{"title": "Third discovery", "url": "https://third.test/context", "snippet": "Context report."}],
+    ]
+    session.backend.web_fetch_failures.add(failed_url)
+
+    _dated_canadian_fetches(session)
+    await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    profile = session.app.research_profile(user_text)
+    fetch_calls = [arguments for name, arguments in session.backend.call_log if name == "web_fetch"]
+    assert failed_url in [arguments["url"] for arguments in fetch_calls]
+    assert later_url in [arguments["url"] for arguments in fetch_calls], "a failed first candidate must not stop later candidates"
+    assert recovery_url in [arguments["url"] for arguments in fetch_calls], "recovery-search candidates must still be scheduled"
+    assert len(session.backend.call_log) <= profile["max_calls"]
+
+    assert session.last_stream_payload is not None
+    successful_fetch_messages = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+        and json.loads(message["content"]).get("content")
+    ]
+    assert len(successful_fetch_messages) >= profile["minimum_fetches"], (
+        "a failed fetch must not count as one of the required successful deep-research fetches"
+    )
+    assert any(message.get("url") == later_url for message in successful_fetch_messages)
+
+
+@pytest.mark.asyncio
+async def test_deep_news_model_calls_never_exceed_research_budget(session):
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [
+            {"title": f"Source {index}A", "url": f"https://source-{index}-a.test/news", "snippet": "Report A."},
+            {"title": f"Source {index}B", "url": f"https://source-{index}-b.test/news", "snippet": "Report B."},
+        ]
+        for index in range(8)
+    ]
+
+    def search_call(index: int) -> dict:
+        return {"function": {"name": "web_search", "arguments": {"query": f"Canada technology news {index}"}}}
+
+    await session.turn(
+        user_text,
+        ollama_script=[
+            {"message": {"content": "", "tool_calls": [search_call(index)]}}
+            for index in range(4)
+        ] + [{"message": {"content": "", "tool_calls": [search_call(index) for index in range(4, 8)]}}],
+        final_text="Here is the researched news summary.",
+    )
+
+    assert len(session.backend.call_log) <= session.app.research_profile(user_text)["max_calls"]
+
+
+@pytest.mark.asyncio
+async def test_deep_news_synthesis_prompt_allows_a_detailed_supported_roundup(session):
+    """Removing the deep synthesis contract must make this prompt check fail."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Technology policy", "url": "https://policy.example/news", "snippet": "A policy development."}],
+        [{"title": "Research funding", "url": "https://research.example/news", "snippet": "A research development."}],
+        [{"title": "Industry", "url": "https://industry.example/news", "snippet": "An industry development."}],
+    ]
+    _dated_canadian_fetches(session)
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="The supported developments include policy, research, and industry changes.",
+    )
+
+    assert reply == "The supported developments include policy, research, and industry changes."
+    assert session.last_stream_payload is not None
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "system"
+    )
+    assert "The user explicitly requested depth" in system_text
+    assert "several distinct supported developments" in system_text
+    assert "multi-paragraph" in system_text
+
+
+@pytest.mark.asyncio
+async def test_deep_news_office_holder_prompt_prefers_fetched_evidence_to_a_snippet(session):
+    """A stale snippet must not be eligible evidence for the current holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Fetched Holder is the current office-holder.",
+    )
+
+    assert reply == "Fetched Holder is the current office-holder."
+    assert session.last_stream_payload is not None
+    prompt_text = json.dumps(session.last_stream_payload["messages"])
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "system"
+    )
+    assert "Snippet Holder" not in prompt_text and "Fetched Holder" in prompt_text
+    assert "Current office-holder claims require fetched evidence" in system_text
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_a_current_office_holder_repeated_only_from_a_snippet(session):
+    """Repeating a stale snippet holder must fail after deep fetched-only grounding."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Snippet Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+    assert session.last_stream_payload is not None
+    assert "Snippet Holder" not in json.dumps(session.last_stream_payload["messages"])
+
+
+@pytest.mark.asyncio
+async def test_deep_news_removes_tool_call_prose_from_the_final_synthesis_prompt(session):
+    """A dispatch message's prose must not carry a stale snippet into final synthesis."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Search-result holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {
+            "content": "Snippet Holder is the current office-holder.",
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}}],
+        }}],
+        final_text="Fetched Holder is the current office-holder.",
+    )
+
+    assert reply == "Fetched Holder is the current office-holder."
+    assert session.last_stream_payload is not None
+    final_messages = session.last_stream_payload["messages"]
+    dispatch_messages = [
+        message for message in final_messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert dispatch_messages and all(message.get("content") == "" for message in dispatch_messages)
+    assert "Snippet Holder" not in json.dumps(final_messages)
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_current_holder_when_fetched_text_only_names_a_former_holder(session):
+    """A fetched name alone cannot support the asserted current office-holder role."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.gc.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Former Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = (
+        "Former Holder previously held the office. Fetched Holder is the current office-holder."
+    )
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Former Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_an_attributed_false_report_about_a_current_holder(session):
+    """An attributed, refuted report cannot establish the current office-holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    false_report_url = "https://news-one.example/current-holder"
+    second_url = "https://news-two.example/current-holder"
+    third_url = "https://news-three.example/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Claim report", "url": false_report_url, "snippet": "Former Holder is current."}],
+        [{"title": "Department update", "url": second_url, "snippet": "Current-holder update."}],
+        [{"title": "Background", "url": third_url, "snippet": "Government context."}],
+    ]
+    session.backend.web_fetch_contents[false_report_url] = (
+        "A false report claimed Former Holder is the current office-holder; "
+        "the department says Fetched Holder is. Fetched Holder is the current office-holder."
+    )
+    session.backend.web_fetch_contents[second_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Former Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+
+
+@pytest.mark.asyncio
+async def test_deep_news_accepts_a_current_holder_corroborated_by_independent_fetched_sources(session):
+    """Two independent direct fetched assertions may support the current holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    first_url = "https://news-one.example/current-holder"
+    second_url = "https://news-two.example/current-holder"
+    third_url = "https://news-three.example/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "First current-holder report", "url": first_url, "snippet": "Current-holder update."}],
+        [{"title": "Second current-holder report", "url": second_url, "snippet": "Independent current-holder update."}],
+        [{"title": "Background", "url": third_url, "snippet": "Government context."}],
+    ]
+    session.backend.web_fetch_contents[first_url] = "Corroborated Holder is the current office-holder. The department announced new funding."
+    session.backend.web_fetch_contents[second_url] = "Corroborated Holder is the current office-holder. Independent reporting examined the policy debate."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Corroborated Holder is the current office-holder.",
+    )
+
+    assert reply == "Corroborated Holder is the current office-holder."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_url,first_content,second_content,final_text,accepted",
+    [
+        pytest.param("https://canada.gc.ca/holder", "The claim that Alice Doe is the current office-holder was debunked.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="debunked-embedded-claim"),
+        pytest.param("https://news-one.example/holder", "Unrelated political context.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="arbitrary-role"),
+        pytest.param("https://gov.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="fake-government-prefix"),
+        pytest.param("https://news.gov.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="fake-government-infix"),
+        pytest.param("https://canada.gc.ca.example/holder", "Alice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="government-suffix-spoof"),
+        pytest.param("https://canada.gc.ca/holder", '"Alice Doe is the current Foreign Minister."', "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="quoted-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister, a claim subsequently debunked.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="refuted-suffix"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is not the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", False, id="negated-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Bob Roe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="conflicting-holder"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Bob Roe is the current Foreign Minister, following the election.", "Alice Doe is the current Foreign Minister.", False, id="conflicting-holder-with-context"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is not the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="contradictory-negation"),
+        pytest.param("https://alias.news-two.example/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", "Alice Doe is the current Foreign Minister.", False, id="same-publisher-subdomains"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", True, id="safe-government"),
+        pytest.param("https://department.gov.uk/holder", "Alice Doe is the current Foreign Minister.", "Unrelated economic context.", "Alice Doe is the current Foreign Minister.", True, id="safe-government-country-suffix"),
+        pytest.param("https://news-one.example/holder", "Alice Doe is the current Foreign Minister.", "Alice Doe is current Foreign Minister.", "Alice Doe is the current Foreign Minister.", True, id="independent-domains"),
+        pytest.param("https://news-one.example/holder", "Unrelated political context.", "Unrelated economic context.", "The current Foreign Minister is Alice Doe.", False, id="reverse-output-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Unrelated political context.", "Unrelated economic context.", "Alice Doe is the prime minister.", False, id="present-role-unrelated-evidence"),
+        pytest.param("https://news-one.example/holder", "Alice Doe is the prime minister.", "Unrelated economic context.", "Alice Doe is the prime minister.", False, id="present-role-single-publisher"),
+        pytest.param("https://alias.news-two.example/holder", "Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Alice Doe is the prime minister.", False, id="present-role-same-publisher"),
+        pytest.param("https://gov.example/holder", "Alice Doe is the prime minister.", "Unrelated economic context.", "Alice Doe is the prime minister.", False, id="present-role-fake-government"),
+        pytest.param("https://canada.gc.ca/holder", "A false report claimed:\nAlice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="newline-preserves-attribution"),
+        pytest.param("https://canada.gc.ca/holder", "A false report claimed\nAlice Doe is the current office-holder.", "Unrelated economic context.", "Alice Doe is the current office-holder.", False, id="bare-newline-preserves-attribution"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "The current Foreign Minister is Bob Roe, following the election.", "Alice Doe is the current Foreign Minister.", False, id="reverse-conflict-with-context"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the prime minister.", "The prime minister is Bob Roe, following the election.", "Alice Doe is the prime minister.", False, id="present-role-reverse-conflict"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the prime minister.", "Unrelated economic context.", "Alice Doe is the prime minister.", True, id="present-role-safe-government"),
+        pytest.param("https://news-one.example/holder", "Alice Doe is the prime minister.", "Alice Doe is prime minister.", "Alice Doe is the prime minister.", True, id="present-role-independent-publishers"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the prime minister.", "Unrelated economic context.", "Alice Doe is the current prime minister.", True, id="present-evidence-supports-current-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current prime minister.", "Unrelated economic context.", "Alice Doe is prime minister.", True, id="current-evidence-supports-present-claim"),
+        pytest.param("https://canada.gc.ca/holder", "Background context.\nAlice Doe is the prime minister.", "Unrelated economic context.", "Alice Doe is the prime minister.", True, id="terminal-punctuation-starts-assertion"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "The current Foreign Minister is Bob Roe (following the election).", "Alice Doe is the current Foreign Minister.", False, id="reverse-conflict-parenthetical-context"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "The current Foreign Minister is Bob Roe — following the election.", "Alice Doe is the current Foreign Minister.", False, id="reverse-conflict-dash-context"),
+        pytest.param("https://canada.gc.ca/holder", "Alice Doe is the current Foreign Minister.", "Unrelated economic context.", "The current Foreign Minister is Alice Doe.", True, id="reverse-output-supported-person-first"),
+    ],
+)
+async def test_deep_news_current_role_evidence_boundary(
+    session, first_url, first_content, second_content, final_text, accepted,
+):
+    """Weak relationship matching or hostname trust must not authorize speech."""
+    second_url = "https://news-two.example/holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "First update", "url": first_url, "snippet": "Government update."}],
+        [{"title": "Second update", "url": second_url, "snippet": "Independent update."}],
+        [{"title": "Background", "url": "https://news-three.example/context", "snippet": "Economic update."}],
+    ]
+    session.backend.web_fetch_contents[first_url] = first_content
+    session.backend.web_fetch_contents[second_url] = second_content
+    reply = await session.turn(
+        "Please give me an in-depth review of current Canadian government news.",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text=final_text,
+    )
+    assert reply == (final_text if accepted else "I can't safely verify that current office-holder from the fetched evidence.")
+
+
+@pytest.mark.asyncio
+async def test_deep_news_incomplete_fetched_evidence_returns_limitation_without_synthesis(session):
+    """Removing the readiness gate must make this return the canned model answer."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    fetched_url = "https://policy.example/news"
+    failed_urls = {"https://research.example/news", "https://industry.example/news"}
+    session.backend.web_search_fixtures = [
+        [{"title": "Technology policy", "url": fetched_url, "snippet": "A policy development."}],
+        [{"title": "Research funding", "url": "https://research.example/news", "snippet": "A research development."}],
+        [{"title": "Industry", "url": "https://industry.example/news", "snippet": "An industry development."}],
+    ]
+    session.backend.web_fetch_failures.update(failed_urls)
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="This canned model roundup must not be used.",
+    )
+
+    assert "still couldn't verify enough independent Canadian coverage" in reply
+    assert session.last_stream_payload is None
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_deep_news_empty_or_invalid_search_results_return_limitation_without_synthesis(session):
+    """Three successful searches with no fetchable article must not permit a roundup."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Malformed result", "url": "not-a-url", "snippet": "No article URL."}],
+        [],
+        [{"title": "Unsupported scheme", "url": "ftp://example.test/news", "snippet": "No HTTP article URL."}],
+    ]
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="This canned model roundup must not be used when no article was fetched.",
+    )
+
+    assert "still couldn't verify enough independent Canadian coverage" in reply
+    assert session.last_stream_payload is None
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 4
+    assert not any(name == "web_fetch" for name, _ in session.backend.call_log)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_count", [1, 6])
+async def test_research_recovery_retries_failed_searches_until_three_succeed(session, failure_count):
+    session.backend.web_search_fixtures = [None] * failure_count + [
+        [{"url": "https://one.example/story"}],
+        [{"url": "https://two.example/story"}],
+        [],
+    ]
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}],
+        final_text="The fetched stories describe two developments.",
+    )
+    assert reply == "The fetched stories describe two developments."
+    searches = [args for name, args in session.backend.call_log if name == "web_search"]
+    assert len(searches) == failure_count + 3
+    assert len(session.backend.call_log) <= 16
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_keeps_untried_candidates_after_two_failed_fetches(session):
+    urls = [f"https://source-{index}.example/article" for index in range(4)]
+    session.backend.web_search_fixtures = [[{"url": url} for url in urls], [], []]
+    session.backend.web_fetch_failures.update(urls[:2])
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}],
+        final_text="The fetched stories describe two developments.",
+    )
+    assert reply == "The fetched stories describe two developments."
+    assert [args["url"] for name, args in session.backend.call_log if name == "web_fetch"] == urls
+    assert len(session.backend.call_log) <= 16
+
+
+@pytest.mark.asyncio
+async def test_world_news_late_successes_keep_fetched_links_after_eleven_failures(session):
+    failed = [f"https://failed-{index}.example/story" for index in range(11)]
+    good = ["https://one.example/story", "https://two.example/story"]
+    session.backend.web_search_fixtures = [
+        [{"url": url} for url in failed], [{"url": good[0]}], [{"url": good[1]}],
+    ]
+    session.backend.web_fetch_failures.update(failed)
+    reply = await session.turn(
+        "Give me an in-depth review of world news today.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "world news today"}}},
+        ]}}],
+        final_text="The fetched stories describe two world developments.",
+    )
+    assert reply == "The fetched stories describe two world developments."
+    assert len(session.backend.call_log) == 16
+    assert session.backend.call_log[13][0] == "web_fetch"
+    assert session.backend.call_log[13][1]["url"] == good[0]
+    assert session.backend.call_log[15][0] == "web_fetch"
+    assert session.backend.call_log[15][1]["url"] == good[1]
+    assert session.last_stream_payload is not None
+    trace = next(item["entries"] for item in reversed(session.ws.sent) if item.get("type") == "trace")
+    assert len(trace) <= 12
+    assert [source["url"] for item in trace for source in item["sources"] if source["kind"] == "fetched"] == good
+    footer = session.app.openai_tool_trace_footer(trace)
+    assert all(f"]({url})" in footer for url in good)
+    assert "fixture fetch failure" not in footer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_fetch", [False, True])
+async def test_deep_news_retains_search_date_when_fetch_has_no_publication_date(session, model_fetch):
+    old_url = "https://canada.gc.ca/announcement"
+    session.backend.web_search_fixtures = [
+        [{"url": old_url, "date": "2015-10-19"}],
+        [{"url": "https://independent.example/news"}],
+        [],
+    ]
+    session.backend.web_fetch_contents[old_url.split("#")[0]] = "Alice Doe is the prime minister."
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}] + ([{"message": {"tool_calls": [
+            {"function": {"name": "web_fetch", "arguments": {"url": old_url}}},
+        ]}}] if model_fetch else []),
+        final_text="Alice Doe is the prime minister.",
+    )
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+    fetched = [json.loads(message["content"]) for message in session.last_stream_payload["messages"]
+               if message.get("role") == "tool" and message.get("name") == "web_fetch"]
+    assert next(item for item in fetched if item["url"] == old_url.split("#")[0])["date"] == "2015-10-19"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["Explain photosynthesis in-depth.", "Explain cellular respiration in-depth."])
+async def test_deep_news_gate_does_not_apply_to_general_depth_requests(session, prompt):
+    answer = "Plants convert light into chemical energy through a sequence of reactions."
+    reply = await session.turn(prompt, ollama_script=[], final_text=answer)
+    assert reply == answer
+    assert not any(name in {"web_search", "web_fetch"} for name, _ in session.backend.call_log)
+    system_text = "\n".join(str(message.get("content") or "") for message in session.last_stream_payload["messages"]
+                            if message.get("role") == "system")
+    assert "The user explicitly requested depth" in system_text
+    assert "several distinct supported developments" not in system_text
+    assert "Current office-holder claims require fetched evidence" not in system_text
+
+
 # --- Real production transcript replay (UnresolvedSubject / relevance gate) -
 # Reproduces the exact reported failure: capability discovery/Qwen picked
 # get_storage_status + plex_search for a movie-identification question and
@@ -2024,6 +2899,446 @@ class _FakeGatewayRequest:
         self.headers = headers or {}
 
 
+class _GatewayStream:
+    """Drive real ASGI sends; HTTPX's ASGITransport buffers streaming bodies."""
+
+    def __init__(self, app, body, headers=(), *, spec_version="2.0", fail_content_send=False, hold_content_send=None):
+        self.app = app
+        self.body = body
+        self.headers = headers
+        self.spec_version = spec_version
+        self.fail_content_send = fail_content_send
+        self.hold_content_send = hold_content_send
+        self.output = asyncio.Queue()
+        self.disconnected = asyncio.Event()
+        self.messages = []
+
+    async def __aenter__(self):
+        self.request_sent = False
+
+        async def receive():
+            if not self.request_sent:
+                self.request_sent = True
+                return {"type": "http.request", "body": json.dumps(self.body).encode(), "more_body": False}
+            await self.disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            self.messages.append(message)
+            if self.fail_content_send and b'"content":' in message.get("body", b""):
+                raise OSError("connection closed")
+            if self.hold_content_send is not None and b'"content":' in message.get("body", b""):
+                await self.hold_content_send.wait()
+            await self.output.put(message)
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": self.spec_version},
+                 "http_version": "1.1", "method": "POST", "scheme": "http",
+                 "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+                 "query_string": b"", "headers": [(b"authorization", b"Bearer qa-only"), *self.headers],
+                 "server": ("test", 80), "client": ("test", 1)}
+        self.task = asyncio.create_task(self.app(scope, receive, send))
+        return self
+
+    async def next_message(self):
+        try:
+            return await asyncio.wait_for(self.output.get(), 1)
+        except TimeoutError:
+            pytest.fail("OpenAI stream did not send a frame while the tool was blocked")
+
+    async def __aexit__(self, *args):
+        self.disconnected.set()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(self.task, 1)
+        finally:
+            if not self.task.done():
+                self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+
+
+def _openai_stream_body(**extra):
+    return {"model": "home-ai", "stream": True,
+            "messages": [{"role": "user", "content": "Check a source."}], **extra}
+
+
+def _stream_frames(messages):
+    wire = b"".join(m.get("body", b"") for m in messages).decode()
+    return [json.loads(line[6:]) if line != "data: [DONE]" else "[DONE]"
+            for line in wire.splitlines() if line.startswith("data: ")]
+
+
+def _stream_content(messages):
+    return "".join(frame["choices"][0]["delta"].get("content", "")
+                   for frame in _stream_frames(messages) if isinstance(frame, dict))
+
+
+@pytest.fixture
+def gateway_tool(app, monkeypatch):
+    import httpx
+
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup = {"delay": 0.01}
+    calls = []
+    payload = {"tool": "web_fetch", "status": "ok", "transport_ok": True, "operation_ok": True,
+               "result": {"title": "Private result title", "content": "private result body"}}
+    response_status = {"code": 200}
+
+    class ToolClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            cleanup_started.set()
+            await asyncio.sleep(cleanup["delay"] if args[0] is asyncio.CancelledError else 0)
+            closed.set()
+
+        async def post(self, url, json, headers):
+            assert url == f"{app.TOOLS_URL}/invoke"
+            calls.append(json)
+            entered.set()
+            await release.wait()
+            return httpx.Response(response_status["code"], json=payload, request=httpx.Request("POST", url))
+
+    async def respond(sink, client_id, request_id, user_text):
+        result = await app.invoke_tool("web_fetch", {"url": "https://www.cbc.ca/private?token=secret"}, client_id, request_id)
+        assert result == payload
+        await sink.send_json({"type": "text", "text": "A verified answer.", "request_id": request_id})
+
+    monkeypatch.setattr(app, "OPENAI_COMPAT_API_KEY", "qa-only")
+    monkeypatch.setattr(app, "OPENAI_COMPAT_API_KEY_FILE", "")
+    monkeypatch.setattr(app, "httpx", SimpleNamespace(AsyncClient=ToolClient))
+    monkeypatch.setattr(app, "respond", respond)
+    monkeypatch.setattr(app, "discovery_audit", lambda event: None)
+    return SimpleNamespace(entered=entered, release=release, closed=closed, payload=payload, calls=calls,
+                           response_status=response_status, cleanup_started=cleanup_started, cleanup=cleanup)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_sends_role_and_safe_progress_before_tool_completes(app, gateway_tool, spec_version):
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
+        start = await stream.next_message()
+        assert start["type"] == "http.response.start"
+        assert start["status"] == 200
+        headers = dict(start["headers"])
+        assert headers[b"x-home-ai-session"].startswith(b"legacy:")
+        assert headers[b"x-home-ai-request"].startswith(b"req-")
+        role = await stream.next_message()
+        assert _stream_frames([role])[0]["choices"][0]["delta"] == {"role": "assistant"}
+        while "Reading CBC…" not in _stream_content(stream.messages):
+            await stream.next_message()
+        assert not gateway_tool.release.is_set()
+        assert not gateway_tool.closed.is_set()
+        await asyncio.wait_for(gateway_tool.entered.wait(), 1)
+        assert gateway_tool.calls[0]["client_id"] == headers[b"x-home-ai-session"].decode()
+        assert gateway_tool.calls[0]["turn_id"] == headers[b"x-home-ai-turn"].decode()
+        assert gateway_tool.calls[0]["trace_id"] == headers[b"x-home-ai-trace"].decode()
+        gateway_tool.release.set()
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n\n---\n\nA verified answer."
+    frames = _stream_frames(stream.messages)
+    assert sum(f == "[DONE]" for f in frames) == 1
+    assert sum(isinstance(f, dict) and f["choices"][0]["finish_reason"] == "stop" for f in frames) == 1
+    assert frames[-1] == "[DONE]"
+    assert app.spoken_text_for_openai_display(_stream_content(stream.messages)) == "A verified answer."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_openai_stream_disconnect_or_cancel_awaits_tool_cleanup(app, gateway_tool, cancel):
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await stream.next_message()
+        await asyncio.wait_for(gateway_tool.entered.wait(), 1)
+        if cancel:
+            stream.task.cancel()
+        else:
+            stream.disconnected.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(stream.task, 1)
+        assert gateway_tool.closed.is_set()
+        assert not gateway_tool.release.is_set()
+    assert app.tts_suppressed.get() is False
+    assert app.progress_sink_context.get() is None
+    assert asyncio.all_tasks() == previous_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_send_disconnect_awaits_tool_cleanup(app, gateway_tool, spec_version):
+    from starlette.requests import ClientDisconnect
+
+    previous_tasks = asyncio.all_tasks()
+    with pytest.raises(ClientDisconnect if spec_version == "2.4" else OSError):
+        async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version, fail_content_send=True) as stream:
+            await asyncio.wait_for(stream.task, 1)
+    assert gateway_tool.closed.is_set()
+    assert not gateway_tool.release.is_set()
+    assert asyncio.all_tasks() == previous_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+@pytest.mark.parametrize("shutdown", ["disconnect", "cancel", "disconnect_then_cancel"])
+async def test_openai_stream_send_error_then_disconnect_preserves_http_cleanup(
+    app, gateway_tool, spec_version, shutdown,
+):
+    from starlette.requests import ClientDisconnect
+
+    gateway_tool.cleanup["delay"] = 0.05
+    previous_tasks = asyncio.all_tasks()
+    cleanup_complete_at_return = None
+    with contextlib.suppress(asyncio.CancelledError, OSError, ClientDisconnect):
+        async with _GatewayStream(
+            app.app, _openai_stream_body(), spec_version=spec_version, fail_content_send=True,
+        ) as stream:
+            await asyncio.wait_for(gateway_tool.cleanup_started.wait(), 1)
+            assert gateway_tool.entered.is_set()
+            assert not gateway_tool.closed.is_set()
+            assert not gateway_tool.release.is_set()
+            if shutdown == "cancel":
+                stream.task.cancel()
+            else:
+                stream.disconnected.set()
+                if shutdown == "disconnect_then_cancel":
+                    # Let the receive supervisor begin joining the stream,
+                    # then cancel the request while HTTP cleanup still runs.
+                    await asyncio.sleep(0.01)
+                    stream.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, OSError, ClientDisconnect):
+                await asyncio.wait_for(stream.task, 1)
+            cleanup_complete_at_return = gateway_tool.closed.is_set()
+    assert cleanup_complete_at_return is True, "second shutdown signal interrupted send-error HTTP cleanup"
+    assert asyncio.all_tasks() == previous_tasks
+    assert app.progress_sink_context.get() is None
+    assert "[DONE]" not in _stream_frames(stream.messages)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_coalesces_flood_without_blocking_tool_results(app, gateway_tool, monkeypatch):
+    completed = asyncio.Event()
+    client_reading = asyncio.Event()
+
+    async def respond(sink, client_id, request_id, user_text):
+        for tool in ["web_search"] * 100 + ["weather_forecast", "plex_search", "home_get_state", "future_tool"]:
+            result = await app.invoke_tool(tool, {"query": "private query"}, client_id, request_id)
+            assert result == gateway_tool.payload
+        completed.set()
+        await sink.send_json({"type": "text", "text": "Done."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    gateway_tool.release.set()
+    async with _GatewayStream(app.app, _openai_stream_body(), hold_content_send=client_reading) as stream:
+        await asyncio.wait_for(completed.wait(), 1)
+        client_reading.set()
+        await asyncio.wait_for(stream.task, 1)
+    content = _stream_content(stream.messages)
+    assert content == "**Working**\n- Searching the web…\n- Checking the forecast…\n- Checking Plex…\n- Checking your home…\n\n---\n\nDone."
+    assert len(_stream_frames(stream.messages)) <= 9
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_failure_is_generic_and_terminates(app, gateway_tool, monkeypatch):
+    async def respond(*args):
+        raise RuntimeError("private stack token=secret")
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == "Home-AI could not complete this request."
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_timeout_closes_tool_and_finishes(app, gateway_tool, monkeypatch):
+    monkeypatch.setattr(app, "OPENAI_STREAM_TIMEOUT_SECONDS", 0.05)
+    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert gateway_tool.closed.is_set()
+    assert _stream_content(stream.messages).endswith("\n---\n\nHome-AI could not complete this request.")
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+@pytest.mark.parametrize("cancel_request", [False, True])
+async def test_openai_stream_disconnect_during_timeout_preserves_http_cleanup(
+    app, gateway_tool, monkeypatch, spec_version, cancel_request,
+):
+    monkeypatch.setattr(app, "OPENAI_STREAM_TIMEOUT_SECONDS", 0.02)
+    gateway_tool.cleanup["delay"] = 0.05
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
+        await asyncio.wait_for(gateway_tool.cleanup_started.wait(), 1)
+        assert gateway_tool.entered.is_set()
+        assert not gateway_tool.closed.is_set()
+        assert not gateway_tool.release.is_set()
+        if cancel_request:
+            stream.task.cancel()
+        else:
+            stream.disconnected.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(stream.task, 1)
+        assert gateway_tool.closed.is_set(), "disconnect interrupted timeout-triggered HTTP cleanup"
+        assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n"
+        assert "[DONE]" not in _stream_frames(stream.messages)
+    assert asyncio.all_tasks() == previous_tasks
+    assert app.progress_sink_context.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_idle_disconnect_supervises_blocked_tool(app, gateway_tool, spec_version):
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
+        while "Reading CBC…" not in _stream_content(stream.messages):
+            await stream.next_message()
+        assert not gateway_tool.release.is_set()
+        stream.disconnected.set()
+        completed, _ = await asyncio.wait({stream.task}, timeout=0.25)
+        # Keep a deliberately failing implementation from leaking test tasks.
+        if not completed:
+            stream.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stream.task
+        assert completed, "idle disconnect was not observed while the tool was blocked"
+        assert gateway_tool.closed.is_set()
+        assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n"
+        assert "[DONE]" not in _stream_frames(stream.messages)
+    assert asyncio.all_tasks() == previous_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["projection", "sink"])
+async def test_tool_result_survives_progress_failure(app, gateway_tool, monkeypatch, stage):
+    import progress_events
+
+    events = []
+
+    async def sink(event):
+        events.append(event)
+        raise RuntimeError("private sink failure")
+
+    if stage == "projection":
+        def bad_projection(*args):
+            raise RuntimeError("private projection failure")
+        monkeypatch.setattr(progress_events, "safe_progress_event", bad_projection)
+    token = progress_events.progress_sink_context.set(sink)
+    gateway_tool.release.set()
+    try:
+        result = await app.invoke_tool("web_fetch", {"url": "https://cbc.ca/private?token=secret"}, "client", "request")
+    finally:
+        progress_events.progress_sink_context.reset(token)
+    assert result == gateway_tool.payload
+    if stage == "sink":
+        assert events == [{"phase": "tool_started", "label": "Reading CBC…"}, {"phase": "tool_finished", "label": "Complete"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["operation", "missing", "transport"])
+async def test_tool_failures_emit_generic_progress_without_changing_outcome(app, gateway_tool, failure):
+    events = []
+
+    async def sink(event):
+        events.append(event)
+
+    if failure == "operation":
+        gateway_tool.payload["operation_ok"] = False
+        gateway_tool.payload["result"]["error"] = "private backend failure"
+    else:
+        gateway_tool.response_status["code"] = 404 if failure == "missing" else 503
+    gateway_tool.release.set()
+    token = app.progress_sink_context.set(sink)
+    try:
+        result = await app.invoke_tool("web_fetch", {"url": "http://server-tools/private?token=secret"}, "client", "request")
+    finally:
+        app.progress_sink_context.reset(token)
+    assert result["operation_ok"] is False
+    assert result["transport_ok"] is (failure != "transport")
+    if failure == "operation":
+        assert result == gateway_tool.payload
+    assert events == [{"phase": "tool_started", "label": "Reading a source…"}, {"phase": "tool_failed", "label": "Tool unavailable"}]
+
+
+@pytest.mark.asyncio
+async def test_openai_nonstream_keeps_json_schema_without_progress(app, gateway_tool):
+    gateway_tool.release.set()
+    async with _GatewayStream(app.app, _openai_stream_body(stream=False)) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    start = stream.messages[0]
+    assert dict(start["headers"])[b"x-home-ai-session"].startswith(b"legacy:")
+    body = json.loads(b"".join(m.get("body", b"") for m in stream.messages))
+    assert body["object"] == "chat.completion"
+    assert body["choices"] == [{"index": 0, "message": {"role": "assistant", "content": "A verified answer."}, "finish_reason": "stop"}]
+    assert body["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_openai_gateway_keeps_rich_footer_and_plain_speech(app, gateway_tool, monkeypatch, streaming):
+    gateway_tool.release.set()
+
+    async def respond(sink, client_id, request_id, user_text):
+        await app.invoke_tool("web_fetch", {"url": "https://cbc.ca/private?token=secret"}, client_id, request_id)
+        await app.emit_trace(sink, request_id, [{"tool": "web_fetch", "status": "ok", "result": {
+            "url": "https://cbc.ca/news/update?token=secret", "title": "Canada update",
+        }}])
+        await sink.send_json({"type": "text", "text": "A verified answer."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body(stream=streaming)) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    if streaming:
+        display = _stream_content(stream.messages)
+        assert display.startswith("**Working**\n- Reading CBC…\n\n---\n\nA verified answer.")
+    else:
+        body = json.loads(b"".join(m.get("body", b"") for m in stream.messages))
+        display = body["choices"][0]["message"]["content"]
+        assert display.startswith("A verified answer.")
+        assert "**Working**" not in display
+    assert "<!-- home-ai-display-trace -->" in display
+    assert "[Canada update](https://cbc.ca/news/update)" in display
+    assert "token=secret" not in display
+    assert display.count("A verified answer.") == 1
+    assert app.spoken_text_for_openai_display(display) == "A verified answer."
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_housekeeping_has_no_progress_or_tool_calls(app, gateway_tool, monkeypatch):
+    async def generate_final(messages):
+        return '{"title": "Source Check"}'
+
+    monkeypatch.setattr(app, "generate_final", generate_final)
+    async with _GatewayStream(app.app, {**OPENWEBUI_TITLE_TASK, "stream": True}) as stream:
+        await asyncio.wait_for(stream.task, 1)
+    assert _stream_content(stream.messages) == '{"title": "Source Check"}'
+    assert gateway_tool.calls == []
+    assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_progress_and_identity_are_request_local(app, gateway_tool, monkeypatch):
+    gateway_tool.release.set()
+
+    async def respond(sink, client_id, request_id, user_text):
+        tool = "web_search" if client_id == "legacy:search" else "weather_forecast"
+        await app.invoke_tool(tool, {"query": "private household query"}, client_id, request_id)
+        await sink.send_json({"type": "text", "text": "Done."})
+
+    monkeypatch.setattr(app, "respond", respond)
+    async with _GatewayStream(app.app, _openai_stream_body(), [(b"x-home-ai-session-id", b"search")]) as first:
+        async with _GatewayStream(app.app, _openai_stream_body(), [(b"x-home-ai-session-id", b"forecast")]) as second:
+            await asyncio.wait_for(asyncio.gather(first.task, second.task), 1)
+    assert _stream_content(first.messages) == "**Working**\n- Searching the web…\n\n---\n\nDone."
+    assert _stream_content(second.messages) == "**Working**\n- Checking the forecast…\n\n---\n\nDone."
+    assert app.progress_sink_context.get() is None
+
+
 OPENWEBUI_TITLE_TASK = {"messages": [{"role": "user", "content": (
     "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing "
     "the chat history.\n### Chat History:\n<chat_history>\nUSER: do i have "
@@ -2140,7 +3455,7 @@ async def test_fresh_title_restatement_replaces_stale_subject_and_bare_reply_res
     # never echo "Zzyzx" back to the user.
     reply2 = await session.turn(f"Can you give me the movie {title} by {creator}?")
     assert "zzyzx" not in reply2.casefold(), "a fresh title restatement must never echo the old garbled subject back"
-    assert title.casefold() in reply2.casefold(), "the fresh title must actually be used, not discarded"
+    assert session.backend.submitted_writes[-1]["arguments"]["confirmation_context"]["title"] == title
     last_goal_calls = [args for name, args in session.backend.call_log if name == "media_plan_goal"]
     assert "zzyzx" not in str(last_goal_calls[-1]).casefold(), "the retry must not carry the stale title forward"
 
@@ -2156,7 +3471,8 @@ async def test_fresh_title_restatement_replaces_stale_subject_and_bare_reply_res
     # capability, which is the exact live production bug this proves fixed.
     calls_before = len(session.backend.call_log)
     reply4 = await session.turn(title)
-    assert title.casefold() in reply4.casefold(), f"the bare reply must resolve as the title, got: {reply4!r}"
+    assert "already" in reply4.casefold(), f"the resolved title was already requested, got: {reply4!r}"
+    assert len(session.backend.submitted_writes) == 1
     new_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
     assert new_calls, "the bare reply must be tried against media_plan_goal, not silently dropped"
     assert session.app.conversation_context.get(session.client_id, {}).get("pending_title_clarification") is None, (
@@ -2207,8 +3523,9 @@ async def test_add_the_thing_year_ambiguity_the_older_one(session):
     await session.turn("The older one.")
     plan_calls = [args for name, args in session.backend.call_log[calls_before:] if name == "media_plan_goal"]
     assert plan_calls and "1982" in str(plan_calls[-1].get("goal", "")), "\"older\" (comparative) must resolve like \"old\""
-    # Confirmed identified -> a real confirmation prompt, never a silent write.
-    assert not session.backend.submitted_writes
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "1091"
+    assert session.client_id not in session.app.pending
 
 
 # --- Tool fan-out check: a media clarification reply must not trigger ----
@@ -2231,7 +3548,7 @@ async def test_disambiguation_reply_does_not_fan_out_to_unrelated_tools(session)
     calls_before = [name for name, _ in session.backend.call_log]
     await session.turn("The older one.")
     new_calls = [name for name, _ in session.backend.call_log[len(calls_before):]]
-    assert new_calls == ["media_plan_goal"], f"a clarification reply must only touch media_plan_goal, got: {new_calls}"
+    assert new_calls == ["media_plan_goal", "media_standard_request"], new_calls
 
 
 @pytest.mark.asyncio
@@ -2306,26 +3623,20 @@ async def test_pending_disambiguation_expires(session):
 # --- Clarification vs. confirmation: never the same concept ---------------
 
 @pytest.mark.asyncio
-async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(session):
-    """A media clarification answer ("The older one.") and a write
-    confirmation answer ("Yeah.") are different concepts entirely --
-    resolving a candidate must never itself execute or authorize a write,
-    and must never be interpretable as answering an unrelated pending
-    confirmation."""
+async def test_discovery_clarification_does_not_authorize_media_write(session):
+    """Selection after discovery supplies identity but no request authority."""
     session.backend.seed_web("The Thing", media_type="movie", year="1982", tmdb_id="1091")
     session.backend.seed_web("The Thing", media_type="movie", year="2011", tmdb_id="60308")
     await session.turn(
-        "Add The Thing.",
+        "Do you know The Thing?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "The Thing", "media_type": "movie"}}},
         ]}}],
     )
     await session.turn("The older one.")
-    # Resolving the candidate must stage a real confirmation prompt (a
-    # write requires an explicit "yes" of its own) -- never execute directly.
     assert not session.backend.submitted_writes
     action = session.app.pending.get(session.client_id)
-    assert action is not None, "identification must stage a real PendingConfirmation, not skip straight to a write"
+    assert action is None
 
 
 # --- Descriptive media discovery (real live production bug): a plain --
@@ -2334,6 +3645,37 @@ async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(
 # --- library-search dead end, and not the old "no matching live       --
 # --- workflow" status short-circuit. Reproduced through the REAL      --
 # --- respond()/preflight_plan deterministic path, not helper calls.   --
+
+@pytest.mark.asyncio
+async def test_read_only_media_identification_does_not_stage_an_acquisition_offer(session):
+    """A descriptive identity question answers with the canonical title only.
+
+    This catches the regression where the current MEDIA_DISCOVERY operation
+    was stored in turn context but stage_media_offer() only examined stale
+    operation fields, appending a Plex/request offer to an informational
+    answer.
+    """
+    session.backend.seed_library(
+        "White Chicks", media_type="movie", state="ABSENT", tmdb_id="12153", year="2004"
+    )
+    # The integration fake's resolver models catalog clue matching through
+    # its person-index seam; this phrase is the reported descriptive clue.
+    session.backend.seed_person("two cops", "White Chicks")
+
+    reply = await session.turn(
+        "What's that movie where two cops dress as blonde women?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "White Chicks"}}},
+        ]}}],
+    )
+
+    assert "white chicks (2004)" in reply.casefold()
+    assert not any(phrase in reply.casefold() for phrase in ("want me", "request", "plex", "availability"))
+    assert session.client_id not in session.app.pending
+    assert session.client_id not in session.app.pending_offers
+    assert session.app.conversation_context[session.client_id]["canonical_identity"] == {
+        "media_type": "movie", "title": "White Chicks", "tmdb_id": "12153", "year": "2004",
+    }
 
 @pytest.mark.asyncio
 async def test_scenario_2_descriptive_question_reaches_media_plan_goal_not_plex_search(session):
@@ -2391,18 +3733,256 @@ async def test_phrasing_variants_all_reach_media_plan_goal(session, text):
     "Request the movie with Brad Pitt and fly fishing.",
 ])
 @pytest.mark.asyncio
-async def test_request_variants_reach_media_plan_goal_and_proceed_to_confirmation(session, text):
-    """Item 11: request-shaped descriptive variants use the SAME identity
-    resolution machinery (media_plan_goal), then proceed to normal
-    confirmation once resolved -- never a second, independent resolver."""
+async def test_request_variants_execute_bound_media_request_same_turn(session, text):
+    """Explicit requests consume one planner binding without another approval."""
     session.backend.seed_person("brad pitt", "A River Runs Through It")
     session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
     await session.turn(text)
     called = [name for name, _ in session.backend.call_log]
     assert "media_plan_goal" in called, text
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, f"a resolved request must stage a real confirmation, not write directly: {text}"
+    assert len(session.backend.submitted_writes) == 1, text
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("discover_first,request_text", [
+    (False, "Request Dune."),
+    (False, "Add Dune."),
+    (True, "Can you request it?"),
+])
+@pytest.mark.asyncio
+async def test_explicit_media_request_preserves_server_binding(session, discover_first, request_text):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631", year="2021")
+    if discover_first:
+        await session.turn("Do you know Dune?", ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
+        ]}}])
+        assert not session.backend.submitted_writes
+    reply = await session.turn(request_text)
+    assert len(session.backend.submitted_writes) == 1
+    assert len(session.backend.media_execution_calls) == 1
+    call = session.backend.media_execution_calls[0]
+    record = session.backend.planner_confirmations[-1]
+    assert call["confirmed"] is True
+    assert call["action_id"] == record["confirmation_id"]
+    assert call["session_id"] == session.client_id
+    assert call["arguments"] == {
+        "workflow_id": "wf-438631", "canonical_external_id": "438631", "media_type": "movie",
+        "season_scope": [], "confirmation_context": record, "session_id": session.client_id,
+    }
+    assert call["arguments"]["confirmation_context"] is record
+    assert "looking for it" in reply.casefold()
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_repeated_explicit_media_request_returns_executor_no_op(session):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Request Dune.")
+    reply = await session.turn("Request Dune.")
+    assert len(session.backend.media_execution_calls) == 2
+    assert len(session.backend.submitted_writes) == 1
+    assert "already" in reply.casefold() and "looking for it" not in reply.casefold()
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_already_in_plex_skips_executor(session):
+    session.backend.seed_library("Dune", media_type="movie", state="AVAILABLE_IN_PLEX", tmdb_id="438631")
+    reply = await session.turn("Request Dune.")
+    assert "already" in reply.casefold() and "plex" in reply.casefold()
+    assert not session.backend.media_execution_calls
     assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("request_text", ["Request Dune.", "Do you know Dune?"])
+@pytest.mark.asyncio
+async def test_ambiguous_media_preserves_original_operation_until_selection(session, request_text):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn(request_text, ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "Dune"}}},
+    ]}}])
+    entry = session.app.conversation_context[session.client_id]["pending_disambiguation"]
+    assert entry["original_operation"] == ("MEDIA_REQUEST" if request_text.startswith("Request") else "MEDIA_DISCOVERY")
+    assert not session.backend.media_execution_calls
+    await session.turn("yes")
+    assert not session.backend.media_execution_calls
+    await session.turn("The new one.")
+    expected_writes = 1 if request_text.startswith("Request") else 0
+    assert len(session.backend.submitted_writes) == expected_writes
+    if expected_writes:
+        assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "438631"
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_bare_yes_without_pending_media_action_never_writes(session):
+    await session.turn("yes")
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    ({"status": "disabled", "reason": "STANDARD_MOVIE_WRITES_DISABLED"}, "aren't turned on"),
+    ({"status": "rejected", "reason": "CONFIRMATION_SESSION_OR_STATUS_INVALID"}, "expired or didn't match"),
+    ({"status": "failed_ingestion"}, "couldn't hand that off"),
+    ({"status": "submitted", "ingestion_confirmed": False}, "couldn't confirm"),
+    ({}, "couldn't confirm"),
+])
+@pytest.mark.asyncio
+async def test_explicit_media_request_reports_executor_outcome_truthfully(session, outcome, expected):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    session.backend.media_standard_request_override = outcome
+    reply = await session.turn("Request Dune.")
+    assert len(session.backend.media_execution_calls) == 1
+    assert expected in reply.casefold()
+    assert "looking for it" not in reply.casefold()
+    assert session.client_id not in session.app.pending
+    state = session.app.conversation_context[session.client_id]["latest_media_workflow"]
+    assert state["execution_status"] == outcome.get("status", "ok")
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_without_server_confirmation_id_never_writes(session, monkeypatch):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    original = session.backend.invoke
+
+    async def incomplete_planner(name, arguments, client_id, request_id, **kwargs):
+        result = await original(name, arguments, client_id, request_id, **kwargs)
+        if name == "media_plan_goal":
+            result["result"]["confirmation_record"].pop("confirmation_id")
+        return result
+
+    monkeypatch.setattr(session.backend, "invoke", incomplete_planner)
+    await session.turn("Request Dune.")
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_request_after_unresolved_title_executes_current_request(session):
+    await session.turn("Request Nonexistent Zzyzx movie.")
+    assert not session.backend.submitted_writes
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Can you get me the movie Dune?")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "438631"
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_title_clarification_preserves_explicit_request_until_scope_is_known(session):
+    await session.turn("Can you request the movie?")
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Dune")
+    assert len(session.backend.submitted_writes) == 1
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.asyncio
+async def test_discovery_model_request_arguments_do_not_stage_write(session):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn("Do you know Dune?", ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+    ]}}])
+    assert not session.backend.media_execution_calls
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+@pytest.mark.asyncio
+async def test_media_clarification_new_read_request_does_not_inherit_write_intent(session, ambiguous):
+    if ambiguous:
+        session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+        session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+        await session.turn("Request Dune.")
+        reply = "Do I have the 2021 movie in Plex?"
+    else:
+        await session.turn("Can you request the movie?")
+        session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+        reply = "Do I have Dune?"
+    await session.turn(reply)
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("reply", [
+    "Do I have the 2021 one?",
+    "Is the 2021 one in my library?",
+    "No, not the 2021 one.",
+])
+@pytest.mark.asyncio
+async def test_media_request_ambiguity_nonaffirmative_reply_never_writes(session, reply):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn("Request Dune.")
+    original = session.app.conversation_context[session.client_id]["pending_disambiguation"]
+    await session.turn(reply)
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert session.app.conversation_context[session.client_id]["pending_disambiguation"] == original
+
+
+@pytest.mark.parametrize("text", [
+    "Can you give me information about the movie Dune?",
+    "Can you find out about the movie Dune?",
+    "Do not request the movie Dune.",
+])
+@pytest.mark.asyncio
+async def test_media_information_and_negation_never_authorize_request(session, text):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    await session.turn(text, ollama_script=[{"message": {"tool_calls": [
+        {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune"}}},
+    ]}}])
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+
+
+@pytest.mark.parametrize("text", [
+    "Can you find the movie Dune?",
+    "Can you find me the movie Dune?",
+])
+@pytest.mark.asyncio
+async def test_media_find_wording_identifies_without_authorizing_request(session, text):
+    session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
+    reply = await session.turn(text)
+    assert not session.backend.media_execution_calls
+    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert session.client_id not in session.app.pending_offers
+    assert "dune" in reply.casefold()
+    assert any(name == "media_plan_goal" for name, _ in session.backend.call_log)
+
+
+@pytest.mark.parametrize("request_text,selection", [
+    ("Request the movie Dune from 2021.", None),
+    ("Request Dune.", "The 2021 one."),
+    ("Request Dune.", "The new one."),
+])
+@pytest.mark.asyncio
+async def test_positive_media_authorization_executes_one_exact_binding(session, request_text, selection):
+    session.backend.seed_web("Dune", media_type="movie", year="1984", tmdb_id="841")
+    session.backend.seed_web("Dune", media_type="movie", year="2021", tmdb_id="438631")
+    await session.turn(request_text)
+    if selection:
+        assert not session.backend.media_execution_calls
+        await session.turn(selection)
+    assert len(session.backend.media_execution_calls) == 1
+    assert len(session.backend.submitted_writes) == 1
+    call = session.backend.media_execution_calls[0]
+    record = session.backend.planner_confirmations[-1]
+    assert call["confirmed"] is True
+    assert call["action_id"] == record["confirmation_id"]
+    assert call["arguments"]["confirmation_context"] is record
+    assert call["arguments"]["canonical_external_id"] == "438631"
+    assert call["arguments"]["session_id"] == session.client_id
+    assert session.client_id not in session.app.pending
 
 
 @pytest.mark.asyncio
@@ -2571,9 +4151,7 @@ def test_creator_hint_only_resolves_when_catalog_candidates_supply_unique_people
 
 @pytest.mark.asyncio
 async def test_knowledge_to_request_handoff(session):
-    """Item 13: descriptive discovery resolves identity; "Add it." then
-    proceeds through normal media planning and stops at strict
-    confirmation -- no production write during QA."""
+    """Descriptive discovery retains the exact identity for an explicit request."""
     session.backend.seed_person("brad pitt", "A River Runs Through It")
     session.backend.seed_library("A River Runs Through It", media_type="movie", state="ABSENT", tmdb_id="11202")
 
@@ -2582,9 +4160,9 @@ async def test_knowledge_to_request_handoff(session):
     assert session.client_id not in session.app.pending
 
     await session.turn("Add it.")
-    action = session.app.pending.get(session.client_id)
-    assert action is not None, "a request following identity resolution must stop at a real confirmation prompt"
-    assert not session.backend.submitted_writes
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "11202"
 
 
 @pytest.mark.asyncio
@@ -2649,12 +4227,8 @@ async def test_legitimate_confirmed_media_request_still_executes_end_to_end(sess
     confirmation, answered with a real "yes", must still execute the fake
     write exactly as before."""
     session.backend.seed_library("Dune", media_type="movie", state="ABSENT", tmdb_id="438631")
-    await session.turn(
-        "Get Dune 2021.",
-        ollama_script=[{"message": {"content": "", "tool_calls": [
-            {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Dune 2021"}}},
-        ]}}],
-    )
+    result = await session.backend.invoke("media_plan_goal", {"goal": "get Dune 2021"}, session.client_id, "legacy-request")
+    session.app.stage_media_confirmation(session.client_id, "legacy-request", result["result"])
     action = session.app.pending.get(session.client_id)
     assert action is not None
     assert action["name"] in {"media_standard_request", "media_execute_goal"}
@@ -2679,7 +4253,7 @@ async def test_bug_a_untyped_request_reaches_media_plan_goal_through_respond(ses
     reply = await session.turn("Can you request Sagwa The Chinese Siamese Cat")
     called = [name for name, _ in session.backend.call_log]
     assert "media_plan_goal" in called
-    assert "sagwa" in reply.casefold()
+    assert session.backend.submitted_writes[0]["arguments"]["canonical_external_id"] == "77670"
     assert "no tools" not in reply.casefold() and "no access" not in reply.casefold()
 
 
@@ -2701,7 +4275,8 @@ async def test_bug_b_yes_do_that_continues_the_offered_identity(session):
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Sagwa The Chinese Siamese Cat"}}},
         ]}}],
     )
-    assert session.client_id in session.app.pending
+    assert session.client_id not in session.app.pending
+    assert len(session.backend.submitted_writes) == 1
 
     await session.turn("yes do that")
     assert len(session.backend.submitted_writes) == 1
