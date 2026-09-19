@@ -1820,6 +1820,152 @@ async def test_active_camera_context_survives_an_interleaved_media_question(sess
 # domains so a first-search-only fetch block cannot accidentally satisfy the
 # deep-research readiness contract.
 
+def _quiet_news_fixtures(session, monkeypatch, *, day=18, strong=False, still_sparse=False, corroborated=None):
+    """Synthetic network responses; real respond/gates/synthesis stay enabled."""
+    now = datetime(2026, 9, day, 12).timestamp()
+    monkeypatch.setattr(session.app, "time", SimpleNamespace(**{**vars(time), "time": lambda: now}))
+    noise = [{"url": "https://unrelated-world.example/football", "date": f"2026-09-{day}",
+              "title": "Overseas football results"},
+             {"url": "https://world-noise.example/markets", "date": f"2026-09-{day}",
+              "title": "Overseas markets"}]
+    urls = ["https://cbc.ca/news/funding", "https://reuters.com/world/canada/housing"]
+    date = f"2026-09-{day if strong else day - 1}"
+    coverage = [{"url": url, "date": date, "title": title} for url, title in zip(
+        urls, ["Canada research funding", "Canada housing update"])]
+    session.backend.web_search_fixtures = ([coverage, [], []] if strong else
+                                          [noise, [], [], noise if still_sparse else coverage + noise])
+    session.backend.web_fetch_contents[noise[0]["url"]] = "Overseas football teams won their matches."
+    session.backend.web_fetch_contents[noise[1]["url"]] = "Overseas markets reported a quiet session."
+    session.backend.web_fetch_contents[urls[0]] = "Canada announced research funding."
+    session.backend.web_fetch_contents[urls[1]] = "Canada reported new housing construction figures."
+    if corroborated is not None:
+        session.backend.web_fetch_contents[urls[0]] += " Alice Doe is the prime minister."
+        if corroborated:
+            session.backend.web_fetch_contents[urls[1]] += " Alice Doe is the prime minister."
+    return urls, date
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day,window", [(18, 2), (20, 3)])
+async def test_quiet_canada_news_widens_once_with_disclosure_and_dated_sources(session, monkeypatch, day, window):
+    urls, date = _quiet_news_fixtures(session, monkeypatch, day=day)
+    reply = await session.turn("Give me an in-depth review of the recent news in Canada today",
+                               final_text="The fetched coverage describes funding and housing developments.")
+    searches = [args for name, args in session.backend.call_log if name == "web_search"]
+    assert [args["recency_days"] for args in searches] == [1, 1, 1, window]
+    assert all("canada" in args["query"].casefold() for args in searches)
+    assert "same-day coverage is limited" in reply.casefold()
+    assert "Canada" in reply and f"2026-09-{day}" in reply
+    assert session.last_stream_payload is not None
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(urls)
+    assert all(item["date"] == date for item in evidence)
+    assert "unrelated-world.example" not in json.dumps(session.last_stream_payload["messages"])
+    traces = [event for event in session.ws.sent if event.get("type") == "trace"]
+    assert all(url in json.dumps(traces) for url in urls)
+    fetched_sources = [source for event in traces for entry in event["entries"] for source in entry["sources"]
+                       if source["kind"] == "fetched" and source["url"] in urls]
+    assert {source["published"] for source in fetched_sources} == {date}
+    assert len(session.backend.call_log) <= 16
+
+
+def _dated_canadian_fetches(session):
+    """Give scheduler fixtures explicit article geography and publication dates."""
+    for batch in session.backend.web_search_fixtures:
+        for candidate in batch or []:
+            url = candidate["url"]
+            session.backend.web_fetch_contents[url] = f"Canadian technology reporting for {url}."
+            session.backend.web_fetch_metadata[url] = {"date": datetime.now().date().isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_strong_same_day_evidence_never_widens(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, strong=True)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Canada announced funding and housing developments.")
+    assert session.last_stream_payload is not None
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+    assert "same-day coverage is limited" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_world_noise_stays_sparse_after_one_retry(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, still_sparse=True)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="An invented worldwide roundup must not be used.")
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    assert session.last_stream_payload is None
+    assert "same-day coverage is limited" in reply.casefold()
+    assert "Canada" in reply and "enough" in reply
+    assert "invented" not in reply and "worldwide" not in reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corroborated", [False, True])
+async def test_quiet_canada_news_widening_preserves_current_holder_corroboration(session, monkeypatch, corroborated):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=corroborated)
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" in reply.casefold()
+    if corroborated:
+        assert "Alice Doe is the prime minister." in reply
+    else:
+        assert "can't safely verify that current office-holder" in reply
+        assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_reserves_retry_budget_and_overrides_model_window(session, monkeypatch):
+    urls, date = _quiet_news_fixtures(session, monkeypatch)
+    session.backend.web_search_fixtures[0] = [
+        {"url": f"https://world-{index}.example/sport", "date": "2026-09-18"}
+        for index in range(20)
+    ]
+    reply = await session.turn(
+        "Give me an in-depth review of Canada news today",
+        ollama_script=[{"message": {"tool_calls": [{"function": {"name": "web_search", "arguments": {
+            "query": "Canada news", "recency_days": 30,
+        }}}]}}], final_text="The articles describe Canadian funding and housing.",
+    )
+    assert len(session.backend.call_log) == 16
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" in reply.casefold()
+    sources = [source for event in session.ws.sent if event.get("type") == "trace"
+               for entry in event["entries"] for source in entry["sources"] if source["kind"] == "fetched"]
+    assert set(urls) <= {source["url"] for source in sources}
+    assert all(source["published"] == date for source in sources if source["url"] in urls)
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_model_fetched_noise_cannot_leak_into_synthesis(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch)
+    await session.turn(
+        "Give me an in-depth review of Canada news today",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada news"}}},
+            {"function": {"name": "web_fetch", "arguments": {"url": "https://unrelated-world.example/football"}}},
+        ]}}], final_text="The articles describe Canadian funding and housing.",
+    )
+    assert session.last_stream_payload is not None
+    assert "unrelated-world.example" not in json.dumps(session.last_stream_payload["messages"])
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_dated_roundup_does_not_discard_current_role_conflicts(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=True)
+    url = "https://canada.gc.ca/current-government"
+    session.backend.web_search_fixtures[0].append({"url": url, "title": "Canada government"})
+    session.backend.web_fetch_contents[url] = "Bob Roe is the prime minister. Canada government directory."
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "can't safely verify that current office-holder" in reply
+    assert "Alice Doe is the prime minister." not in reply
+
+
 @pytest.mark.asyncio
 async def test_deep_news_recovery_fetches_results_from_each_search(session):
     user_text = "Please give me an in-depth review of Canada's technology news today."
@@ -1828,6 +1974,7 @@ async def test_deep_news_recovery_fetches_results_from_each_search(session):
         [{"title": "Recovery source", "url": "https://public.test/recovery", "snippet": "Independent report."}],
         [{"title": "Follow-up source", "url": "https://regional.test/follow-up", "snippet": "Regional report."}],
     ]
+    _dated_canadian_fetches(session)
 
     await session.turn(
         user_text,
@@ -1871,6 +2018,7 @@ async def test_research_recovery_prefers_a_new_final_redirect_domain(session):
         [],
     ]
     session.backend.web_fetch_final_urls[redirect_url] = "https://b.test/final"
+    _dated_canadian_fetches(session)
 
     await session.turn(
         user_text,
@@ -1909,6 +2057,7 @@ async def test_research_recovery_fetch_failure_still_reaches_successful_evidence
     ]
     session.backend.web_fetch_failures.add(failed_url)
 
+    _dated_canadian_fetches(session)
     await session.turn(
         user_text,
         ollama_script=[{"message": {"content": "", "tool_calls": [
@@ -1972,6 +2121,7 @@ async def test_deep_news_synthesis_prompt_allows_a_detailed_supported_roundup(se
         [{"title": "Research funding", "url": "https://research.example/news", "snippet": "A research development."}],
         [{"title": "Industry", "url": "https://industry.example/news", "snippet": "An industry development."}],
     ]
+    _dated_canadian_fetches(session)
 
     reply = await session.turn(
         user_text,
@@ -2243,9 +2393,9 @@ async def test_deep_news_incomplete_fetched_evidence_returns_limitation_without_
         final_text="This canned model roundup must not be used.",
     )
 
-    assert reply == "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+    assert "still couldn't verify enough independent Canadian coverage" in reply
     assert session.last_stream_payload is None
-    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 4
 
 
 @pytest.mark.asyncio
@@ -2266,9 +2416,9 @@ async def test_deep_news_empty_or_invalid_search_results_return_limitation_witho
         final_text="This canned model roundup must not be used when no article was fetched.",
     )
 
-    assert reply == "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+    assert "still couldn't verify enough independent Canadian coverage" in reply
     assert session.last_stream_payload is None
-    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 4
     assert not any(name == "web_fetch" for name, _ in session.backend.call_log)
 
 

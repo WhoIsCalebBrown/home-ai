@@ -4201,6 +4201,43 @@ def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) ->
     )
 
 
+def canadian_news_evidence(live_results: list[dict], now: float, recency_days: int | None) -> list[dict]:
+    """Keep dated Canadian articles; searches count as work, never as proof.
+
+    Publisher nationality and discovery snippets alone cannot establish the
+    article's scope. Unknown dates cannot establish same-day coverage either.
+    None applies geography alone so current-role validation still sees undated
+    institutional pages and uses its own existing freshness/conflict rules.
+    """
+    today = datetime.fromtimestamp(now).date()
+    evidence = []
+    for item in live_results:
+        if item.get("tool") == "web_search":
+            evidence.append(item)
+            continue
+        if item.get("tool") != "web_fetch" or item.get("status") != "ok":
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        content = str(result.get("content") or "").strip()
+        if not content or not re.search(
+            r"\b(?:canada|canadian|ottawa|ontario|qu[eé]bec|alberta|british columbia|"
+            r"manitoba|saskatchewan|nova scotia|new brunswick|newfoundland|labrador|"
+            r"prince edward island|nunavut|yukon|northwest territories)\b",
+            str(result.get("title") or "") + " " + content, re.I,
+        ):
+            continue
+        if recency_days is None:
+            evidence.append(item)
+            continue
+        try:
+            date = datetime.fromisoformat(str(result.get("published") or result.get("date") or "").replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+        if 0 <= (today - date).days < recency_days:
+            evidence.append(item)
+    return evidence
+
+
 def deep_research_synthesis_instruction(shape: dict[str, int]) -> str:
     """Tell final synthesis how to use a ready deep-research evidence set."""
     source_count = shape.get("distinct_fetched_domains", 0)
@@ -5815,6 +5852,11 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         context["retrieval_confidence"] = retrieval_confidence(candidates)
         profile = research_profile(user_text)
         deep_news = profile["mode"] == "deep" and bool(profile.get("current_news"))
+        same_day_canada = bool(deep_news and re.search(r"\bcanad(?:a|ian)\b", user_text, re.I)
+                               and re.search(r"\b(?:today|tonight|this morning)\b", user_text, re.I))
+        research_now = time.time()
+        news_window = 1
+        news_disclosure = ""
         context["research_mode"] = profile["mode"]
         context["research_budget"] = {key: value for key, value in profile.items() if key != "num_predict"}
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
@@ -6167,6 +6209,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         successful_research_domains: set[str] = set()
         research_candidates: dict[str, dict] = {}
 
+        def news_evidence() -> list[dict]:
+            return canadian_news_evidence(live_results, research_now, news_window) if same_day_canada else live_results
+
+        def research_call_limit() -> int:
+            # Reserve one wider search and two independent article fetches.
+            return int(profile["max_calls"]) - (3 if same_day_canada and news_window == 1 else 0)
+
         def retain_search_date(fetched: dict, requested_url: str) -> dict:
             """Keep discovery dates on automatic and model-requested fetches."""
             fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
@@ -6186,13 +6235,13 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 for candidate in search_result["result"].get("results", []):
                     if isinstance(candidate, dict) and (url := normalized_research_url(candidate.get("url"))):
                         research_candidates.setdefault(url, {**candidate, "url": url})
-            max_calls = int(profile["max_calls"])
+            max_calls = research_call_limit()
             fetch_limit = {"quick": 0, "normal": 1, "deep": 2}.get(str(profile["mode"]), 0)
             useful_fetches = 0
             while useful_fetches < (max_calls if finish else fetch_limit):
-                shape = research_evidence_shape(live_results)
+                shape = research_evidence_shape(news_evidence())
                 reserve = max(0, int(profile["minimum_searches"]) - shape["successful_searches"]) if deep_news else 0
-                if research_calls >= max_calls - reserve or (finish and deep_research_ready(live_results, True)):
+                if research_calls >= max_calls - reserve or (finish and deep_research_ready(news_evidence(), True)):
                     break
                 candidates = research_fetch_candidates(
                     {"results": list(research_candidates.values())}, attempted_research_urls,
@@ -6221,7 +6270,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     if fetched_url:
                         attempted_research_urls.add(fetched_url)
                         successful_research_domains.add(research_publisher(fetched_url))
-                    useful_fetches += int(research_evidence_shape(live_results)["distinct_fetched_urls"] > shape["distinct_fetched_urls"])
+                    useful_fetches += int(research_evidence_shape(news_evidence())["distinct_fetched_urls"] > shape["distinct_fetched_urls"])
 
         for _ in range(int(profile["iterations"])):
             discovery_audit({
@@ -6251,17 +6300,17 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if not calls:
                 minimum_searches = 2 if profile["mode"] == "normal" else int(profile["minimum_searches"]) if deep_news else 0
                 while (research_evidence_shape(live_results)["successful_searches"] < minimum_searches
-                       and research_calls < int(profile["max_calls"])):
+                       and research_calls < research_call_limit()):
                     recovery_queries = web_recovery_queries(user_text)
                     search_attempts = sum(1 for item in live_results if item.get("tool") == "web_search")
                     query = recovery_queries[min(search_attempts, len(recovery_queries) - 1)]
-                    followup_recency = 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
+                    followup_recency = 1 if same_day_canada or re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
                     followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": followup_recency, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
                     research_calls += 1
                     live_results.append(followup)
                     messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                     await fetch_search_evidence(followup)
-                if deep_news and not deep_research_ready(live_results, bool(research_candidates)):
+                if deep_news and not deep_research_ready(news_evidence(), bool(research_candidates)):
                     await fetch_search_evidence(finish=True)
                 break
             # This is a dispatch record, not final-answer evidence. Retain
@@ -6269,7 +6318,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # could otherwise reintroduce an ungrounded search-snippet claim.
             messages.append({**message, "role": "assistant", "content": ""})
             for call in calls[:4]:
-                if research_calls >= int(profile["max_calls"]):
+                if research_calls >= research_call_limit():
                     break
                 fn = call.get("function", {})
                 name, arguments = fn.get("name"), fn.get("arguments", {})
@@ -6303,6 +6352,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     arguments = json.loads(arguments)
                 arguments = normalize_home_tool_arguments(name, arguments, user_text)
                 arguments = enrich_research_arguments(name, arguments, profile, user_text)
+                if same_day_canada and name == "web_search":
+                    arguments["recency_days"] = 1
                 result = await invoke_tool(name, arguments, client_id, request_id)
                 research_calls += 1
                 if name == "web_fetch":
@@ -6323,8 +6374,37 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     record_tool_referent(client_id, name, arguments, result)
                 if name == "web_search":
                     await fetch_search_evidence(result)
-            if research_calls >= int(profile["max_calls"]):
+            if research_calls >= research_call_limit():
                 break
+        if same_day_canada and not deep_research_ready(news_evidence(), True):
+            news_window = 3 if datetime.fromtimestamp(research_now).weekday() == 6 else 2
+            start_date = datetime.fromtimestamp(research_now - (news_window - 1) * 86400).date().isoformat()
+            end_date = datetime.fromtimestamp(research_now).date().isoformat()
+            news_disclosure = (
+                "Same-day coverage is limited in the sources I could verify for Canada. "
+                f"I broadened the coverage window to {start_date} through {end_date}."
+            )
+            followup = await invoke_tool("web_search", {
+                "query": web_search_query_from_text(user_text), "max_results": 20,
+                "recency_days": news_window, "search_type": "news",
+            }, client_id, request_id)
+            research_calls += 1
+            # Prioritize the wider search's new candidates over exhausted
+            # same-day candidates; retained fetched evidence remains available.
+            research_candidates = {url: candidate for url, candidate in research_candidates.items()
+                                   if url in attempted_research_urls}
+            live_results.append(followup)
+            await fetch_search_evidence(followup, finish=True)
+        trace_results = live_results
+        if same_day_canada:
+            # The display projection is bounded to twelve entries. Put used
+            # articles first so a late recovery's dated links survive noisy
+            # discovery, without changing raw provenance or evidence dates.
+            used_articles = [item for item in news_evidence() if item.get("tool") == "web_fetch"]
+            trace_results = [
+                {**item, "result": {**item["result"], "published": item["result"].get("published") or item["result"].get("date")}}
+                for item in used_articles
+            ] + [item for item in live_results if item not in used_articles]
         if deep_news:
             candidate_urls_exist = any(
                 item.get("tool") == "web_search"
@@ -6333,10 +6413,12 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 and research_fetch_candidates(item["result"], set(), set(), 1)
                 for item in live_results
             )
-            if not deep_research_ready(live_results, candidate_urls_exist):
+            if not deep_research_ready(news_evidence(), True if same_day_canada else candidate_urls_exist):
                 full = "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+                if news_disclosure:
+                    full = news_disclosure + " I still couldn't verify enough independent Canadian coverage for a reliable in-depth roundup."
                 store_provenance(client_id, live_results)
-                await emit_trace(ws, request_id, live_results)
+                await emit_trace(ws, request_id, trace_results)
                 await emit_answer(ws, request_id, full, client_id=client_id, origin="deep_research_incomplete")
                 history.append({"role": "assistant", "content": full})
                 await ws.send_json({"type": "done", "request_id": request_id})
@@ -6414,6 +6496,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # question) must never ground the answer, even though it was
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
+            if same_day_canada:
+                grounding_results = canadian_news_evidence(grounding_results, research_now, news_window)
             if deep_news:
                 # Search snippets are discovery hints only. A deep-news final
                 # answer may use article text but must not treat a snippet as
@@ -6426,7 +6510,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if evidence_messages:
                 evidence_messages[0]["content"] = instruction + "\n" + evidence_messages[0]["content"]
                 messages.extend(evidence_messages)
-            await emit_trace(ws, request_id, live_results)
+            await emit_trace(ws, request_id, trace_results)
         else:
             grounding_results = live_results
         # The Qwen tool-dispatch loop above appends a raw {"role": "tool",
@@ -6443,15 +6527,39 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 message for message in messages
                 if not (message.get("role") == "tool" and message.get("name") not in relevant_tool_names)
             ]
+        if same_day_canada:
+            # Filtering by tool name alone would retain an off-scope fetch
+            # alongside valid fetches. Rebuild those messages from scoped proof.
+            messages = [message for message in messages
+                        if message.get("role") != "tool" and not message.get("tool_calls")]
+            messages.extend({"role": "tool", "name": "web_fetch", "content": json.dumps(
+                compact_research_result("web_fetch", item["result"], deep=True), separators=(",", ":"),
+            )} for item in grounding_results if item.get("tool") == "web_fetch")
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
         if deep_news:
-            messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(live_results))})
+            messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(news_evidence()))})
+            if same_day_canada:
+                messages.append({"role": "system", "content": (
+                    "Keep the roundup relevant to Canada and the user's requested topic. "
+                    "Identify each development's publication date and fetched source. "
+                    "Use only the supplied fetched articles; do not fill gaps from model memory. "
+                    + (news_disclosure + " This disclosure is already shown; do not repeat it. Do not describe older coverage as today's news."
+                       if news_disclosure else "The evidence is limited to today's dated coverage.")
+                )})
         elif profile["mode"] == "deep":
             messages.append({"role": "system", "content": "The user explicitly requested depth, so the normal short-answer default does not apply. Give a detailed explanation with context and examples as appropriate to the subject."})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
-        full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
+        if news_disclosure:
+            await emit_answer(ws, request_id, news_disclosure)
+        guard_results = grounding_results
+        if same_day_canada:
+            # A news publication window must not hide a conflicting live
+            # institutional page from the existing current-officeholder guard.
+            guard_results = [item for item in canadian_news_evidence(live_results, research_now, None)
+                             if item.get("tool") == "web_fetch"]
+        full = await stream_final(ws, request_id, messages, full_seed=news_disclosure, guard_user_text=user_text, guard_results=guard_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
     history.append({"role": "assistant", "content": full.strip()})
     await ws.send_json({"type": "done", "request_id": request_id})

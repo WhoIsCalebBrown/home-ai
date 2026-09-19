@@ -12,7 +12,7 @@ import pytest
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
 needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "social_acknowledgement_response", "plural_disambiguation_reply", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "informational_media_continuation", "media_acquisition_request_frame", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "library_category_followup", "library_count_category", "referential_media_library_question", "referential_media_request", "retained_media_goal", "canonical_identity_matches", "enforce_retained_media_identity", "collective_library_query", "referential_web_query", "storage_state_followup", "operation_for_plan", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer", "research_profile", "research_fetch_candidates", "research_evidence_shape", "deep_research_ready"}
-needed.update({"current_news_intent", "current_role_relationships", "research_article_freshness", "fetched_current_role_supported", "normalized_research_url", "research_publisher", "research_authoritative"})
+needed.update({"current_news_intent", "current_role_relationships", "research_article_freshness", "fetched_current_role_supported", "normalized_research_url", "research_publisher", "research_authoritative", "canadian_news_evidence"})
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -97,6 +97,25 @@ research_profile = namespace["research_profile"]
 research_fetch_candidates = namespace["research_fetch_candidates"]
 research_evidence_shape = namespace["research_evidence_shape"]
 deep_research_ready = namespace["deep_research_ready"]
+
+
+@pytest.mark.parametrize("content,date,days,accepted", [
+    ("Canada announces new research funding.", "2026-09-18", 1, False),
+    ("Canada announces new research funding.", "2026-09-18", 2, True),
+    ("Ontario expands hospital capacity.", "2026-09-17", 2, False),
+    ("Ontario expands hospital capacity.", "2026-09-17", 3, True),
+    ("Unrelated overseas football results.", "2026-09-19", 3, False),
+    ("Canada announces new research funding.", "2026-09-20", 3, False),
+    ("Canada announces new research funding.", "unknown", 3, False),
+    ("Canada announces new research funding.", None, 3, False),
+])
+def test_canadian_news_scope_requires_fetched_relevance_and_window(content, date, days, accepted):
+    # Removing either the geography or publication-window gate admits noise.
+    item = {"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://cbc.ca/news/article", "content": content, "date": date,
+    }}
+    evidence = namespace["canadian_news_evidence"]([item], datetime(2026, 9, 19, 12).timestamp(), days)
+    assert evidence == ([item] if accepted else [])
 
 
 def test_download_followup_uses_recorded_sources():
