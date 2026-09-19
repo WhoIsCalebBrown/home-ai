@@ -32,6 +32,7 @@ from wyoming.tts import Synthesize
 from tts_audio import prepend_silence
 from trace_projection import MAX_SOURCES_PER_SEARCH, MAX_TRACE_ENTRIES, clean_text, project_trace, safe_display_url
 from progress_events import ProgressPreamble, emit_tool_progress, progress_sink_context
+from openwebui_speech import display_atoms, resolve_part
 
 app = FastAPI(title="Local Voice Assistant")
 OLLAMA = os.getenv("OLLAMA_URL", "http://voice-ollama:11434")
@@ -264,6 +265,7 @@ turn_trace_context = contextvars.ContextVar("turn_trace_context", default={})
 # tool trace. Keep the corresponding speech-only response separately so its
 # TTS request does not parse UI/diagnostic markup.
 openai_tts_text_by_display_digest: dict[str, tuple[float, str]] = {}
+openai_tts_atoms_by_display_digest: dict[str, list[tuple[str, str]]] = {}
 OPENAI_TTS_TEXT_TTL = 15 * 60
 OPENAI_TTS_MAX_ENTRIES = 256
 
@@ -272,6 +274,9 @@ def _purge_openai_tts_registry(now: float) -> None:
     for key, (created, _) in list(openai_tts_text_by_display_digest.items()):
         if now - created > OPENAI_TTS_TEXT_TTL:
             openai_tts_text_by_display_digest.pop(key, None)
+    for key in list(openai_tts_atoms_by_display_digest):
+        if key not in openai_tts_text_by_display_digest:
+            openai_tts_atoms_by_display_digest.pop(key, None)
 
 
 def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
@@ -287,17 +292,32 @@ def register_openai_tts_text(display_text: str, spoken_text: str) -> None:
                 key=lambda key: openai_tts_text_by_display_digest[key][0],
             )
             openai_tts_text_by_display_digest.pop(oldest_key, None)
+            openai_tts_atoms_by_display_digest.pop(oldest_key, None)
     openai_tts_text_by_display_digest[digest] = (now, spoken_text)
+    openai_tts_atoms_by_display_digest[digest] = display_atoms(display_text, spoken_text)
 
 
-def spoken_text_for_openai_display(display_text: str) -> str:
+def _registered_openai_speech(display_text: str) -> str | None:
     now = time.time()
     _purge_openai_tts_registry(now)
     digest = hashlib.sha256(display_text.encode("utf-8")).hexdigest()
     entry = openai_tts_text_by_display_digest.get(digest)
     if entry and now - entry[0] <= OPENAI_TTS_TEXT_TTL:
         return entry[1]
-    return display_text
+    silent_match = False
+    for key in reversed(openai_tts_text_by_display_digest):
+        resolved = resolve_part(display_text, openai_tts_atoms_by_display_digest.get(key, []))
+        if resolved:
+            return resolved
+        silent_match |= resolved == ""
+    if silent_match:
+        return ""
+    return None
+
+
+def spoken_text_for_openai_display(display_text: str) -> str:
+    registered = _registered_openai_speech(display_text)
+    return display_text if registered is None else registered
 
 
 async def check_tools_backend() -> None:
@@ -7110,22 +7130,31 @@ def remove_openai_display_metadata(text: str) -> str:
     # Flattened clients can turn those same boundary newlines into spaces.
     if not marker:
         flat_source = r"\[(?:\\.|[^\]\r\n])+\]\(https?://[^)\s]+\)(?: — [^\s]+)?"
-        flat_action = (
-            r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|"
-            r"Checked your home|Used an assistant tool)"
-        )
-        flat_entry = (
-            rf"{flat_action} — (?:complete|no results|failed)"
-            rf"(?:\s+-\s+{flat_source})*"
-        )
-        flat_actual = re.compile(
-            rf"--- \*\*Research activity\*\* - {flat_entry}"
-            rf"(?:\s+-\s+{flat_entry})*"
-        )
+
+        def generated_flat_rows(tail: str) -> bool:
+            rows = re.split(r"\s+-\s+", tail)
+            if rows.pop(0) != "--- **Research activity**" or len(rows) > MAX_TRACE_ENTRIES * 4:
+                return False
+            actions = 0
+            sources = 0
+            for row in rows:
+                if action_status.fullmatch(row):
+                    actions += 1
+                    sources = 0
+                elif actions and sources < MAX_SOURCES_PER_SEARCH:
+                    # Candidate rows have no link. Require the same escaped,
+                    # bounded text shape the renderer emits for remote fields.
+                    unescaped = re.sub(r"\\(.)", r"\1", row)
+                    if not re.fullmatch(flat_source, row) and _safe_markdown_text(unescaped, 436) != row:
+                        return False
+                    sources += 1
+                else:
+                    return False
+            return 0 < actions <= MAX_TRACE_ENTRIES
         for candidate in re.finditer(r"(?:\A|\n\n|\s+)(?=---\s+\*\*Research activity\*\*)", cleaned):
             start = candidate.end()
             tail = re.sub(r"\s+", " ", cleaned[start:].strip())
-            known = flat_actual.fullmatch(tail)
+            known = generated_flat_rows(tail)
             linked = re.fullmatch(
                 r"--- \*\*Research activity\*\* - [^\s].* Sources - "
                 r"\[[^\]]+\]\(https?://[^)\s]+\)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*",
@@ -7267,9 +7296,15 @@ def _openai_stream_response(body: dict, request: Request, session_id: str) -> St
     created = int(time.time())
     correlation = getattr(request, "_home_ai_correlation", {})
 
+    progress_display = ""
+
     async def progress_sink(event: dict) -> None:
+        nonlocal progress_display
         content = preamble.add(event)
         if content:
+            progress_display += content
+            register_openai_tts_text(content, "")
+            register_openai_tts_text(progress_display, "")
             # Progress is optional and must never backpressure a tool. Only
             # four bounded fragments can enter this queue in one request.
             with contextlib.suppress(asyncio.QueueFull):
@@ -7363,9 +7398,8 @@ async def openai_speech(request: Request):
         # tool diagnostics for Open WebUI. Resolve the exact response through
         # the server-side display->speech registry before synthesis, so the
         # spoken channel never receives that metadata.
-        text = spoken_text_for_openai_display(text)
-        if text:
-            text = remove_openai_display_metadata(text)
+        registered = _registered_openai_speech(text)
+        text = remove_openai_display_metadata(text) if registered is None else registered
         if not text:
             # Display-only tool diagnostics can arrive as their own TTS
             # request. Treat that request as intentionally silent.

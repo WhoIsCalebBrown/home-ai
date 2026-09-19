@@ -33,8 +33,12 @@ tool-backed final answer, the Assistant can emit an ordinary persisted Markdown
 `**Working**` preamble with no more than four distinct safe major-stage lines.
 It then emits `---`, the answer, and the server-owned rich source trace. This
 is deliberately not token-level streaming. The preamble remains in the saved
-Open WebUI conversation by design, but it and the source trace are removed
-before TTS.
+Open WebUI conversation by design. The bounded speech registry removes it and
+the source trace from current messages, including the pinned client's stripped
+and split Read Aloud inputs. Isolated plain fragments from history after the
+registry's 15-minute lifetime or a server restart lack that provenance; the
+[acceptance evidence](qa/openwebui-progress-source-acceptance.md) records this
+limit and the complete-footer fallback.
 
 ## Transient-status compatibility gate (BLOCKED)
 

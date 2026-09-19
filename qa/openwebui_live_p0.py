@@ -24,8 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
 
 
 WRITE_WORDS = re.compile(r"\b(?:confirm|approve|download|acquire|add|request|get|grab|restart|delete|remove|turn on|turn off)\b", re.I)
@@ -267,6 +266,14 @@ PROBE_HOSTILE_TITLE = 'Unsafe title witness <img src="x" onerror="alert(1)"> [sp
 PROBE_PROMPT = f"Show the QA fixture for {PROBE_RAW_QUERY}."
 PROBE_BLOCK_SECONDS = 3.0
 PROBE_SAFE_TITLE = "Fixture source"
+PROBE_ANSWER = "Here is the fixture answer."
+PROBE_PROGRESS = "**Working**\n- Searching the web…\n- Reading example.com…\n"
+PROBE_UNSAFE_URLS = [
+    "http://100.64.0.1/", "https://nas/", "https://myhost.localhost/",
+    "https://example.com\\private.local/", "https://%31%32%37.0.0.1/",
+    "https://１２７．０．０．１/", "https://@example.com/", "https://example.com:bad/",
+]
+PROBE_SPOKEN: list[str] = []
 PROBE_LIVE_RESULTS = [
     {
         "tool": "web_search",
@@ -298,11 +305,14 @@ PROBE_LIVE_RESULTS = [
         "result": {"url": PROBE_PRIVATE_URL, "error": PROBE_TOOL_ERROR},
     },
 ]
+PROBE_LIVE_RESULTS.extend({
+    "tool": "web_fetch", "status": "ok", "result": {"title": "Rejected URL", "url": url},
+} for url in PROBE_UNSAFE_URLS)
 
 
 @lru_cache(maxsize=1)
-def _fixture_display_answer() -> str:
-    """Build the fixture response through the real projection/footer boundary."""
+def _fixture_app():
+    """Use production rendering, registration and TTS; fake only external IO."""
     repository = Path(__file__).resolve().parents[1]
     assistant_dir = repository / "assistant"
     if str(assistant_dir) not in sys.path:
@@ -316,6 +326,28 @@ def _fixture_display_answer() -> str:
         raise RuntimeError("could not load the production trace footer")
     app_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(app_module)
+    app_module.OPENAI_COMPAT_API_KEY = PROBE_KEY
+    app_module.OPENAI_COMPAT_API_KEY_FILE = ""
+
+    async def synthesize(text):
+        PROBE_SPOKEN.append(text)
+        return text.encode()
+
+    async def turn(body, request):
+        sink = app_module.progress_sink_context.get()
+        for label in ["Searching the web…", "Reading example.com…"]:
+            await sink({"phase": "tool_started", "label": label})
+        await asyncio.sleep(PROBE_BLOCK_SECONDS)
+        return PROBE_ANSWER, "fixture-session", project_trace(PROBE_LIVE_RESULTS)
+
+    app_module.synthesize_pocket = synthesize
+    app_module._openai_chat_turn = turn
+    return app_module
+
+
+def _fixture_display_answer() -> str:
+    app_module = _fixture_app()
+    project_trace = app_module.project_trace
     trace = project_trace(PROBE_LIVE_RESULTS)
     rendered = app_module.openai_tool_trace_footer(trace)
     raw_metadata = (PROBE_PRIVATE_URL, PROBE_SNIPPET, PROBE_TOKEN, PROBE_TOOL_ERROR)
@@ -323,14 +355,7 @@ def _fixture_display_answer() -> str:
         raise RuntimeError("fixture projection leaked raw tool metadata")
     if PROBE_HOSTILE_TITLE not in repr(trace):
         raise RuntimeError("fixture hostile title did not reach projection")
-    return "Here is the fixture answer." + rendered
-
-
-def _probe_sse(delta: dict[str, Any], finish_reason: str | None = None) -> str:
-    frame = {"id": "chatcmpl-progress-source-fixture", "object": "chat.completion.chunk",
-             "created": 0, "model": PROBE_MODEL,
-             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
-    return f"data: {json.dumps(frame, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    return PROBE_ANSWER + rendered
 
 
 def _require_probe_auth(request: Request) -> None:
@@ -352,34 +377,26 @@ async def progress_source_chat(request: Request):
     prompt = " ".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
     if body.get("model") != PROBE_MODEL or not body.get("stream") or PROBE_RAW_QUERY not in prompt:
         raise HTTPException(400, "fixture accepts only its streamed QA model")
-    display_answer = _fixture_display_answer()
-
-    async def events():
-        yield _probe_sse({"role": "assistant"})
-        yield _probe_sse({"content": "**Working**\n- Searching the web…\n- Reading example.com…\n"})
-        # The pause represents a blocked source.  The browser must show the
-        # ordinary content above before this source completes.
-        await asyncio.sleep(PROBE_BLOCK_SECONDS)
-        yield _probe_sse({"content": "\n---\n\n"})
-        yield _probe_sse({"content": display_answer})
-        yield _probe_sse({}, "stop")
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(events(), media_type="text/event-stream")
+    _fixture_display_answer()  # Fail closed on raw-fixture projection leakage.
+    return _fixture_app()._openai_stream_response(body, request, "fixture-session")
 
 
 @progress_source_probe.post("/v1/audio/speech")
 async def progress_source_tts(request: Request):
     _require_probe_auth(request)
-    text = str((await request.json()).get("input") or "")
-    # The fixture has no synthesizer.  A 204 is the required outcome for
-    # progress/source-only text and proves it never asks a speech backend to
-    # read browser display diagnostics.
-    if not text or text == _fixture_display_answer() or DISPLAY_TRACE_MARKER in text or text.startswith("**Working**"):
-        return Response(status_code=204)
-    if text == "Here is the fixture answer.":
-        return Response(content=b"fixture-spoken-answer", media_type="audio/wav")
-    raise HTTPException(400, "unexpected fixture speech input")
+    return await _fixture_app().openai_speech(request)
+
+
+@progress_source_probe.get("/qa/evidence")
+async def progress_source_evidence(request: Request):
+    _require_probe_auth(request)
+    return {
+        "display": PROBE_PROGRESS + "\n---\n\n" + _fixture_display_answer(),
+        "progress": PROBE_PROGRESS,
+        "footer": _fixture_app().openai_tool_trace_footer(_fixture_app().project_trace(PROBE_LIVE_RESULTS)),
+        "trace": _fixture_app().project_trace(PROBE_LIVE_RESULTS),
+        "spoken": PROBE_SPOKEN,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

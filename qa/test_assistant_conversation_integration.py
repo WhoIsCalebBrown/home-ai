@@ -2578,6 +2578,36 @@ async def test_research_recovery_keeps_untried_candidates_after_two_failed_fetch
 
 
 @pytest.mark.asyncio
+async def test_world_news_late_successes_keep_fetched_links_after_eleven_failures(session):
+    failed = [f"https://failed-{index}.example/story" for index in range(11)]
+    good = ["https://one.example/story", "https://two.example/story"]
+    session.backend.web_search_fixtures = [
+        [{"url": url} for url in failed], [{"url": good[0]}], [{"url": good[1]}],
+    ]
+    session.backend.web_fetch_failures.update(failed)
+    reply = await session.turn(
+        "Give me an in-depth review of world news today.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "world news today"}}},
+        ]}}],
+        final_text="The fetched stories describe two world developments.",
+    )
+    assert reply == "The fetched stories describe two world developments."
+    assert len(session.backend.call_log) == 16
+    assert session.backend.call_log[13][0] == "web_fetch"
+    assert session.backend.call_log[13][1]["url"] == good[0]
+    assert session.backend.call_log[15][0] == "web_fetch"
+    assert session.backend.call_log[15][1]["url"] == good[1]
+    assert session.last_stream_payload is not None
+    trace = next(item["entries"] for item in reversed(session.ws.sent) if item.get("type") == "trace")
+    assert len(trace) <= 12
+    assert [source["url"] for item in trace for source in item["sources"] if source["kind"] == "fetched"] == good
+    footer = session.app.openai_tool_trace_footer(trace)
+    assert all(f"]({url})" in footer for url in good)
+    assert "fixture fetch failure" not in footer
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("model_fetch", [False, True])
 async def test_deep_news_retains_search_date_when_fetch_has_no_publication_date(session, model_fetch):
     old_url = "https://canada.gc.ca/announcement"

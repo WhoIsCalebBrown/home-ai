@@ -18,9 +18,12 @@ requires a sentinel raw query in the UI prompt and feeds a raw tool-result list
 through the actual assistant trace_projection.project_trace function and the
 actual voice-api-app.py openai_tool_trace_footer function. That raw metadata
 contains a private/internal token-bearing URL, raw query, snippet, token, raw
-exception, hostile HTML/Markdown title, and one safe fetched URL. The emitted
-stream contains only the resulting projected footer. It holds the fake source
-for three seconds before sending the final answer and trace.
+exception, hostile HTML/Markdown title, CGNAT/local/malformed destinations, and
+one safe fetched URL. The provider uses the production streaming response,
+speech registry, and `/v1/audio/speech` handler. Only the external turn and
+synthesizer IO are replaced: the turn holds its source for three seconds, and
+the synthesizer records and returns exactly the text it receives. The fixture
+does not manufacture 204 responses.
 
 ## Reproducible browser acceptance
 
@@ -52,7 +55,7 @@ until curl -fsS http://127.0.0.1:18094/health >/dev/null; do sleep 1; done
 docker run --rm --network "$QA_NETWORK" --shm-size=1gb \
   -e NODE_PATH=/node_modules \
   -v "$PLAYWRIGHT_HOME/node_modules:/node_modules:ro" \
-  -v "$PWD/qa:/workspace/qa:ro" -v "$QA_DATA:/evidence" \
+  -v "$PWD:/workspace:ro" -v "$QA_DATA:/evidence" \
   mcr.microsoft.com/playwright:v1.52.0-noble \
   node /workspace/qa/openwebui_progress_source_acceptance.mjs \
   --base-url http://home-ai-progress-source-webui:8080 \
@@ -85,6 +88,13 @@ The script fails unless all of these hold in the assistant DOM:
   is created;
 - raw query, snippet, private/internal URL, token, or raw error is absent from
   the assistant message.
+- the native renderer and Open WebUI create only the approved public anchor;
+- actual pinned `getMessageContentParts`, `cleanText`, and `removeFormattings`
+  from `/_app/immutable/chunks/BzfgYq-h.js.map` preprocess full displays and
+  progress/footer fragments in punctuation, paragraphs, and none modes;
+- those inputs reach the production speech handler: metadata returns 204 with
+  zero synthesis calls, and answer-bearing parts synthesize only the answer;
+- live progress parts return 204 before the answer is registered.
 
 ## Observed result
 
@@ -95,10 +105,17 @@ The completed browser invocation returned:
   "fixture_delay_ms": 3000,
   "early_progress_visible": true,
   "early_final_visible": false,
-  "early_elapsed_ms": 477,
+  "early_elapsed_ms": 487,
+  "live_speech_silent_count": 5,
   "completed_progress_line_count": 2,
-  "final_elapsed_ms": 3446,
+  "final_elapsed_ms": 3413,
   "reloaded_progress_line_count": 2,
+  "speech": {
+    "punctuation": {"silent": 13, "spoken": 1},
+    "paragraphs": {"silent": 39, "spoken": 1},
+    "none": {"silent": 2, "spoken": 1}
+  },
+  "native_anchors": ["https://example.com/news"],
   "status": "pass"
 }
 ~~~
@@ -106,10 +123,30 @@ The completed browser invocation returned:
 This is graphical acceptance evidence from the UI itself; no synthetic
 assistant message was inserted.
 
-The fixture speech endpoint returned 204 for a preamble/trace-only request.
-The real speech boundary is covered by the production-shaped TTS normalization
-and OpenAI gateway tests: preamble and rich trace are removed, while
-progress-only and trace-only input returns 204 without invoking a synthesizer.
+Speech processing is evaluated from the pinned client's source map by
+`qa/openwebui_pinned_speech.mjs`, which erases TypeScript annotations only.
+It posts the resulting parts to the real handler through the disposable QA
+provider and checks recorded synthesis calls. This verifies the server TTS
+boundary, not browser-local speech engines or audio playback quality.
+
+Source-map SHA-256:
+`ba6079a375623d62108dbe67fa834a4f836ca5e796c4646aee0325a0a15e1f47`.
+Current screenshots were written to the disposable evidence directory, then
+preserved in this worktree's ignored
+`.superpowers/sdd/2026-09-19-openwebui-progress-and-source-transparency/final-browser/`
+before the disposable UI and its data were removed:
+
+| Screenshot | SHA-256 |
+| --- | --- |
+| progress-visible-before-source-completes.png | b57f2278a0071f280679b1296bda1f924ad447eda8695b82da84940fa7aa205d |
+| progress-source-final.png | be0c9234b6b2124efc2695be4417d29fedce580e3ab49235b44d1e9f2b5aa161 |
+| progress-source-reload.png | 14e04c5cde4164981207a254a669819606a24e52bb8c65f87c537b00771ca200 |
+
+The fragment registry retains the existing 15-minute lifetime and 256-display
+capacity. An expired or pre-restart isolated plain source title has no
+provenance; it cannot safely be distinguished from ordinary speech input.
+Complete unregistered Markdown footers retain the bounded grammar fallback.
+Registered ordinary answers take precedence over colliding metadata fragments.
 
 ## Production-shaped test evidence
 
@@ -124,13 +161,13 @@ docker build -f qa/Dockerfile.assistant_integration -t home-ai-assistant-sdd-qa 
 docker run --rm --network none --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   -w /repo home-ai-assistant-sdd-qa python -m pytest -q -p no:cacheprovider \
-  assistant/test_trace_projection.py assistant/test_progress_events.py \
+  assistant/test_trace_projection.py assistant/test_trace_rendering.py assistant/test_progress_events.py \
   assistant/test_openai_gateway.py assistant/test_tts_normalization.py \
   assistant/test_grounding_regressions.py \
   qa/test_assistant_conversation_integration.py
 ~~~
 
-Focused result: 643 passed, 561 warnings in 27.01s. The warnings are the
+Focused result: 670 passed, 563 warnings in 26.96s. The warnings are the
 existing audioop and FastAPI startup-event deprecations; the cache provider was
 disabled so the read-only cache warnings are absent.
 
@@ -141,18 +178,22 @@ command:
 docker build -f qa/Dockerfile.assistant_integration -t home-ai-assistant-sdd-qa .
 docker run --rm --network none --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  -w /repo home-ai-assistant-sdd-qa python -m pytest -q
+  -w /repo home-ai-assistant-sdd-qa python -m pytest -q -p no:cacheprovider --tb=short
 ~~~
 
 Result:
 
 ~~~text
-1087 passed, 563 warnings in 53.30s
+1112 passed, 563 warnings in 52.41s
 ~~~
 
-Its warnings were existing pytest-asyncio/audioop/FastAPI deprecations plus two
-expected pytest cache write warnings from the deliberately read-only repository.
-The fix round changes QA/docs only; it does not alter Assistant runtime code.
+Its warnings were existing audioop/FastAPI deprecations; pytest also reports its
+existing unset async fixture-scope deprecation. Cache writes were disabled.
+The rebuilt QA image was
+`sha256:9b4060805748de6ee401614067d8bc1746f80dd4d89d4eac1a057db9ee4111fb`.
+This final fix changes the owned speech boundary, display URL validation and
+trace selection, with one packaging COPY for the new speech helper. Open WebUI,
+production services, deployments and the separate branch blockers are unchanged.
 
 ## Teardown
 

@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { chromium } from "playwright";
+import { PINNED_UTILS_MAP, pinnedSpeechProcessor } from "./openwebui_pinned_speech.mjs";
 
 const FINAL_ANSWER = "Here is the fixture answer.";
 const TRACE_TEXT = "Research activity";
@@ -81,6 +82,7 @@ async function completedAssistantDom(page) {
         && !link.hasAttribute("disabled")
         && getComputedStyle(link).pointerEvents !== "none",
       evil_anchor_count: root.querySelectorAll('a[href*="evil.example"]').length,
+      all_anchors: [...root.querySelectorAll("a[href]")].map(node => node.href),
       injected_node_count: root.querySelectorAll('img[src="x"], script, [onerror], [onload]').length,
     };
   }, { finalAnswer: FINAL_ANSWER, safeUrl: SAFE_URL });
@@ -96,6 +98,7 @@ function checkCompletedDom(snapshot, phase) {
   assert(snapshot.safe_anchor_count === 1, phase + ": safe source anchor missing or duplicated");
   assert(snapshot.safe_anchor_clickable, phase + ": safe source anchor is not clickable");
   assert(snapshot.evil_anchor_count === 0, phase + ": hostile title created evil destination");
+  assert(snapshot.all_anchors.every(url => url === SAFE_URL), phase + ": non-public source anchor");
   assert(snapshot.injected_node_count === 0, phase + ": hostile title created injected node");
   assert(snapshot.text.includes(HOSTILE_TITLE_WITNESS),
     phase + ": sanitized hostile-title witness was not visible as inert text");
@@ -111,6 +114,7 @@ async function main() {
   const artifactsDir = requiredOption("--artifacts-dir");
   const email = option("--email", "progress-source@example.test");
   const password = option("--password", "FixturePassword123!");
+  const providerUrl = option("--provider-url", "http://progress-source-provider:8000");
   fs.mkdirSync(artifactsDir, { recursive: true });
 
   const browser = await chromium.launch({ headless: true });
@@ -119,6 +123,9 @@ async function main() {
   const result = { base_url: baseUrl, fixture_delay_ms: 3000 };
   try {
     await authenticate(page, baseUrl, email, password);
+    const headers = { Authorization: "Bearer progress-source-fixture-key", "Content-Type": "application/json" };
+    const sourceMap = await (await fetch(baseUrl + PINNED_UTILS_MAP)).json();
+    const getMessageContentParts = pinnedSpeechProcessor(sourceMap);
     const input = page.locator("[contenteditable=true]");
     await input.fill(PROMPT);
     const started = performance.now();
@@ -132,6 +139,17 @@ async function main() {
     assert(!result.early_final_visible, "early: final answer arrived before blocked source completed");
     assert(result.early_elapsed_ms < result.fixture_delay_ms, "early: observation was after fixture release");
     await page.screenshot({ path: path.join(artifactsDir, "progress-visible-before-source-completes.png"), fullPage: true });
+    const live = await (await fetch(providerUrl + "/qa/evidence", { headers })).json();
+    result.live_speech_silent_count = 0;
+    for (const mode of ["punctuation", "paragraphs", "none"]) {
+      for (const input of getMessageContentParts(live.progress, mode)) {
+        const response = await fetch(providerUrl + "/v1/audio/speech", {
+          method: "POST", headers, body: JSON.stringify({ input }),
+        });
+        assert(response.status === 204, mode + ": live progress was spoken before the answer existed");
+        result.live_speech_silent_count++;
+      }
+    }
 
     await page.getByText(FINAL_ANSWER, { exact: true }).waitFor();
     const completed = await completedAssistantDom(page);
@@ -150,6 +168,38 @@ async function main() {
     assert(result.reloaded_progress_line_count >= 1 && result.reloaded_progress_line_count <= 4,
       "reload: persisted preamble must contain one through four safe lines");
     await page.screenshot({ path: path.join(artifactsDir, "progress-source-reload.png"), fullPage: true });
+    const evidence = await (await fetch(providerUrl + "/qa/evidence", { headers })).json();
+    result.speech = {};
+    let expectedSyntheses = evidence.spoken.length;
+    for (const mode of ["punctuation", "paragraphs", "none"]) {
+      let silent = 0, spoken = 0;
+      for (const value of [evidence.display, evidence.progress, evidence.footer]) {
+        for (const input of getMessageContentParts(value, mode)) {
+          const expected = input.includes(FINAL_ANSWER) ? FINAL_ANSWER : "";
+          const response = await fetch(providerUrl + "/v1/audio/speech", {
+            method: "POST", headers, body: JSON.stringify({ input, response_format: "wav" }),
+          });
+          assert(response.status === (expected ? 200 : 204), mode + ": wrong speech status for " + input);
+          assert(await response.text() === expected, mode + ": display metadata reached synthesis");
+          expected ? spoken++ : silent++;
+        }
+      }
+      expectedSyntheses += spoken;
+      result.speech[mode] = { silent, spoken };
+    }
+    const after = await (await fetch(providerUrl + "/qa/evidence", { headers })).json();
+    assert(after.spoken.length === expectedSyntheses && after.spoken.every(text => text === FINAL_ANSWER),
+      "Real speech handler invoked the synthesizer for metadata");
+
+    const native = fs.readFileSync(path.resolve(path.dirname(new URL(import.meta.url).pathname),
+      "../assistant/voice-api-index.html"), "utf8");
+    const nativeFunctions = ["approvedTraceUrl", "renderTrace"].map(name =>
+      native.split("\n").find(line => line.startsWith("function " + name + "("))).join("\n");
+    result.native_anchors = await page.evaluate(({ source, trace }) => {
+      const render = new Function("const MAX_TRACE_ENTRIES=12,MAX_SOURCES_PER_SEARCH=3;\n" + source + "\nreturn renderTrace;")();
+      return [...render(trace).querySelectorAll("a")].map(node => node.href);
+    }, { source: nativeFunctions, trace: evidence.trace });
+    assert(JSON.stringify(result.native_anchors) === JSON.stringify([SAFE_URL]), "Native trace created an unsafe anchor");
     result.status = "pass";
     fs.writeFileSync(path.join(artifactsDir, "results.json"), JSON.stringify(result, null, 2) + "\n");
     console.log(JSON.stringify(result));

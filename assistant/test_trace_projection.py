@@ -73,6 +73,20 @@ def test_project_trace_prefers_fetched_final_source_and_drops_sensitive_data():
     "https://example.com:65536/",
     "https://example.com:+443/",
     "https://[2606:4700:4700::1111]:/",
+    "http://100.64.0.1/",
+    "http://100.127.255.254/",
+    "https://nas/",
+    "https://myhost.localhost/",
+    "https://myhost.localhost./",
+    "https://example.com\\private.local/",
+    "https://example.com\\@127.0.0.1/",
+    "https://foo_bar.example/",
+    "https://-bad.example/",
+    "https://bad-.example/",
+    "https://bad..example/",
+    "https://example.com../",
+    "https://example.com:0/",
+    "https://[2606:4700:4700::1111]extra/",
 ])
 def test_safe_display_url_rejects_unsafe_or_sensitive_urls(value):
     assert safe_display_url(value) is None
@@ -86,6 +100,8 @@ def test_safe_display_url_rejects_unsafe_or_sensitive_urls(value):
     ("https://example.com", "https://example.com/"),
     ("https://example.com.", "https://example.com/"),
     ("https://[2606:4700:4700::1111]/news", "https://[2606:4700:4700::1111]/news"),
+    ("http://8.8.8.8/news", "http://8.8.8.8/news"),
+    ("https://news-2.example.org/news", "https://news-2.example.org/news"),
 ])
 def test_safe_display_url_normalizes_public_urls(value, expected):
     assert safe_display_url(value) == expected
@@ -209,3 +225,25 @@ def test_project_trace_treats_malformed_search_shapes_as_empty(result):
         "status": "no results",
         "sources": [],
     }]
+
+
+def test_late_fetched_evidence_survives_shared_cap_in_chronological_order():
+    failures = [{"tool": "web_fetch", "status": "error", "result": {"error": "private failure"}} for _ in range(11)]
+    raw = [{"tool": "web_search", "status": "ok", "result": {"query": "private query"}}] + failures
+    raw += [
+        {"tool": "web_search", "status": "ok", "result": {}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://one.example/story", "title": "First evidence"}},
+        {"tool": "web_search", "status": "ok", "result": {}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://two.example/story", "title": "Second evidence"}},
+    ]
+    trace = project_trace(raw)
+    assert len(trace) == 12
+    assert [source["url"] for entry in trace for source in entry["sources"]] == [
+        "https://one.example/story", "https://two.example/story",
+    ]
+    assert trace[0]["tool"] == "web_search"
+    assert trace[-2]["sources"][0]["title"] == "First evidence"
+    assert trace[-1]["sources"][0]["title"] == "Second evidence"
+    assert any(entry["status"] == "failed" for entry in trace)
+    assert "private" not in repr(trace)
+    assert len(json.dumps(trace).encode()) <= 16384
