@@ -4215,27 +4215,30 @@ def canadian_news_relevant(text: str, user_text: str) -> bool:
         geography, re.I,
     ):
         return False
-    # Strip request scaffolding, not arbitrary article words. Unrecognized
-    # topics still require a literal match rather than silently broadening.
-    framing = set((
-        "can could would you please give me tell show provide an a in depth deep dive review of on about the "
-        "recent latest current news events headlines today tonight this morning canada canadian s thorough "
-        "comprehensive detailed full picture properly research roundup summary overview report update updates "
-        "happening what is has gone all major top developments and or for with across"
-    ).split())
-    topics = [word for word in re.findall(r"[a-z]+", user_text.casefold()) if word not in framing]
-    aliases = {
-        "technology": r"technolog\w*|tech|software|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cyber\w*",
-        "tech": r"technolog\w*|tech|software|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cyber\w*",
-        "politics": r"politic\w*|government|parliament|elections?|legislat\w*",
-        "economy": r"econom\w*|inflation|interest rates?|employment|GDP",
-        "business": r"business\w*|companies|corporate|commerce|trade",
-        "health": r"health\w*|hospitals?|medical|medicine|disease\w*",
-        "science": r"scien\w*|research|discovery|discoveries",
-        "sports": r"sports?|hockey|football|soccer|baseball|basketball|tennis|athlet\w*",
+    # Only recognized category phrases impose a topical constraint. Request
+    # words such as "are", "want", or "briefly" never become article evidence,
+    # and generic news requests need no growing list of conversational fillers.
+    categories = {
+        r"technology|technological|tech|AI|artificial intelligence":
+            r"technolog(?:y|ies|ical)|tech|software|hardware|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cybersecurity|cyberattacks?",
+        r"politics|political|government":
+            r"politic(?:s|al)|government|parliament|parliamentary|elections?|legislation|legislative",
+        r"economy|economics|economic":
+            r"econom(?:y|ics|ic)|inflation|interest rates?|employment|GDP",
+        r"business|commerce|financial|finance":
+            r"business(?:es)?|companies|corporate|commerce|trade|financ(?:e|ial)|markets?",
+        r"health|healthcare|medical":
+            r"health(?:care)?|hospitals?|medical|medicine|diseases?",
+        r"science|scientific":
+            r"science|scientific|scientists?|research(?:ers)?|discovery|discoveries",
+        r"sports?|athletics":
+            r"sports?|hockey|football|soccer|baseball|basketball|tennis|athletics|athletes?",
+        r"entertainment|arts|culture|cultural":
+            r"entertainment|arts|culture|cultural|films?|movies?|cinema|music|theatre|theater|festivals?",
     }
-    return not topics or any(re.search(r"\b(?:" + aliases.get(topic, re.escape(topic) + r"s?") + r")\b", text, re.I)
-                             for topic in topics)
+    topics = [evidence for requested, evidence in categories.items()
+              if re.search(r"\b(?:" + requested + r")\b", user_text, re.I)]
+    return not topics or any(re.search(r"\b(?:" + topic + r")\b", text, re.I) for topic in topics)
 
 
 def canadian_news_evidence(live_results: list[dict], now: float, recency_days: int, user_text: str = "") -> list[dict]:

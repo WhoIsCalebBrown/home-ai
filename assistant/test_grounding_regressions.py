@@ -150,6 +150,30 @@ def test_canadian_news_ambiguous_place_names_need_canadian_context(content, acce
     assert namespace["canadian_news_evidence"]([item], now, 1) == ([item] if accepted else [])
 
 
+@pytest.mark.parametrize("prompt,article,accepted", [
+    ("What are today’s top technology headlines in Canada? Give me an in-depth review.", "Canadian hockey players are competing in the final.", False),
+    ("I want technology news in Canada today.", "Canadian hockey players want a championship.", False),
+    ("Briefly review Canadian technology news.", "Canadian hockey players briefly visited the arena.", False),
+    ("I want an in-depth review of today’s news in Canada", "Canada announced new funding.", True),
+    ("What are the biggest stories in Canadian news today?", "Canada reported housing construction figures.", True),
+    ("Please research Canada's news thoroughly today.", "Canada reported housing construction figures.", True),
+    ("Canadian technology news today", "Canada's software sector announced new jobs.", True),
+    ("Canadian tech news today", "Canada announced semiconductor manufacturing capacity.", True),
+    ("Canadian technology news today", "Canadian computer hardware manufacturers reported new products.", True),
+    ("Canadian technology news today", "Canadian researchers published artificial intelligence benchmarks.", True),
+    ("Canadian political news today", "Canada's parliament passed new legislation.", True),
+    ("Canadian economic news today", "Canada reported inflation and employment figures.", True),
+    ("Canadian business news today", "Canadian companies expanded trade operations.", True),
+    ("Canadian healthcare news today", "Canada opened a new hospital.", True),
+    ("Canadian scientific news today", "Canadian researchers announced a new discovery.", True),
+    ("Canadian sports news today", "Canada hosted a hockey tournament.", True),
+    ("Canadian entertainment news today", "Canada hosted a film festival.", True),
+    ("Canadian entertainment news today", "Canadian hockey players are competing in the final.", False),
+])
+def test_canadian_news_topic_taxonomy_requires_category_evidence(prompt, article, accepted):
+    assert namespace["canadian_news_relevant"](article, prompt) is accepted
+
+
 def test_download_followup_uses_recorded_sources():
     expected = ["qbittorrent", "sonarr", "radarr", "lidarr", "slskd", "torbox"]
     assert [SOURCE_NAMES[name] for name in expected] == ["qBittorrent", "Sonarr", "Radarr", "Lidarr", "Slskd", "Torbox"]

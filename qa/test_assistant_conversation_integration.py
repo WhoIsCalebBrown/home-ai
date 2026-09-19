@@ -2010,6 +2010,47 @@ async def test_quiet_canada_news_requested_topic_controls_evidence_gate(session,
 
 
 @pytest.mark.asyncio
+async def test_quiet_canada_news_topic_cannot_be_bypassed_by_request_word_overlap(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canadian hockey players are competing in a league final."
+    session.backend.web_fetch_contents[urls[1]] = "Canada's hockey teams are preparing for a tournament."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn("What are today’s top technology headlines in Canada? Give me an in-depth review.",
+                               final_text="The hockey teams are competing.")
+    assert session.last_stream_payload is None
+    assert "still couldn't verify enough" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [
+    "I want an in-depth review of today’s news in Canada",
+    "What are today’s biggest headlines in Canada? Give me an in-depth review.",
+])
+async def test_quiet_canada_news_generic_language_keeps_broad_strong_coverage(session, monkeypatch, prompt):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    reply = await session.turn(prompt, final_text="Canada reported funding and housing developments.")
+    assert session.last_stream_payload is not None
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(urls)
+    assert "same-day coverage is limited" not in reply.casefold()
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_technology_synonyms_satisfy_requested_category(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canada announced semiconductor manufacturing investment."
+    session.backend.web_fetch_contents[urls[1]] = "Canadian software developers launched a new platform."
+    reply = await session.turn("What are today’s top technology headlines in Canada? Give me an in-depth review.",
+                               final_text="Canada reported semiconductor and software developments.")
+    assert session.last_stream_payload is not None
+    assert "same-day coverage is limited" not in reply.casefold()
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
 async def test_quiet_canada_news_wider_topic_matches_only_enter_synthesis(session, monkeypatch):
     urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
     session.backend.web_fetch_contents[urls[0]] = "Canadian hockey teams finished a league match."
