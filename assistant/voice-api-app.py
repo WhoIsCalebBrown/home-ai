@@ -2042,12 +2042,13 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             target = legacy_target.replace("_", " ")
             normalized.pop("device_id", None)
     lowered = user_text.casefold()
+    switch_bulk_exclusion = bool(re.search(
+        r"\b(?:apart\s+from|except|excluding|without|but(?:\s+not)?|not)\s+(?:the\s+)?(?:outlet|outlets|plug|plugs|switch|switches)\b",
+        lowered,
+    ))
     switch_bulk_request = (
         bool(re.search(r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered))
-        and not bool(re.search(
-            r"\b(?:apart\s+from|except|excluding|without|but(?:\s+not)?|not)\s+(?:the\s+)?(?:outlet|outlets|plug|plugs|switch|switches)\b",
-            lowered,
-        ))
+        and not switch_bulk_exclusion
     )
     raw_action = str(normalized.get("action") or "").casefold().strip()
     if raw_action in {"on", "off"}:
@@ -2060,7 +2061,9 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             normalized["action"] = "turn_off"
         elif re.search(r"\b(?:turn\s+)?on\b", lowered):
             normalized["action"] = "turn_on"
-    if switch_bulk_request and target.casefold() in {"everything", "all devices", "all home devices"}:
+    if switch_bulk_exclusion and (not target or target.casefold() in {"everything", "all devices", "all home devices"}):
+        target = "all lights"
+    elif switch_bulk_request and target.casefold() in {"everything", "all devices", "all home devices"}:
         target = "all switches"
     if not target:
         device_type = str(normalized.get("device_type") or "").casefold()

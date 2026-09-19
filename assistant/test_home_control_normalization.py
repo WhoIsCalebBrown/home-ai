@@ -48,7 +48,7 @@ def test_explicit_switch_bulk_wording_overrides_model_everything_target(utteranc
     "Turn off everything except the outlets.",
     "Turn off everything except the plugs.",
 ])
-def test_excluded_switch_category_never_overrides_model_everything_target(utterance):
+def test_excluded_switch_category_normalizes_model_everything_target_to_lights(utterance):
     assert normalize_home_tool_arguments("home_control", {
         "action": "turn_off", "entity_or_area": "everything",
-    }, utterance) == {"action": "turn_off", "entity_or_area": "everything"}
+    }, utterance) == {"action": "turn_off", "entity_or_area": "all lights"}
