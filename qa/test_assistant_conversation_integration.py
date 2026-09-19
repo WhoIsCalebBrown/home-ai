@@ -851,11 +851,11 @@ async def test_unresolved_home_exclusion_clarifies_without_control(session):
     assert session.backend.submitted_writes == before
 
 
-# --- Scenario: discover -> offer -> accept -> cross-capability -> offer ->
-# explicit write intent -> strict confirmation -> fake write (spec #2, #24) --
+# --- Scenario: discover -> library read -> explicit write intent -> strict
+# confirmation -> fake write (spec #2, #24) ---------------------------------
 
 @pytest.mark.asyncio
-async def test_full_discover_offer_accept_write_conversation(session):
+async def test_full_discover_library_request_confirmation_conversation(session):
     session.backend.seed_web("Cowboy Bebop", media_type="anime", tmdb_id="30991")
 
     reply1 = await session.turn(
@@ -866,22 +866,24 @@ async def test_full_discover_offer_accept_write_conversation(session):
         final_text="Cowboy Bebop is an anime series.",
     )
     assert "cowboy bebop" in reply1.casefold()
+    assert session.client_id not in session.app.pending_offers
 
     subject_before = session.app.conversation_context.get(session.client_id, {}).get("latest_resolved_referent")
     assert subject_before and "cowboy bebop" in subject_before.casefold()
 
     reply2 = await session.turn(
-        "Is Cowboy Bebop in my library?",
+        "Do I have Cowboy Bebop in Plex?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "Cowboy Bebop"}}},
         ]}}],
         final_text="It's not in Plex yet.",
     )
     assert session.client_id not in session.app.pending  # no write confirmation yet
+    assert session.client_id not in session.app.pending_offers
     assert not session.backend.submitted_writes
 
     reply3 = await session.turn(
-        "Yeah, get it.",
+        "Can you get it?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
             {"function": {"name": "media_plan_goal", "arguments": {"goal": "get Cowboy Bebop"}}},
         ]}}],
@@ -2894,6 +2896,37 @@ async def test_clarification_reply_never_satisfies_a_pending_write_confirmation(
 # --- library-search dead end, and not the old "no matching live       --
 # --- workflow" status short-circuit. Reproduced through the REAL      --
 # --- respond()/preflight_plan deterministic path, not helper calls.   --
+
+@pytest.mark.asyncio
+async def test_read_only_media_identification_does_not_stage_an_acquisition_offer(session):
+    """A descriptive identity question answers with the canonical title only.
+
+    This catches the regression where the current MEDIA_DISCOVERY operation
+    was stored in turn context but stage_media_offer() only examined stale
+    operation fields, appending a Plex/request offer to an informational
+    answer.
+    """
+    session.backend.seed_library(
+        "White Chicks", media_type="movie", state="ABSENT", tmdb_id="12153", year="2004"
+    )
+    # The integration fake's resolver models catalog clue matching through
+    # its person-index seam; this phrase is the reported descriptive clue.
+    session.backend.seed_person("two cops", "White Chicks")
+
+    reply = await session.turn(
+        "What's that movie where two cops dress as blonde women?",
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "media_plan_goal", "arguments": {"goal": "White Chicks"}}},
+        ]}}],
+    )
+
+    assert "white chicks (2004)" in reply.casefold()
+    assert not any(phrase in reply.casefold() for phrase in ("want me", "request", "plex", "availability"))
+    assert session.client_id not in session.app.pending
+    assert session.client_id not in session.app.pending_offers
+    assert session.app.conversation_context[session.client_id]["canonical_identity"] == {
+        "media_type": "movie", "title": "White Chicks", "tmdb_id": "12153", "year": "2004",
+    }
 
 @pytest.mark.asyncio
 async def test_scenario_2_descriptive_question_reaches_media_plan_goal_not_plex_search(session):

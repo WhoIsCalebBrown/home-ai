@@ -2418,7 +2418,7 @@ def media_acquisition_request_frame(text: str) -> bool:
     return bool(
         re.match(
             r"\s*i\s+(?:want|need)\s+(?:(?:a|an|the)\s+)?"
-            r"(?:movie|film|show|series|season|episode|album|music|anime)\b",
+            r"(?:[\w'-]+\s+){0,6}?(?:movie|film|show|series|season|episode|album|music|anime)\b",
             text,
             re.I,
         )
@@ -4770,7 +4770,12 @@ def stage_media_offer(client_id: str, plan_result: dict) -> str | None:
     # An explicit request is already in the confirmation path when it is
     # actionable.  Never turn that same request into a read-only offer that
     # asks an equivalent question a second time.
-    operation = conversation_context.get(client_id, {}).get("_pending_operation") or conversation_context.get(client_id, {}).get("latest_operation")
+    context = conversation_context.get(client_id, {})
+    # `operation` is the authoritative classification for this turn.  The
+    # retained fields describe older work and are only fallbacks for generic
+    # continuation offers.  A current discovery or library read must never
+    # turn an informational answer into an acquisition-related follow-up.
+    operation = context.get("_pending_operation") or context.get("operation") or context.get("latest_operation")
     if operation in {"MEDIA_REQUEST", "MEDIA_DISCOVERY", "MEDIA_LIBRARY_QUERY"}:
         return None
     identity = plan_result.get("canonical_identity") or {}
