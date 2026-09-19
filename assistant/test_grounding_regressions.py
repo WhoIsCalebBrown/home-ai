@@ -1708,9 +1708,22 @@ def test_media_operation_contract(text, expected):
 
 
 def test_media_operation_contract_precedence_negatives():
-    assert media_intent("What is White Chicks about?", {}) == "MEDIA_DISCOVERY"
+    assert media_intent("What is White Chicks about?", {}) is None
     assert media_intent("Can you play the trailer?", {}) == "MEDIA_PLAY"
     assert media_intent("How is my White Chicks download doing?", {}) == "MEDIA_STATUS"
+    operation, scope = operation_for_plan(
+        "What is White Chicks about?", {}, [("media_plan_goal", {"goal": "What is White Chicks about?"})]
+    )
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
+def test_media_operation_contract_accepts_nominal_media_requests():
+    text = "I want the movie where they get trapped"
+    assert media_intent(text, {}) == "MEDIA_REQUEST"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_REQUEST"
+    assert scope == {}
 
 
 def test_media_operation_contract_keeps_plot_verbs_as_discovery():
@@ -1720,6 +1733,8 @@ def test_media_operation_contract_keeps_plot_verbs_as_discovery():
 def test_media_operation_contract_rejects_non_media_descriptive_questions():
     assert media_intent("What is photosynthesis about?", {}) is None
     assert media_intent("Who is Jane Doe?", {}) is None
+    for text in ("What is OpenAI Codex about?", "What is Jane Doe about?", "What is North Korea about?"):
+        assert media_intent(text, {}) is None
 
 
 def test_descriptive_media_operation_is_preserved_for_media_plan_goal():

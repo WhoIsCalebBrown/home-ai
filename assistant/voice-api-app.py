@@ -2415,13 +2415,21 @@ def media_acquisition_request_frame(text: str) -> bool:
     explicit request frame. This narrower predicate is intentionally used
     only where a title-shaped subject is otherwise already present.
     """
-    return bool(re.match(
-        r"\s*(?:(?:can|could|would|will)\s+(?:you|i)\s+|"
-        r"i\s+(?:want|need)\s+(?:to\s+)?|i(?:'d| would)\s+like\s+(?:to\s+)?|"
-        r"please\s+)?(?:get|give|grab|add|find|request|want|obtain)\b",
-        text,
-        re.I,
-    ))
+    return bool(
+        re.match(
+            r"\s*i\s+(?:want|need)\s+(?:(?:a|an|the)\s+)?"
+            r"(?:movie|film|show|series|season|episode|album|music|anime)\b",
+            text,
+            re.I,
+        )
+        or re.match(
+            r"\s*(?:(?:can|could|would|will)\s+(?:you|i)\s+|"
+            r"i\s+(?:want|need)\s+(?:to\s+)?|i(?:'d| would)\s+like\s+(?:to\s+)?|"
+            r"please\s+)?(?:get|give|grab|add|find|request|want|obtain)\b",
+            text,
+            re.I,
+        )
+    )
 
 
 def media_library_query(text: str) -> bool:
@@ -2461,11 +2469,7 @@ def media_intent(text: str, context: dict | None = None) -> str | None:
     if media_library_query(text):
         return "MEDIA_LIBRARY_QUERY"
     descriptive_clue = _descriptive_media_clue(text)
-    title_shaped_about_question = bool(
-        re.search(r"\bwhat(?:'s|\s+is)\s+(?:(?:the|that)\s+)?(?:[a-z]+\s+){1,4}[a-z]+\s+about\b", text, re.I)
-        and re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", text)
-    )
-    descriptive_media = descriptive_clue and (media_identity_signal(text) or title_shaped_about_question)
+    descriptive_media = descriptive_clue and media_identity_signal(text)
     if ((media_goal_request(text) and (not descriptive_clue or media_acquisition_request_frame(text)))
             or (media_acquisition_request_frame(text) and descriptive_clue)):
         return "MEDIA_REQUEST"
