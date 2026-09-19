@@ -2415,6 +2415,16 @@ def media_acquisition_request_frame(text: str) -> bool:
     explicit request frame. This narrower predicate is intentionally used
     only where a title-shaped subject is otherwise already present.
     """
+    # "I need to know/find out/remember which movie ..." asks for
+    # information, not acquisition. Keep these bounded informational
+    # continuations ahead of the descriptive `I want/need ... movie` frame.
+    if re.match(
+        r"\s*i\s+(?:want|need)\s+to\s+(?:know|find\s+out|remember|learn|"
+        r"figure\s+out|identify|understand|see|check)\b",
+        text,
+        re.I,
+    ):
+        return False
     return bool(
         re.match(
             r"\s*i\s+(?:want|need)\s+(?:(?:a|an|the)\s+)?"

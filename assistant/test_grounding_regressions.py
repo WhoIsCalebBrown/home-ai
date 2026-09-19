@@ -1726,6 +1726,14 @@ def test_media_operation_contract_accepts_nominal_media_requests():
     assert scope == {}
 
 
+def test_media_operation_contract_keeps_informational_i_need_media_questions_read_only():
+    text = "I need to know which movie Brad Pitt is in"
+    assert media_intent(text, {}) == "MEDIA_DISCOVERY"
+    operation, scope = operation_for_plan(text, {}, [("media_plan_goal", {"goal": text})])
+    assert operation == "MEDIA_DISCOVERY"
+    assert scope == {}
+
+
 def test_media_operation_contract_keeps_plot_verbs_as_discovery():
     assert media_intent("What's that movie where they get trapped?", {}) == "MEDIA_DISCOVERY"
 
