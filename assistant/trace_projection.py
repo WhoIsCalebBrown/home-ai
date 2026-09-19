@@ -25,8 +25,26 @@ def clean_text(value: object, limit: int) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def _noncanonical_numeric_ipv4(host: str) -> bool:
+    """Reject browser/WHATWG alternate spellings of numeric IPv4 hosts."""
+    if host.isdigit():
+        return True
+    if host.casefold().startswith("0x") and all(char in "0123456789abcdefx" for char in host.casefold()):
+        return True
+    parts = host.split(".")
+    if len(parts) > 1 and all(part.isdigit() for part in parts):
+        if len(parts) != 4:
+            return True
+        return any(part != str(int(part)) or not 0 <= int(part) <= 255 for part in parts)
+    return any(
+        part.casefold().startswith("0x")
+        and all(char in "0123456789abcdefx" for char in part.casefold())
+        for part in parts
+    )
+
+
 def safe_display_url(value: str) -> str | None:
-    if not value or re.search(r"[\x00-\x1f\x7f]", value):
+    if not isinstance(value, str) or not value or re.search(r"[\x00-\x1f\x7f]", value):
         return None
     try:
         parsed = urlsplit(value)
@@ -35,6 +53,10 @@ def safe_display_url(value: str) -> str | None:
     except ValueError:
         return None
     if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+        return None
+    if "@" in parsed.netloc or parsed.netloc.endswith(":"):
+        return None
+    if "%" in host or any(ord(char) > 127 for char in host) or _noncanonical_numeric_ipv4(host):
         return None
     if host in {"localhost", "unraid", "tower", "host.docker.internal", "metadata.google.internal"}:
         return None
@@ -60,7 +82,21 @@ def project_trace(live_results: list[dict]) -> list[dict]:
         tool = str(raw.get("tool") or "unknown")
         result = raw.get("result") if isinstance(raw.get("result"), dict) else {}
         ok = raw.get("status") == "ok" and raw.get("operation_ok", True) is not False
-        empty_search = tool == "web_search" and int(result.get("result_count") or 0) == 0
+        search_results = result.get("results")
+        if not isinstance(search_results, list):
+            search_results = []
+        raw_result_count = result.get("result_count")
+        try:
+            if isinstance(raw_result_count, bool):
+                raise ValueError("boolean result count")
+            result_count = int(raw_result_count or 0)
+            count_valid = result_count >= 0
+        except (TypeError, ValueError):
+            result_count = 0
+            count_valid = False
+        if not count_valid:
+            search_results = []
+        empty_search = tool == "web_search" and (result_count <= 0 or not search_results)
         status = "failed" if not ok else "no results" if empty_search else "complete"
         sources: list[dict] = []
         if tool == "web_fetch" and ok:
@@ -75,7 +111,7 @@ def project_trace(live_results: list[dict]) -> list[dict]:
                     "published": clean_text(result.get("published"), 40) or None,
                 })
         elif tool == "web_search" and ok:
-            for candidate in list(result.get("results") or [])[:MAX_SOURCES_PER_SEARCH]:
+            for candidate in search_results[:MAX_SOURCES_PER_SEARCH]:
                 if not isinstance(candidate, dict):
                     continue
                 domain = clean_text(candidate.get("domain"), MAX_DOMAIN_CHARS)

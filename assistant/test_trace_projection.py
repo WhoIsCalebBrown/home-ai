@@ -55,6 +55,24 @@ def test_project_trace_prefers_fetched_final_source_and_drops_sensitive_data():
     "https://[fe80::1]/status",
     "https://example.com/path\nnext",
     "https://example.com/path\x00",
+    # WHATWG/browser host normalization turns these into private loopback
+    # targets even though urllib.parse leaves them as apparently public text.
+    "https://%31%32%37.0.0.1/",
+    "https://2130706433/",
+    "https://0x7f000001/",
+    "https://0177.0.0.1/",
+    "https://１２７．０．０．１/",
+    "https://ⓛⓞⓒⓐⓛⓗⓞⓢⓣ/",
+    # Empty userinfo is still userinfo and must not be discarded as falsey.
+    "https://@example.com/",
+    "https://:@example.com/",
+    # urlsplit().port is None for a trailing colon, so reject that malformed
+    # authority explicitly alongside other invalid port forms.
+    "https://example.com:/",
+    "https://example.com:bad/",
+    "https://example.com:65536/",
+    "https://example.com:+443/",
+    "https://[2606:4700:4700::1111]:/",
 ])
 def test_safe_display_url_rejects_unsafe_or_sensitive_urls(value):
     assert safe_display_url(value) is None
@@ -173,3 +191,21 @@ def test_project_trace_ignores_non_mapping_results_and_missing_values():
         {"tool": "web_search", "action": "Searched the web", "status": "no results", "sources": []},
         {"tool": "web_fetch", "action": "Opened source", "status": "complete", "sources": []},
     ]
+
+
+@pytest.mark.parametrize("result", [
+    {"result_count": "wat", "results": [{"title": "must be ignored", "domain": "public.example"}]},
+    {"result_count": "wat", "results": 1},
+    {"result_count": 1, "results": 1},
+    {"result_count": 1, "results": None},
+    {"result_count": -1, "results": [{"title": "must be ignored", "domain": "public.example"}]},
+])
+def test_project_trace_treats_malformed_search_shapes_as_empty(result):
+    trace = project_trace([{"tool": "web_search", "status": "ok", "result": result}])
+
+    assert trace == [{
+        "tool": "web_search",
+        "action": "Searched the web",
+        "status": "no results",
+        "sources": [],
+    }]
