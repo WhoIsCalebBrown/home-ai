@@ -18,6 +18,7 @@ def _load_helpers():
         "_latest_user_message",
         "_is_openwebui_housekeeping_request",
         "_safe_markdown_text",
+        "_safe_markdown_destination",
         "openai_tool_trace_footer",
     }
     assignment_names = {"_OPENWEBUI_HOUSEKEEPING_TASK_SIGNATURES"}
@@ -31,9 +32,12 @@ def _load_helpers():
     selected = [
         node for node in tree.body
         if isinstance(node, ast.Import)
-        and any(alias.name in {"html", "re", "uuid"} for alias in node.names)
+        and any(alias.name in {"re", "uuid"} for alias in node.names)
     ]
-    selected += [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "trace_projection"]
+    selected += [
+        node for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module in {"trace_projection", "urllib.parse"}
+    ]
     selected += [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names) or is_needed_assignment(node)]
     namespace["Request"] = object
     namespace["quote"] = quote
@@ -207,3 +211,22 @@ def test_rich_footer_deduplicates_and_bounds_safe_projected_sources():
     assert "token=secret" not in footer
     assert "household terms" not in footer
     assert "never display" not in footer
+
+
+def test_rich_footer_escapes_hostile_markdown_labels_and_destinations():
+    module = _load_helpers()
+    footer = module.openai_tool_trace_footer([{
+        "action": "**Bold** _italic_ `code` [spoof](https://evil.example)",
+        "status": "complete",
+        "sources": [{
+            "title": "**Bold** _italic_ `code` [spoof](https://evil.example)\\",
+            "domain": "news_*`[spoof](x).example",
+            "url": "https://example.com/](https://evil.example/)*_`\\",
+        }],
+    }])
+    assert "\\*\\*Bold\\*\\*" in footer
+    assert "\\_italic\\_" in footer
+    assert "\\`code\\`" in footer
+    assert r"\[spoof\]\(https\:\/\/evil\.example\)" in footer
+    assert "news\\_\\*\\`\\[spoof\\]\\(x\\)\\.example" in footer
+    assert "https://example.com/%5D%28https://evil.example/%29%2A_%60%5C" in footer

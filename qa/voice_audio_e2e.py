@@ -598,6 +598,23 @@ class AudioResult:
     classification: str = ""
 
 
+def trace_entries(payload: dict) -> list[dict]:
+    """Read only the bounded projected trace schema emitted by the assistant."""
+    entries = payload.get("entries")
+    return entries if isinstance(entries, list) else []
+
+
+def selected_trace_tools(trace: list[dict]) -> set[str]:
+    """Treat completed/no-result projected reads as observed tool selection."""
+    return {
+        str(item.get("tool"))
+        for item in trace
+        if isinstance(item, dict)
+        and item.get("status") in {"complete", "no results"}
+        and item.get("tool")
+    }
+
+
 def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set[str]) -> str | None:
     """Classify truthful safe outcomes separately from routing failures.
 
@@ -606,7 +623,7 @@ def classify_safe_non_success(trace: list[dict], answer: str, allowed_tools: set
     be reported as a missing-tool routing defect when the response is
     explicitly truthful/confirmatory and no write-capable tool ran.
     """
-    if any(item.get("tool") in allowed_tools and item.get("status") in {"error", "unavailable", "timeout"} for item in trace):
+    if any(item.get("tool") in allowed_tools and item.get("status") == "failed" for item in trace):
         if re.search(r"can't verify|couldn't verify|unavailable|couldn't reach|no live", answer, re.I):
             return "backend_read_failure_truthful"
     if not trace and re.search(r"did you mean|could you clarify|need more details|not sure", answer, re.I):
@@ -662,7 +679,7 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
                     result.answer = payload.get("text", "")
                     response_generated = True
                 elif kind == "trace":
-                    result.tool_trace = payload.get("tools") or []
+                    result.tool_trace = trace_entries(payload)
                 elif kind == "error":
                     result.error = payload.get("error") or payload.get("message") or "assistant error"
                 elif kind == "audio_chunk":
@@ -674,7 +691,7 @@ async def run_scenario(name: str, client_id: str) -> AudioResult:
                     result.classification = "response_success_tts_delayed"
                 else:
                     result.error = "audio lane timeout"
-        selected = {entry.get("tool") for entry in result.tool_trace or [] if entry.get("status") == "ok"}
+        selected = selected_trace_tools(result.tool_trace or [])
         unexpected = selected - scenario["allowed_tools"]
         if unexpected:
             result.error = f"unexpected tool selection: {sorted(unexpected)}"
@@ -735,7 +752,7 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
                     elif kind == "text":
                         answer = payload.get("text", "")
                         response_generated = True
-                    elif kind == "trace": traces = payload.get("tools") or []
+                    elif kind == "trace": traces = trace_entries(payload)
                     elif kind == "audio_chunk": chunks += 1
                     elif kind == "error": error = payload.get("error") or payload.get("message")
                     elif kind == "done": break
@@ -751,7 +768,7 @@ async def run_conversation(name: str, client_id: str) -> list[dict]:
                     error = "audio lane timeout before response"
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-            selected = {item.get("tool") for item in traces if item.get("status") == "ok"}
+            selected = selected_trace_tools(traces)
             unexpected = selected - allowed_tools
             if unexpected: error = f"unexpected tool selection: {sorted(unexpected)}"
             elif allowed_tools and not selected:

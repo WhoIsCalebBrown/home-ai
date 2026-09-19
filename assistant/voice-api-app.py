@@ -3,7 +3,6 @@ import base64
 import contextvars
 import hashlib
 import hmac
-import html
 import io
 import json
 import os
@@ -14,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 import yaml
@@ -6741,8 +6740,19 @@ async def _openai_chat_turn(body: dict, request: Request) -> tuple[str, str, lis
 
 def _safe_markdown_text(value: object, limit: int) -> str:
     """Render projected remote text as Markdown text, never Markdown syntax."""
-    return (html.escape(clean_text(value, limit), quote=True)
-            .replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]"))
+    return re.sub(r"([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])", r"\\\1", clean_text(value, limit))
+
+
+def _safe_markdown_destination(url: str) -> str:
+    """Percent-encode destination characters that can alter Markdown links."""
+    parsed = urlsplit(url)
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        quote(parsed.path, safe="/:@&=+$,;%-._~!"),
+        quote(parsed.query, safe="=&;%-._~!"),
+        "",
+    ))
 
 
 def openai_tool_trace_footer(trace: list[dict]) -> str:
@@ -6771,7 +6781,7 @@ def openai_tool_trace_footer(trace: list[dict]) -> str:
             domain = _safe_markdown_text(source.get("domain"), 253)
             label = title or domain or "Source"
             if url:
-                markdown_url = url.replace(")", "\\)")
+                markdown_url = _safe_markdown_destination(url)
                 label = f"[{label}]({markdown_url})"
             rows.append(f"  - {label}" + (f" — {domain}" if title and domain else ""))
     if not rows:
