@@ -52,3 +52,36 @@ def test_excluded_switch_category_normalizes_model_everything_target_to_lights(u
     assert normalize_home_tool_arguments("home_control", {
         "action": "turn_off", "entity_or_area": "everything",
     }, utterance) == {"action": "turn_off", "entity_or_area": "all lights"}
+
+
+def test_non_whole_home_switch_negation_does_not_invent_all_lights_target():
+    assert normalize_home_tool_arguments("home_control", {"action": "turn_off"},
+                                         "Turn off the bedroom lamp, not the switches.") == {
+        "action": "turn_off",
+    }
+
+
+def test_non_whole_home_switch_negation_preserves_narrow_model_target():
+    assert normalize_home_tool_arguments("home_control", {
+        "action": "turn_off", "entity_or_area": "bedroom lamp",
+    }, "Turn off the bedroom lamp, not the switches.") == {
+        "action": "turn_off", "entity_or_area": "bedroom lamp",
+    }
+
+
+def test_mixed_light_and_switch_whole_home_intent_remains_everything():
+    assert normalize_home_tool_arguments("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+    }, "Turn off all lights and switches.") == {
+        "action": "turn_off", "entity_or_area": "everything",
+    }
+
+
+def test_switch_bulk_filters_model_exact_ids_to_switch_domain():
+    assert normalize_home_tool_arguments("home_control", {
+        "action": "turn_off", "entity_or_area": "everything",
+        "entity_ids": ["light.office_light", "switch.neon_light_socket_1"],
+    }, "Turn off all switches.") == {
+        "action": "turn_off", "entity_or_area": "all switches",
+        "entity_ids": ["switch.neon_light_socket_1"],
+    }

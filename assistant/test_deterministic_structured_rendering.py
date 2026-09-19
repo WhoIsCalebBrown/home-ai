@@ -70,6 +70,15 @@ def test_home_control_partial_result_names_unavailable_and_protected_devices():
     assert answer == "The permitted devices were handled, but unavailable: Neon Socket 1; protected: Router."
 
 
+def test_home_control_partial_no_action_says_no_command_was_sent():
+    answer = direct_structured_answer("Turn off all the switches.", [_ok("home_control", {
+        "status": "partial", "outcome": "no_action", "target_entity_ids": [],
+        "unavailable": [{"name": "Neon Socket 1"}],
+        "protected": [{"name": "Router"}],
+    })])
+    assert answer == "No command was sent. Unavailable: Neon Socket 1; protected: Router."
+
+
 def test_container_operation_failure_is_not_successful_status():
     answer = direct_structured_answer("Is Plex running?", [{
         "tool": "unraid_container_status", "status": "invalid_arguments", "transport_ok": True,
