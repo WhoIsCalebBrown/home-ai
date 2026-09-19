@@ -2028,6 +2028,63 @@ async def test_deep_news_rejects_a_current_office_holder_repeated_only_from_a_sn
 
 
 @pytest.mark.asyncio
+async def test_deep_news_removes_tool_call_prose_from_the_final_synthesis_prompt(session):
+    """A dispatch message's prose must not carry a stale snippet into final synthesis."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Search-result holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {
+            "content": "Snippet Holder is the current office-holder.",
+            "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}}],
+        }}],
+        final_text="Fetched Holder is the current office-holder.",
+    )
+
+    assert reply == "Fetched Holder is the current office-holder."
+    assert session.last_stream_payload is not None
+    final_messages = session.last_stream_payload["messages"]
+    dispatch_messages = [
+        message for message in final_messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert dispatch_messages and all(message.get("content") == "" for message in dispatch_messages)
+    assert "Snippet Holder" not in json.dumps(final_messages)
+
+
+@pytest.mark.asyncio
+async def test_deep_news_rejects_current_holder_when_fetched_text_only_names_a_former_holder(session):
+    """A fetched name alone cannot support the asserted current office-holder role."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Former Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = (
+        "Former Holder previously held the office. Fetched Holder is the current office-holder."
+    )
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Former Holder is the current office-holder.",
+    )
+
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+
+
+@pytest.mark.asyncio
 async def test_deep_news_incomplete_fetched_evidence_returns_limitation_without_synthesis(session):
     """Removing the readiness gate must make this return the canned model answer."""
     user_text = "Please give me an in-depth review of Canada's technology news today."

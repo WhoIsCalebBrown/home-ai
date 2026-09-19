@@ -1039,7 +1039,7 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
     if research_mode == "deep":
-        office_title = r"(?:office[- ]holder|prime minister|president|vice president|governor general|governor|mayor|minister|chancellor|speaker|chief justice|secretary)"
+        office_title = r"(?P<title>office[- ]holder|prime minister|president|vice president|governor general|governor|mayor|minister|chancellor|speaker|chief justice|secretary)"
         person_name = r"(?P<name>[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){1,3})"
         office_holder_patterns = (
             rf"\b{person_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{office_title}\b",
@@ -1053,11 +1053,20 @@ def evidence_supported_answer(answer: str, user_text: str, results: list[dict], 
             and isinstance(item.get("result"), dict)
         ).casefold()
         claimed_holders = [
-            match.group("name")
+            (match.group("name"), match.group("title"))
             for pattern in office_holder_patterns
-            for match in re.finditer(pattern, answer)
+            for match in re.finditer(pattern, answer, re.I)
         ]
-        if any(name.casefold() not in fetched_evidence for name in claimed_holders):
+        def fetched_evidence_supports_current_role(name: str, title: str) -> bool:
+            escaped_name = re.escape(name)
+            escaped_title = re.escape(title)
+            relationship_patterns = (
+                rf"\b{escaped_name}\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?{escaped_title}\b",
+                rf"\b(?:the\s+)?(?:current\s+)?{escaped_title}\s+(?:is|remains)\s+{escaped_name}\b",
+            )
+            return any(re.search(pattern, fetched_evidence, re.I) for pattern in relationship_patterns)
+
+        if any(not fetched_evidence_supports_current_role(name, title) for name, title in claimed_holders):
             return "I can't safely verify that current office-holder from the fetched evidence."
     web_items = [item for item in results if item.get("tool") == "web_search"]
     if web_items and re.search(r"\b(?:don't|do not|cannot|can't)\s+(?:have|access)|\bno access to (?:live )?(?:news|the web)|\bcan't tell you what's happening", answer, re.I):
@@ -5964,7 +5973,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     await fetch_search_evidence(followup)
                     continue
                 break
-            messages.append(message)
+            # This is a dispatch record, not final-answer evidence. Retain
+            # tool_calls for the chat protocol while dropping model prose that
+            # could otherwise reintroduce an ungrounded search-snippet claim.
+            messages.append({**message, "role": "assistant", "content": ""})
             for call in calls[:4]:
                 if research_calls >= int(profile["max_calls"]):
                     break
