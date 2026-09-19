@@ -23,6 +23,7 @@ from semantic_routing import discovery_context, has_referential_language, narrow
 from subject_model import PendingOffer, ResolvedSubject, UnresolvedSubject, available_actions, build_canonical_identity, classify_offer_reply, next_best_action, unresolved_subject_from_dict
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncClient
@@ -6876,6 +6877,32 @@ async def openai_chat_completions(request: Request):
 
 
 class _OpenAIStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send) -> None:
+        # ASGI 2.4 send errors only detect disconnects while sending. Keep a
+        # receive watcher for every version, including idle tool/queue waits.
+        streaming = asyncio.create_task(self.stream_response(send))
+        disconnected = asyncio.create_task(self.listen_for_disconnect(receive))
+        try:
+            completed, _ = await asyncio.wait(
+                {streaming, disconnected}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in completed:
+                await task
+        except OSError:
+            if tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split("."))) >= (2, 4):
+                raise ClientDisconnect()
+            raise
+        finally:
+            # Own and join both tasks even if the outer request is cancelled.
+            # An already-cancelling stream may be awaiting HTTP cleanup.
+            with anyio.CancelScope(shield=True):
+                for task in (streaming, disconnected):
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                await asyncio.gather(streaming, disconnected, return_exceptions=True)
+        if self.background is not None:
+            await self.background()
+
     async def stream_response(self, send) -> None:
         try:
             await super().stream_response(send)
@@ -6905,9 +6932,10 @@ def _openai_stream_response(body: dict, request: Request, session_id: str) -> St
     async def run_turn() -> None:
         token = progress_sink_context.set(progress_sink)
         try:
-            answer, _, trace = await asyncio.wait_for(
-                _openai_chat_turn(body, request), timeout=OPENAI_STREAM_TIMEOUT_SECONDS,
-            )
+            # Keep timeout cancellation on this task so disconnect cleanup can
+            # recognize an in-progress cancellation and avoid interrupting it.
+            async with asyncio.timeout(OPENAI_STREAM_TIMEOUT_SECONDS):
+                answer, _, trace = await _openai_chat_turn(body, request)
             display = answer + openai_tool_trace_footer(trace)
             # Register the plain final content too, for clients splitting SSE
             # content chunks into separate speech requests.
@@ -6954,10 +6982,10 @@ def _openai_stream_response(body: dict, request: Request, session_id: str) -> St
                 yield "data: [DONE]\n\n"
                 break
         finally:
-            if not responder.done():
+            if not responder.done() and not responder.cancelling():
                 responder.cancel()
-            # Starlette disconnects cancel an AnyIO scope. Shield the await
-            # so HTTP client cleanup finishes before the request terminates.
+            # The outer request can be in a cancelled AnyIO scope. Shield the
+            # join so HTTP cleanup finishes before the request terminates.
             with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError):
                 await responder
 

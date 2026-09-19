@@ -2681,6 +2681,8 @@ def gateway_tool(app, monkeypatch):
     import httpx
 
     entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup = {"delay": 0.01}
     calls = []
     payload = {"tool": "web_fetch", "status": "ok", "transport_ok": True, "operation_ok": True,
                "result": {"title": "Private result title", "content": "private result body"}}
@@ -2694,7 +2696,8 @@ def gateway_tool(app, monkeypatch):
             return self
 
         async def __aexit__(self, *args):
-            await asyncio.sleep(0.01 if args[0] is asyncio.CancelledError else 0)
+            cleanup_started.set()
+            await asyncio.sleep(cleanup["delay"] if args[0] is asyncio.CancelledError else 0)
             closed.set()
 
         async def post(self, url, json, headers):
@@ -2714,12 +2717,14 @@ def gateway_tool(app, monkeypatch):
     monkeypatch.setattr(app, "httpx", SimpleNamespace(AsyncClient=ToolClient))
     monkeypatch.setattr(app, "respond", respond)
     monkeypatch.setattr(app, "discovery_audit", lambda event: None)
-    return SimpleNamespace(entered=entered, release=release, closed=closed, payload=payload, calls=calls, response_status=response_status)
+    return SimpleNamespace(entered=entered, release=release, closed=closed, payload=payload, calls=calls,
+                           response_status=response_status, cleanup_started=cleanup_started, cleanup=cleanup)
 
 
 @pytest.mark.asyncio
-async def test_openai_stream_sends_role_and_safe_progress_before_tool_completes(app, gateway_tool):
-    async with _GatewayStream(app.app, _openai_stream_body()) as stream:
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_sends_role_and_safe_progress_before_tool_completes(app, gateway_tool, spec_version):
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
         start = await stream.next_message()
         assert start["type"] == "http.response.start"
         assert start["status"] == 200
@@ -2767,12 +2772,13 @@ async def test_openai_stream_disconnect_or_cancel_awaits_tool_cleanup(app, gatew
 
 
 @pytest.mark.asyncio
-async def test_openai_stream_send_disconnect_awaits_tool_cleanup(app, gateway_tool):
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_send_disconnect_awaits_tool_cleanup(app, gateway_tool, spec_version):
     from starlette.requests import ClientDisconnect
 
     previous_tasks = asyncio.all_tasks()
-    with pytest.raises(ClientDisconnect):
-        async with _GatewayStream(app.app, _openai_stream_body(), spec_version="2.4", fail_content_send=True) as stream:
+    with pytest.raises(ClientDisconnect if spec_version == "2.4" else OSError):
+        async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version, fail_content_send=True) as stream:
             await asyncio.wait_for(stream.task, 1)
     assert gateway_tool.closed.is_set()
     assert not gateway_tool.release.is_set()
@@ -2822,6 +2828,55 @@ async def test_openai_stream_timeout_closes_tool_and_finishes(app, gateway_tool,
     assert gateway_tool.closed.is_set()
     assert _stream_content(stream.messages).endswith("\n---\n\nHome-AI could not complete this request.")
     assert _stream_frames(stream.messages)[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+@pytest.mark.parametrize("cancel_request", [False, True])
+async def test_openai_stream_disconnect_during_timeout_preserves_http_cleanup(
+    app, gateway_tool, monkeypatch, spec_version, cancel_request,
+):
+    monkeypatch.setattr(app, "OPENAI_STREAM_TIMEOUT_SECONDS", 0.02)
+    gateway_tool.cleanup["delay"] = 0.05
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
+        await asyncio.wait_for(gateway_tool.cleanup_started.wait(), 1)
+        assert gateway_tool.entered.is_set()
+        assert not gateway_tool.closed.is_set()
+        assert not gateway_tool.release.is_set()
+        if cancel_request:
+            stream.task.cancel()
+        else:
+            stream.disconnected.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(stream.task, 1)
+        assert gateway_tool.closed.is_set(), "disconnect interrupted timeout-triggered HTTP cleanup"
+        assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n"
+        assert "[DONE]" not in _stream_frames(stream.messages)
+    assert asyncio.all_tasks() == previous_tasks
+    assert app.progress_sink_context.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.0", "2.3", "2.4"])
+async def test_openai_stream_idle_disconnect_supervises_blocked_tool(app, gateway_tool, spec_version):
+    previous_tasks = asyncio.all_tasks()
+    async with _GatewayStream(app.app, _openai_stream_body(), spec_version=spec_version) as stream:
+        while "Reading CBC…" not in _stream_content(stream.messages):
+            await stream.next_message()
+        assert not gateway_tool.release.is_set()
+        stream.disconnected.set()
+        completed, _ = await asyncio.wait({stream.task}, timeout=0.25)
+        # Keep a deliberately failing implementation from leaking test tasks.
+        if not completed:
+            stream.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stream.task
+        assert completed, "idle disconnect was not observed while the tool was blocked"
+        assert gateway_tool.closed.is_set()
+        assert _stream_content(stream.messages) == "**Working**\n- Reading CBC…\n"
+        assert "[DONE]" not in _stream_frames(stream.messages)
+    assert asyncio.all_tasks() == previous_tasks
 
 
 @pytest.mark.asyncio
