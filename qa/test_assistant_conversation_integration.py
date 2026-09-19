@@ -66,6 +66,7 @@ import time
 import uuid
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -1822,7 +1823,7 @@ async def test_active_camera_context_survives_an_interleaved_media_question(sess
 
 def _quiet_news_fixtures(session, monkeypatch, *, day=18, strong=False, still_sparse=False, corroborated=None):
     """Synthetic network responses; real respond/gates/synthesis stay enabled."""
-    now = datetime(2026, 9, day, 12).timestamp()
+    now = datetime(2026, 9, day, 12, tzinfo=ZoneInfo("America/Toronto")).timestamp()
     monkeypatch.setattr(session.app, "time", SimpleNamespace(**{**vars(time), "time": lambda: now}))
     noise = [{"url": "https://unrelated-world.example/football", "date": f"2026-09-{day}",
               "title": "Overseas football results"},
@@ -1876,7 +1877,7 @@ def _dated_canadian_fetches(session):
         for candidate in batch or []:
             url = candidate["url"]
             session.backend.web_fetch_contents[url] = f"Canadian technology reporting for {url}."
-            session.backend.web_fetch_metadata[url] = {"date": datetime.now().date().isoformat()}
+            session.backend.web_fetch_metadata[url] = {"date": datetime.now(ZoneInfo("America/Toronto")).date().isoformat()}
 
 
 @pytest.mark.asyncio
@@ -1964,6 +1965,81 @@ async def test_quiet_canada_news_dated_roundup_does_not_discard_current_role_con
     assert session.last_stream_payload is not None
     assert "can't safely verify that current office-holder" in reply
     assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_geography_cannot_hide_institutional_role_conflict(session, monkeypatch):
+    _quiet_news_fixtures(session, monkeypatch, corroborated=True)
+    url = "https://pm.gc.ca/current-government"
+    session.backend.web_search_fixtures[0].append({"url": url})
+    session.backend.web_fetch_contents[url] = "Bob Roe is the prime minister."
+    reply = await session.turn("Give me an in-depth review of Canada news today",
+                               final_text="Alice Doe is the prime minister.")
+    assert session.last_stream_payload is not None
+    assert "can't safely verify that current office-holder" in reply
+    assert "Alice Doe is the prime minister." not in reply
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_ambiguous_geography_cannot_make_roundup_ready(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "A Labrador won the dog show in London."
+    session.backend.web_fetch_contents[urls[1]] = "Ontario, California approved new city transport services."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn("Give me an in-depth review of Canada news today", final_text="Unsupported roundup.")
+    assert session.last_stream_payload is None
+    assert "still couldn't verify enough" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topic", ["technology ", "", "top "])
+async def test_quiet_canada_news_requested_topic_controls_evidence_gate(session, monkeypatch, topic):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canada's hockey team won a league match."
+    session.backend.web_fetch_contents[urls[1]] = "Canadian hockey players prepared for their next tournament."
+    session.backend.web_search_fixtures.append([])
+    reply = await session.turn(f"Give me an in-depth review of Canada {topic}news today", final_text="The hockey season continued.")
+    if topic == "technology ":
+        assert session.last_stream_payload is None
+        assert "still couldn't verify enough" in reply
+        assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, 2]
+    else:
+        assert session.last_stream_payload is not None
+        assert "same-day coverage is limited" not in reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_quiet_canada_news_wider_topic_matches_only_enter_synthesis(session, monkeypatch):
+    urls, _ = _quiet_news_fixtures(session, monkeypatch, strong=True)
+    session.backend.web_fetch_contents[urls[0]] = "Canadian hockey teams finished a league match."
+    session.backend.web_fetch_contents[urls[1]] = "Canada hosted a hockey tournament."
+    wider_urls = ["https://tech-one.example/chips", "https://tech-two.example/software"]
+    session.backend.web_search_fixtures.append([
+        {"url": wider_urls[0], "date": "2026-09-17"}, {"url": wider_urls[1], "date": "2026-09-17"},
+    ])
+    session.backend.web_fetch_contents[wider_urls[0]] = "Canada announced new semiconductor technology funding."
+    session.backend.web_fetch_contents[wider_urls[1]] = "Canadian software companies expanded their engineering teams."
+    reply = await session.turn("Give me an in-depth review of Canada technology news today", final_text="Technology coverage included chips and software.")
+    assert "same-day coverage is limited" in reply.casefold()
+    evidence = [json.loads(msg["content"]) for msg in session.last_stream_payload["messages"]
+                if msg.get("role") == "tool" and msg.get("name") == "web_fetch"]
+    assert {item["url"] for item in evidence} == set(wider_urls)
+    assert "hockey" not in json.dumps(session.last_stream_payload["messages"]).casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_now,window,start,end", [
+    ("2026-03-09T00:30:00", 2, "2026-03-08", "2026-03-09"),
+    ("2026-11-01T23:30:00", 3, "2026-10-30", "2026-11-01"),
+])
+async def test_quiet_canada_news_dst_disclosure_matches_toronto_calendar(session, monkeypatch, local_now, window, start, end):
+    now = datetime.fromisoformat(local_now).replace(tzinfo=ZoneInfo("America/Toronto")).timestamp()
+    monkeypatch.setattr(session.app, "time", SimpleNamespace(**{**vars(time), "time": lambda: now}))
+    session.backend.web_search_fixtures = [[], [], [], []]
+    reply = await session.turn("Give me an in-depth review of Canada news today", final_text="Unsupported roundup.")
+    assert f"{start} through {end}" in reply
+    assert [args["recency_days"] for name, args in session.backend.call_log if name == "web_search"] == [1, 1, 1, window]
 
 
 @pytest.mark.asyncio

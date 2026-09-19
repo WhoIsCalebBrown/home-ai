@@ -12,9 +12,10 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import anyio
 import httpx
@@ -4201,15 +4202,52 @@ def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) ->
     )
 
 
-def canadian_news_evidence(live_results: list[dict], now: float, recency_days: int | None) -> list[dict]:
+def canadian_news_relevant(text: str, user_text: str) -> bool:
+    """Require Canadian context and any explicitly requested news topic."""
+    # These place names also occur abroad or as animal breeds. Remove explicit
+    # foreign uses; Labrador alone is not geographic evidence.
+    geography = re.sub(r"\bOntario\s*[,]?\s*(?:California|Oregon|CA|United States|USA)\b", "", text, flags=re.I)
+    if not re.search(
+        r"\b(?:canada|canadians?|ottawa|ontario|qu[eé]bec|alberta|british columbia|"
+        r"manitoba|saskatchewan|nova scotia|new brunswick|newfoundland|"
+        r"prince edward island|nunavut|yukon|northwest territories|"
+        r"(?:province|region|territory) of labrador|labrador (?:region|peninsula|coast))\b",
+        geography, re.I,
+    ):
+        return False
+    # Strip request scaffolding, not arbitrary article words. Unrecognized
+    # topics still require a literal match rather than silently broadening.
+    framing = set((
+        "can could would you please give me tell show provide an a in depth deep dive review of on about the "
+        "recent latest current news events headlines today tonight this morning canada canadian s thorough "
+        "comprehensive detailed full picture properly research roundup summary overview report update updates "
+        "happening what is has gone all major top developments and or for with across"
+    ).split())
+    topics = [word for word in re.findall(r"[a-z]+", user_text.casefold()) if word not in framing]
+    aliases = {
+        "technology": r"technolog\w*|tech|software|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cyber\w*",
+        "tech": r"technolog\w*|tech|software|semiconductors?|comput(?:ers?|ing)|artificial intelligence|AI|cyber\w*",
+        "politics": r"politic\w*|government|parliament|elections?|legislat\w*",
+        "economy": r"econom\w*|inflation|interest rates?|employment|GDP",
+        "business": r"business\w*|companies|corporate|commerce|trade",
+        "health": r"health\w*|hospitals?|medical|medicine|disease\w*",
+        "science": r"scien\w*|research|discovery|discoveries",
+        "sports": r"sports?|hockey|football|soccer|baseball|basketball|tennis|athlet\w*",
+    }
+    return not topics or any(re.search(r"\b(?:" + aliases.get(topic, re.escape(topic) + r"s?") + r")\b", text, re.I)
+                             for topic in topics)
+
+
+def canadian_news_evidence(live_results: list[dict], now: float, recency_days: int, user_text: str = "") -> list[dict]:
     """Keep dated Canadian articles; searches count as work, never as proof.
 
     Publisher nationality and discovery snippets alone cannot establish the
     article's scope. Unknown dates cannot establish same-day coverage either.
-    None applies geography alone so current-role validation still sees undated
-    institutional pages and uses its own existing freshness/conflict rules.
+    This is a roundup eligibility filter, never the officeholder guard's input.
+    Calendar dates and timestamped instants use America/Toronto consistently.
     """
-    today = datetime.fromtimestamp(now).date()
+    local_now = datetime.fromtimestamp(now, ZoneInfo("America/Toronto"))
+    today = local_now.date()
     evidence = []
     for item in live_results:
         if item.get("tool") == "web_search":
@@ -4219,18 +4257,20 @@ def canadian_news_evidence(live_results: list[dict], now: float, recency_days: i
             continue
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         content = str(result.get("content") or "").strip()
-        if not content or not re.search(
-            r"\b(?:canada|canadian|ottawa|ontario|qu[eé]bec|alberta|british columbia|"
-            r"manitoba|saskatchewan|nova scotia|new brunswick|newfoundland|labrador|"
-            r"prince edward island|nunavut|yukon|northwest territories)\b",
-            str(result.get("title") or "") + " " + content, re.I,
-        ):
-            continue
-        if recency_days is None:
-            evidence.append(item)
+        if not content or not canadian_news_relevant(str(result.get("title") or "") + " " + content, user_text):
             continue
         try:
-            date = datetime.fromisoformat(str(result.get("published") or result.get("date") or "").replace("Z", "+00:00")).date()
+            value = str(result.get("published") or result.get("date") or "").strip()
+            published = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                date = published.date()
+            else:
+                # Unzoned timestamps use the same explicit local calendar as
+                # date-only metadata; compare instants before taking the date.
+                published = published.replace(tzinfo=local_now.tzinfo) if published.tzinfo is None else published
+                if published.timestamp() > now:
+                    continue
+                date = published.astimezone(local_now.tzinfo).date()
         except ValueError:
             continue
         if 0 <= (today - date).days < recency_days:
@@ -6210,7 +6250,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         research_candidates: dict[str, dict] = {}
 
         def news_evidence() -> list[dict]:
-            return canadian_news_evidence(live_results, research_now, news_window) if same_day_canada else live_results
+            return canadian_news_evidence(live_results, research_now, news_window, user_text) if same_day_canada else live_results
 
         def research_call_limit() -> int:
             # Reserve one wider search and two independent article fetches.
@@ -6377,9 +6417,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if research_calls >= research_call_limit():
                 break
         if same_day_canada and not deep_research_ready(news_evidence(), True):
-            news_window = 3 if datetime.fromtimestamp(research_now).weekday() == 6 else 2
-            start_date = datetime.fromtimestamp(research_now - (news_window - 1) * 86400).date().isoformat()
-            end_date = datetime.fromtimestamp(research_now).date().isoformat()
+            today = datetime.fromtimestamp(research_now, ZoneInfo("America/Toronto")).date()
+            news_window = 3 if today.weekday() == 6 else 2
+            start_date = (today - timedelta(days=news_window - 1)).isoformat()
+            end_date = today.isoformat()
             news_disclosure = (
                 "Same-day coverage is limited in the sources I could verify for Canada. "
                 f"I broadened the coverage window to {start_date} through {end_date}."
@@ -6497,7 +6538,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
             if same_day_canada:
-                grounding_results = canadian_news_evidence(grounding_results, research_now, news_window)
+                grounding_results = canadian_news_evidence(grounding_results, research_now, news_window, user_text)
             if deep_news:
                 # Search snippets are discovery hints only. A deep-news final
                 # answer may use article text but must not treat a snippet as
@@ -6555,9 +6596,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             await emit_answer(ws, request_id, news_disclosure)
         guard_results = grounding_results
         if same_day_canada:
-            # A news publication window must not hide a conflicting live
-            # institutional page from the existing current-officeholder guard.
-            guard_results = [item for item in canadian_news_evidence(live_results, research_now, None)
+            # Roundup geography/topic/date eligibility cannot suppress current
+            # role conflicts. The unchanged role guard determines relevance,
+            # authority and freshness from all fetched web evidence itself.
+            guard_results = [item for item in filter_relevant_tool_results(live_results, context)
                              if item.get("tool") == "web_fetch"]
         full = await stream_final(ws, request_id, messages, full_seed=news_disclosure, guard_user_text=user_text, guard_results=guard_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")
