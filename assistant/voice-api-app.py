@@ -1723,12 +1723,20 @@ def direct_structured_answer(user_text: str, live_results: list[dict]) -> str | 
             names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("devices", [])[:6])
             return f"{names or 'That device'} is currently unavailable in Home Assistant."
         if result.get("status") == "partial":
-            unavailable = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unavailable", [])[:6])
-            protected = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("protected", [])[:6])
-            unauthorized = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unauthorized", [])[:6])
-            unsupported = ", ".join(str(device.get("name") or device.get("entity_id")) for device in result.get("unsupported", [])[:6])
+            exclusions = []
+            for label, devices in (
+                ("unavailable", result.get("unavailable", [])),
+                ("protected", result.get("protected", [])),
+                ("unauthorized", result.get("unauthorized", [])),
+                ("unsupported", result.get("unsupported", [])),
+            ):
+                names = ", ".join(str(device.get("name") or device.get("entity_id")) for device in devices[:6])
+                if names:
+                    exclusions.append(f"{label}: {names}")
             missing = ", ".join(str(value) for value in result.get("missing_or_unauthorized", [])[:6])
-            return f"The permitted devices were handled, but these were excluded or unavailable: {unavailable or protected or unauthorized or unsupported or missing or 'one or more devices'}."
+            if missing:
+                exclusions.append(f"missing or unauthorized: {missing}")
+            return f"The permitted devices were handled, but {'; '.join(exclusions) or 'one or more devices were excluded'}."
         if result.get("outcome") == "home_assistant_reported_target_state":
             return "Home Assistant reports the requested state now."
         if result.get("outcome") == "target_state_not_observed_before_timeout":
@@ -2051,6 +2059,8 @@ def normalize_home_tool_arguments(name: str, arguments: dict, user_text: str) ->
             target = "Neon Lights"
         elif re.search(r"\b(all|everything)\b.*\b(light|lights|lamp|lamps)\b", lowered):
             target = "all lights"
+        elif re.search(r"\b(all|everything)\b.*\b(outlet|outlets|plug|plugs|switch|switches)\b", lowered):
+            target = "all switches"
         elif re.search(r"\b(all|everything)\b", lowered):
             target = "everything"
     if target:

@@ -203,3 +203,57 @@ def test_bulk_scope_survives_authorization_filtering(monkeypatch):
     assert result["status"] == "forbidden"
     assert result["target_entity_ids"] == []
     assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]
+
+
+def test_bulk_switch_control_only_writes_default_safe_switches(monkeypatch):
+    monkeypatch.delenv("HOME_BULK_SAFE_ENTITIES", raising=False)
+    module = _load_tools()
+    entities = [
+        _entity("light.office_light", "on", "Office Light", "Office"),
+        _entity("switch.neon_light_socket_1", "on", "Neon Socket 1", "Office"),
+        _entity("switch.neon_lights_socket_1", "on", "Neon Socket 2", "Office"),
+        _entity("switch.neon_lights_socket_1_2", "on", "Neon Socket 3", "Office"),
+        _entity("switch.router", "on", "Router", "Office"),
+    ]
+
+    async def inventory():
+        return entities, {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        payloads = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            self.payloads.append(json)
+            return FakeResponse()
+
+    module._home_assistant_entities = inventory
+    module._home_assistant_token = lambda: "test-token"
+    module.HOME_WRITE_ALLOWED_ENTITIES.add("switch.router")
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    result = asyncio.run(module.home_control({"entity_or_area": "all switches", "action": "turn_off"}))
+
+    assert result["status"] == "partial"
+    assert result["target_entity_ids"] == [
+        "switch.neon_light_socket_1",
+        "switch.neon_lights_socket_1",
+        "switch.neon_lights_socket_1_2",
+    ]
+    assert FakeAsyncClient.payloads == [{"entity_id": [
+        "switch.neon_light_socket_1",
+        "switch.neon_lights_socket_1",
+        "switch.neon_lights_socket_1_2",
+    ]}]
+    assert [item["entity_id"] for item in result["protected"]] == ["switch.router"]

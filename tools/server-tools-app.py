@@ -181,7 +181,10 @@ HOME_ENTITY_GROUPS = {
         "switch.neon_light_socket_1",
     },
 }
-HOME_BULK_SAFE_ENTITIES = {value.strip() for value in os.getenv("HOME_BULK_SAFE_ENTITIES", "").split(",") if value.strip()}
+HOME_BULK_SAFE_ENTITIES = {value.strip() for value in os.getenv(
+    "HOME_BULK_SAFE_ENTITIES",
+    "switch.neon_light_socket_1,switch.neon_lights_socket_1,switch.neon_lights_socket_1_2",
+).split(",") if value.strip()}
 _HOME_EXISTING_WRITE_POLICY = {
     "light.office_light", "light.bedroom_lamp", "light.music_star_light",
     "light.light_fixture_1", "light.light_fixture_2", "light.light_fixture_3",
