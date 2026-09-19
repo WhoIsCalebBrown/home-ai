@@ -6956,18 +6956,23 @@ def remove_openai_display_metadata(text: str) -> str:
 
     # Flattened clients can turn those same boundary newlines into spaces.
     if not marker:
-        flat = re.compile(r"---\s+\*\*Research activity\*\*\s+-\s+.*", re.S)
-        for candidate in re.finditer(r"(?:\A|\n\n|\s{2,})(?=---\s+\*\*Research activity\*\*)", cleaned):
+        flat_source = r"\[(?:\\.|[^\]\r\n])+\]\(https?://[^)\s]+\)(?: — [^\s]+)?"
+        flat_action = (
+            r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|"
+            r"Checked your home|Used an assistant tool)"
+        )
+        flat_entry = (
+            rf"{flat_action} — (?:complete|no results|failed)"
+            rf"(?:\s+-\s+{flat_source})*"
+        )
+        flat_actual = re.compile(
+            rf"--- \*\*Research activity\*\* - {flat_entry}"
+            rf"(?:\s+-\s+{flat_entry})*"
+        )
+        for candidate in re.finditer(r"(?:\A|\n\n|\s+)(?=---\s+\*\*Research activity\*\*)", cleaned):
             start = candidate.end()
             tail = re.sub(r"\s+", " ", cleaned[start:].strip())
-            if not flat.fullmatch(tail):
-                continue
-            known = re.match(
-                r"--- \*\*Research activity\*\* - "
-                r"(?:Searched the web|Opened source|Checked the forecast|Checked Plex|Checked your home|Used an assistant tool)"
-                r" — (?:complete|no results|failed)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*$",
-                tail,
-            )
+            known = flat_actual.fullmatch(tail)
             linked = re.fullmatch(
                 r"--- \*\*Research activity\*\* - [^\s].* Sources - "
                 r"\[[^\]]+\]\(https?://[^)\s]+\)(?: Sources - \[[^\]]+\]\(https?://[^)\s]+\))*",

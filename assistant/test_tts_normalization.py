@@ -141,6 +141,14 @@ def test_actual_generated_footer_variants_are_silent_but_source_like_prose_survi
     markerless_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": markerless})))
     assert markerless_response.status_code == 204
 
+    flattened = " ".join(markerless.splitlines()).strip()
+    flattened_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": flattened})))
+    assert flattened_response.status_code == 204
+    prefixed_flattened = "Here is the answer. " + flattened
+    prefixed_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": prefixed_flattened})))
+    assert prefixed_response.status_code == 200
+    assert synthesized[-1] == "Here is the answer."
+
     ordinary = "My notes\n\n---\n**Research activity**\n- Discuss project status\nContinue."
     ordinary_response = asyncio.run(app.openai_speech(_SpeechRequest({"input": ordinary})))
     assert ordinary_response.status_code == 200
