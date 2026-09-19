@@ -230,10 +230,11 @@ class FakeToolsBackend:
         self.submitted_writes: list[dict] = []
         self.consumed_confirmations: set[str] = set()
         self.call_log: list[tuple[str, dict]] = []
-        self.web_search_fixtures: list[list[dict]] = []
+        self.web_search_fixtures: list[list[dict] | None] = []
         self.web_fetch_failures: set[str] = set()
         self.web_fetch_final_urls: dict[str, str] = {}
         self.web_fetch_contents: dict[str, str] = {}
+        self.web_fetch_metadata: dict[str, dict] = {}
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
@@ -326,8 +327,11 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": payload}
         if name == "web_search":
             if self.web_search_fixtures:
+                fixture = self.web_search_fixtures.pop(0)
+                if fixture is None:
+                    return {"tool": name, "status": "error", "result": {"error": "fixture search failure"}}
                 return {"tool": name, "status": "ok", "result": {
-                    "results": [dict(item) for item in self.web_search_fixtures.pop(0)],
+                    "results": [dict(item) for item in fixture],
                 }}
             query = str(arguments.get("query", ""))
             entries = None
@@ -352,6 +356,7 @@ class FakeToolsBackend:
             return {"tool": name, "status": "ok", "result": {
                 "url": final_url,
                 "content": self.web_fetch_contents.get(url, f"Fixture article body for {final_url}."),
+                **self.web_fetch_metadata.get(url, {}),
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
@@ -2125,8 +2130,8 @@ async def test_deep_news_accepts_a_current_holder_corroborated_by_independent_fe
         [{"title": "Second current-holder report", "url": second_url, "snippet": "Independent current-holder update."}],
         [{"title": "Background", "url": third_url, "snippet": "Government context."}],
     ]
-    session.backend.web_fetch_contents[first_url] = "Corroborated Holder is the current office-holder."
-    session.backend.web_fetch_contents[second_url] = "Corroborated Holder is the current office-holder."
+    session.backend.web_fetch_contents[first_url] = "Corroborated Holder is the current office-holder. The department announced new funding."
+    session.backend.web_fetch_contents[second_url] = "Corroborated Holder is the current office-holder. Independent reporting examined the policy debate."
 
     reply = await session.turn(
         user_text,
@@ -2247,6 +2252,83 @@ async def test_deep_news_empty_or_invalid_search_results_return_limitation_witho
     assert session.last_stream_payload is None
     assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
     assert not any(name == "web_fetch" for name, _ in session.backend.call_log)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_count", [1, 6])
+async def test_research_recovery_retries_failed_searches_until_three_succeed(session, failure_count):
+    session.backend.web_search_fixtures = [None] * failure_count + [
+        [{"url": "https://one.example/story"}],
+        [{"url": "https://two.example/story"}],
+        [],
+    ]
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}],
+        final_text="The fetched stories describe two developments.",
+    )
+    assert reply == "The fetched stories describe two developments."
+    searches = [args for name, args in session.backend.call_log if name == "web_search"]
+    assert len(searches) == failure_count + 3
+    assert len(session.backend.call_log) <= 16
+
+
+@pytest.mark.asyncio
+async def test_research_recovery_keeps_untried_candidates_after_two_failed_fetches(session):
+    urls = [f"https://source-{index}.example/article" for index in range(4)]
+    session.backend.web_search_fixtures = [[{"url": url} for url in urls], [], []]
+    session.backend.web_fetch_failures.update(urls[:2])
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}],
+        final_text="The fetched stories describe two developments.",
+    )
+    assert reply == "The fetched stories describe two developments."
+    assert [args["url"] for name, args in session.backend.call_log if name == "web_fetch"] == urls
+    assert len(session.backend.call_log) <= 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_fetch", [False, True])
+async def test_deep_news_retains_search_date_when_fetch_has_no_publication_date(session, model_fetch):
+    old_url = "https://canada.gc.ca/announcement"
+    session.backend.web_search_fixtures = [
+        [{"url": old_url, "date": "2015-10-19"}],
+        [{"url": "https://independent.example/news"}],
+        [],
+    ]
+    session.backend.web_fetch_contents[old_url.split("#")[0]] = "Alice Doe is the prime minister."
+    reply = await session.turn(
+        "Give me an in-depth review of current Canadian news.",
+        ollama_script=[{"message": {"tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canadian news"}}},
+        ]}}] + ([{"message": {"tool_calls": [
+            {"function": {"name": "web_fetch", "arguments": {"url": old_url}}},
+        ]}}] if model_fetch else []),
+        final_text="Alice Doe is the prime minister.",
+    )
+    assert reply == "I can't safely verify that current office-holder from the fetched evidence."
+    fetched = [json.loads(message["content"]) for message in session.last_stream_payload["messages"]
+               if message.get("role") == "tool" and message.get("name") == "web_fetch"]
+    assert next(item for item in fetched if item["url"] == old_url.split("#")[0])["date"] == "2015-10-19"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["Explain photosynthesis in-depth.", "Explain cellular respiration in-depth."])
+async def test_deep_news_gate_does_not_apply_to_general_depth_requests(session, prompt):
+    answer = "Plants convert light into chemical energy through a sequence of reactions."
+    reply = await session.turn(prompt, ollama_script=[], final_text=answer)
+    assert reply == answer
+    assert not any(name in {"web_search", "web_fetch"} for name, _ in session.backend.call_log)
+    system_text = "\n".join(str(message.get("content") or "") for message in session.last_stream_payload["messages"]
+                            if message.get("role") == "system")
+    assert "The user explicitly requested depth" in system_text
+    assert "several distinct supported developments" not in system_text
+    assert "Current office-holder claims require fetched evidence" not in system_text
 
 
 # --- Real production transcript replay (UnresolvedSubject / relevance gate) -

@@ -1035,102 +1035,122 @@ def grounded_investigation_answer(result: dict, user_text: str) -> str | None:
             f"{torbox.get('errored', 0)} errored, and {torbox.get('pulling', 0)} pulling.")
 
 
+def current_role_relationships(text: str) -> list[tuple[str, str, bool]]:
+    """Detect plausible named-person relationships, never arbitrary copulas.
+
+    Detection is intentionally broader than positive source support. Proper
+    names, either copular direction, and title-before-name syntax work without
+    a dictionary of people or offices. Capitalized multiword names distinguish
+    these constructions from ordinary prose such as 'Inflation is slowing'.
+    """
+    word = r"[A-ZÀ-ÖØ-Þ][^\W\d_]*(?:['’\-][^\W\d_]+)*"
+    person = rf"{word}(?:[ \t]+{word}){{1,4}}"
+    negative = r"(?P<negative>(?i:not|no longer)\s+)?"
+    forward = re.compile(rf"(?P<name>{person})\s+(?i:is|serves as|remains)\s+{negative}(?P<title>[^.!?;:\n,()—]+)")
+    reverse = re.compile(rf"(?P<title>[^.!?;:\n,()—]+?)\s+(?i:is|remains)\s+{negative}(?P<name>{person})(?![\w'’\-])")
+    titled = re.compile(rf"(?<![\w'’\-])(?P<words>{word}(?:[ \t]+{word}){{2,6}})\s+(?=[a-z])")
+    relationships = []
+    for clause in re.split(r"[.!?;:\n]", text):
+        occupied = []
+        for pattern in (reverse, forward):
+            for match in pattern.finditer(clause):
+                if any(start < match.end() and match.start() < end for start, end in occupied):
+                    continue
+                if (pattern is reverse and re.fullmatch(person, match["title"].strip())
+                        and not re.match(r"(?:the|current)\b", match["title"], re.I)):
+                    continue  # Two proper-name-shaped sides default to person first.
+                name = " ".join(match["name"].casefold().split())
+                title = " ".join(match["title"].casefold().split())
+                if pattern is forward and re.match(r"\w{2,}ing(?:\s|$)", title):
+                    continue  # A progressive verb is not a nominal office.
+                title = re.sub(r"^(?:the\b\s*)?(?:current\b\s*)?", "", title)
+                if not re.fullmatch(r"[^\W\d_][\w'’ -]*", title):
+                    continue
+                relationships.append((name, title, bool(match["negative"])))
+                occupied.append(match.span())
+        for match in titled.finditer(clause):
+            if any(start < match.end() and match.start() < end for start, end in occupied):
+                continue
+            words = match["words"].split()
+            title = " ".join(words[:-2]).casefold()
+            title = re.sub(r"^(?:the\b\s*)?(?:current\b\s*)?", "", title)
+            if title:
+                relationships.append((" ".join(words[-2:]).casefold(), title, False))
+    return list(dict.fromkeys(relationships))
+
+
+def research_article_freshness(result: dict, now: float) -> str:
+    """Treat known old/unparseable dates as historical, never current proof.
+
+    Undated official pages remain usable as live institutional pages. Dated
+    office-holder reports are current only within 31 days; historical official
+    assertions require a separate, explicitly current corroborating article.
+    """
+    value = result.get("published") or result.get("date")
+    if not value:
+        return "undated"
+    try:
+        published = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).date()
+        age = (datetime.fromtimestamp(now).date() - published).days
+        return "current" if 0 <= age <= 31 else "historical"
+    except ValueError:
+        return "historical"
+
+
+def fetched_current_role_supported(name: str, title: str, results: list[dict], now: float) -> bool:
+    """Require a direct, current and authoritative/corroborated relationship."""
+    support = []
+    seen_content = set()
+    current_authority = False
+    # Complete direct sentences supply support in either direction. A colon,
+    # quote, newline introduction or qualification cannot become positive proof.
+    person_first = rf"{re.escape(name)} (?:is|serves as|remains) (?:the )?(?:current )?{re.escape(title)}\.?"
+    role_first = rf"(?:the )?(?:current )?{re.escape(title)} (?:is|remains) {re.escape(name)}\.?"
+    for item in results:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        url = normalized_research_url(result.get("url"))
+        content = str(result.get("content") or "").strip()
+        if item.get("tool") != "web_fetch" or item.get("status") != "ok" or not url or not content:
+            continue
+        freshness = research_article_freshness(result, now)
+        direct_support = False
+        for sentence in re.split(r"(?<=[.!?])\s+", content):
+            canonical = " ".join(sentence.casefold().split())
+            direct = bool(re.fullmatch(person_first, canonical) or re.fullmatch(role_first, canonical))
+            if freshness != "historical":
+                for other_name, other_title, negated in current_role_relationships(sentence):
+                    if other_title != title and not other_title.startswith(title + " "):
+                        continue
+                    if (negated and other_name == name) or (not negated and other_name != name):
+                        return False
+                    if not negated and other_name == name and not direct:
+                        return False  # A qualification/attribution is unresolved.
+            direct_support = direct_support or direct
+        signature = " ".join(content.casefold().split())
+        current_authority = current_authority or (direct_support and research_authoritative(url) and freshness != "historical")
+        if direct_support and signature not in seen_content:
+            support.append((research_publisher(url), research_authoritative(url), freshness))
+            seen_content.add(signature)
+    if current_authority:
+        return True
+    current_publishers = {publisher for publisher, _, freshness in support if freshness != "historical"}
+    if len(current_publishers) >= 2:
+        return True
+    return any(
+        authority and freshness == "historical" and any(
+            other != publisher and other_freshness == "current"
+            for other, _, other_freshness in support
+        )
+        for publisher, authority, freshness in support
+    )
+
+
 def evidence_supported_answer(answer: str, user_text: str, results: list[dict], resolved_domain: str | None = None, research_mode: str = "quick") -> str:
     """Conservatively reject unsupported dynamic claims from model synthesis."""
     evidence = json.dumps(results, ensure_ascii=False).casefold()
-    if research_mode == "deep":
-        # Detection is deliberately broader than acceptance: no vocabulary of
-        # known offices or people can exempt a new present-tense role claim.
-        # Prefer explicit reverse claims so their role and person are not
-        # also interpreted as a person-first relationship in the other order.
-        role_claim_pattern = (
-            r"\b(?:the\s+)?current\s+(?P<reverse_title>[^.!?;\n]+?)\s+(?:is|remains)\s+(?P<reverse_name>[^.!?;\n]+)"
-            r"|(?P<name>[^.!?;\n]+?)\s+(?:is|serves as|remains)\s+(?:the\s+)?(?:current\s+)?(?P<title>[^.!?;\n]+)"
-        )
-
-        def normalized(value: str) -> str:
-            return " ".join(value.casefold().split())
-
-        def fetched_host(value: object) -> str:
-            try:
-                parsed = urlsplit(str(value or ""))
-                host = (parsed.hostname or "").casefold().rstrip(".")
-                if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
-                    return ""
-                return host if re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", host) else ""
-            except ValueError:
-                return ""
-
-        fetched_articles = [
-            (
-                fetched_host(item.get("result", {}).get("url")),
-                str(item.get("result", {}).get("content") or ""),
-            )
-            for item in results
-            if item.get("tool") == "web_fetch"
-            and item.get("status") == "ok"
-            and isinstance(item.get("result"), dict)
-            and str(item.get("result", {}).get("content") or "").strip()
-        ]
-        claimed_holders = [
-            (
-                normalized(match.group("name") or match.group("reverse_name")),
-                normalized(match.group("title") or match.group("reverse_title")),
-            )
-            for match in re.finditer(role_claim_pattern, answer, re.I)
-        ]
-
-        def fetched_evidence_supports_current_role(name: str, title: str) -> bool:
-            # Full sentences only: embedded reports, quotes and qualifying or
-            # refuting suffixes cannot become support through a substring match.
-            # Reverse-order assertions can expose conflicts, but only the
-            # canonical person-first form supplies positive evidence.
-            person = r"(?P<name>[^\W\d_][\w'’ -]*?)"
-            relation = re.compile(
-                rf"{person} is (?P<negative>not |no longer )?(?:the )?(?:current )?{re.escape(title)}(?![\w-])"
-            )
-            reverse_relation = re.compile(
-                rf"(?:the )?(?:current )?{re.escape(title)} is {person}(?=$|[^\w'’ -])"
-            )
-            supporting_domains = set()
-            for domain, content in fetched_articles:
-                if not domain:
-                    continue
-                # A newline or colon may introduce an attributed quotation;
-                # only terminal punctuation starts a fresh source assertion.
-                for sentence in re.split(r"(?<=[.!?])\s+", content):
-                    sentence = normalized(sentence)
-                    assertion = relation.match(sentence)
-                    reverse = reverse_relation.match(sentence)
-                    if reverse:
-                        if normalized(reverse.group("name")) != name or sentence[reverse.end():] not in {"", "."}:
-                            return False
-                    if not assertion:
-                        continue
-                    # A matching relationship followed by extra prose may be
-                    # qualified or refuted. Treat it as unresolved, including
-                    # when other fetched articles offer a clean assertion.
-                    if sentence[assertion.end():] not in {"", "."}:
-                        return False
-                    if assertion.group("negative"):
-                        if assertion.group("name") == name:
-                            return False
-                        continue
-                    if assertion.group("name") != name:
-                        return False
-                    supporting_domains.add(domain)
-            authoritative = any(
-                domain == suffix or domain.endswith("." + suffix)
-                for domain in supporting_domains
-                for suffix in ("gov", "gc.ca", "gov.uk", "gov.au", "gov.nz")
-            )
-            # Subdomains of one publisher are not independent sources. Taking
-            # the last two labels intentionally undercounts multi-label public
-            # suffixes (e.g. co.uk) rather than overclaiming independence.
-            independent_domains = {".".join(domain.split(".")[-2:]) for domain in supporting_domains}
-            return authoritative or len(independent_domains) >= 2
-
-        if any(not fetched_evidence_supports_current_role(name, title) for name, title in claimed_holders):
+    if research_mode == "deep" and current_news_intent(user_text):
+        if any(not fetched_current_role_supported(name, title, results, time.time())
+               for name, title, negated in current_role_relationships(answer) if not negated):
             return "I can't safely verify that current office-holder from the fetched evidence."
     web_items = [item for item in results if item.get("tool") == "web_search"]
     if web_items and re.search(r"\b(?:don't|do not|cannot|can't)\s+(?:have|access)|\bno access to (?:live )?(?:news|the web)|\bcan't tell you what's happening", answer, re.I):
@@ -3954,49 +3974,73 @@ def preflight_plan(text: str, context: dict | None = None) -> list[tuple[str, di
     return list(dict((name, args) for name, args in plan).items())
 
 
-def research_profile(text: str) -> dict[str, int | str]:
+def current_news_intent(text: str) -> bool:
+    """News freshness and answer depth are independent user intentions."""
+    return bool(re.search(r"\b(news|headlines|current events|latest developments|recent developments|what(?:'s| is) happening)\b", text, re.I))
+
+
+def research_profile(text: str) -> dict[str, int | str | bool]:
     """Choose a bounded web-research budget from explicit user intent."""
     lowered = text.casefold()
     if re.search(r"\b(in[- ]depth|deep dive|deeply|comprehensive|thorough|full picture|detailed review|properly research|research this)\b", lowered):
-        return {"mode": "deep", "iterations": 8, "max_calls": 16, "num_predict": 720, "minimum_searches": 3, "minimum_fetches": 2}
+        news = current_news_intent(text)
+        return {"mode": "deep", "current_news": news, "iterations": 8, "max_calls": 16, "num_predict": 720, "minimum_searches": 3 if news else 0, "minimum_fetches": 2 if news else 0}
     if re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered):
         return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360, "minimum_searches": 1, "minimum_fetches": 1}
     return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180, "minimum_searches": 1, "minimum_fetches": 0}
 
 
+def normalized_research_url(value: object) -> str:
+    """Validate an article URL and discard only its fragment."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        host = (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
+        if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+                or not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*", host)):
+            return ""
+        port = parsed.port
+        netloc = host + (f":{port}" if port and port != {"http": 80, "https": 443}[parsed.scheme] else "")
+        return parsed._replace(netloc=netloc, fragment="").geturl()
+    except ValueError:
+        return ""
+
+
+def research_publisher(value: str) -> str:
+    """Conservatively group subdomains in every evidence/selection boundary.
+
+    Last-two-label grouping may undercount multi-label public suffixes, but
+    cannot call two publisher subdomains independent without a suffix database.
+    """
+    host = urlsplit(value).hostname if "://" in value else value
+    return ".".join(str(host or "").casefold().rstrip(".").split(".")[-2:])
+
+
+def research_authoritative(url: str) -> bool:
+    host = urlsplit(url).hostname or ""
+    return any(host == suffix or host.endswith("." + suffix)
+               for suffix in ("gov", "gc.ca", "gov.uk", "gov.au", "gov.nz"))
+
+
 def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: set[str], limit: int) -> list[str]:
     """Choose normalized fetch URLs, favoring primary sources and coverage diversity."""
-    def normalized_url(value: object) -> tuple[str, str] | None:
-        match = re.match(r"^(https?)://([^/?#]+)([^#]*)$", str(value or "").strip(), re.I)
-        if not match:
-            return None
-        scheme, domain, path = match.groups()
-        domain = domain.casefold().removeprefix("www.")
-        if not domain:
-            return None
-        return f"{scheme.casefold()}://{domain}{path}", domain
-
     normalized_seen_urls = {
-        normalized[0] for value in seen_urls if (normalized := normalized_url(value))
+        normalized for value in seen_urls if (normalized := normalized_research_url(value))
     }
-    normalized_seen_domains = {str(value).casefold().removeprefix("www.") for value in seen_domains}
+    normalized_seen_domains = {research_publisher(value) for value in seen_domains}
     options = []
     for index, item in enumerate(result.get("results", []) if isinstance(result, dict) else []):
-        normalized = normalized_url(item.get("url") if isinstance(item, dict) else None)
-        if normalized is None or normalized[0] in normalized_seen_urls:
+        url = normalized_research_url(item.get("url") if isinstance(item, dict) else None)
+        if not url or url in normalized_seen_urls:
             continue
-        url, domain = normalized
+        domain = research_publisher(url)
         if any(existing[1] == url for existing in options):
             continue
-        authoritative = domain.endswith(".gc.ca") or domain.endswith(".gov") or ".gov." in domain or domain.startswith("gov.")
-        options.append((index, url, domain, authoritative))
+        options.append((index, url, domain, research_authoritative(url)))
 
     selected = []
     selected_domains = set(normalized_seen_domains)
     while options and len(selected) < max(limit, 0):
         def candidate_rank(option: tuple[int, str, str, bool]) -> tuple[int, int, int]:
-            if not selected:
-                return (0 if option[3] else 1, 0, option[0])
             return (
                 0 if option[2] not in selected_domains else 1,
                 0 if option[3] else 1,
@@ -4019,6 +4063,7 @@ def research_evidence_shape(live_results: list[dict]) -> dict[str, int]:
     successful_fetches = 0
     fetched_urls = set()
     fetched_domains = set()
+    fetched_content = set()
     for item in live_results:
         if not isinstance(item, dict) or item.get("status") != "ok":
             continue
@@ -4031,13 +4076,13 @@ def research_evidence_shape(live_results: list[dict]) -> dict[str, int]:
         if not str(result.get("content") or "").strip():
             continue
         successful_fetches += 1
-        match = re.match(r"^https?://([^/?#]+)", str(result.get("url") or "").strip(), re.I)
-        if not match:
+        url = normalized_research_url(result.get("url"))
+        signature = " ".join(str(result["content"]).casefold().split())
+        if not url or url in fetched_urls or signature in fetched_content:
             continue
-        url = re.sub(r"#.*$", "", str(result["url"]).strip())
-        domain = match.group(1).casefold().removeprefix("www.")
         fetched_urls.add(url)
-        fetched_domains.add(domain)
+        fetched_domains.add(research_publisher(url))
+        fetched_content.add(signature)
     return {
         "successful_searches": successful_searches,
         "successful_fetches": successful_fetches,
@@ -4069,9 +4114,10 @@ def deep_research_synthesis_instruction(shape: dict[str, int]) -> str:
         "The user explicitly requested depth, so the normal short-answer default does not apply. "
         "Organize several distinct supported developments with their context and significance. "
         "A multi-paragraph answer is appropriate when the supported developments need it. "
-        f"Base the roundup on the {source_count} independently hosted fetched sources in the current evidence. "
+        f"Base the roundup on the {source_count} independent publishers with distinct fetched coverage in the current evidence. "
         "Current office-holder claims require fetched evidence. Use only fetched evidence for current "
         "office-holders and institutional facts; search snippets do not establish those facts. "
+        "Historical articles require current corroboration for current claims. Respect the available publication dates. "
         "Omit conflicts that cannot be resolved from fetched sources. "
         "Never mention internal tool names or the research process."
     )
@@ -4093,6 +4139,8 @@ def compact_research_result(name: str, result: dict, *, deep: bool = False) -> d
 
 def research_tool_instruction(profile: dict[str, int | str]) -> str:
     mode = profile["mode"]
+    if mode == "deep" and not profile.get("current_news"):
+        return "The user requested a detailed answer. Use live tools only if the subject requires external evidence."
     if mode == "quick":
         return "Use the web minimally for this lookup: one focused search and fetch at most the strongest source if needed."
     if mode == "normal":
@@ -5614,6 +5662,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         tools, candidates, discovery_latency = await discover_tools(route_text, context)
         context["retrieval_confidence"] = retrieval_confidence(candidates)
         profile = research_profile(user_text)
+        deep_news = profile["mode"] == "deep" and bool(profile.get("current_news"))
         context["research_mode"] = profile["mode"]
         context["research_budget"] = {key: value for key, value in profile.items() if key != "num_predict"}
         context["retrieved_capabilities"] = [item.get("canonical_name") for item in candidates]
@@ -5961,23 +6010,42 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         research_calls = 0
         attempted_research_urls: set[str] = set()
         successful_research_domains: set[str] = set()
+        research_candidates: dict[str, dict] = {}
 
-        async def fetch_search_evidence(search_result: dict) -> None:
-            """Fetch bounded, diverse article evidence for one successful search."""
+        def retain_search_date(fetched: dict, requested_url: str) -> dict:
+            """Keep discovery dates on automatic and model-requested fetches."""
+            fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+            candidate = research_candidates.get(normalized_research_url(requested_url), {})
+            date = candidate.get("published") or candidate.get("date")
+            if date and not fetched_result.get("published") and not fetched_result.get("date"):
+                fetched_result = {**fetched_result, "date": date}
+            final_url = normalized_research_url(fetched_result.get("url"))
+            if final_url:
+                research_candidates.setdefault(final_url, {**candidate, "url": final_url})
+            return {**fetched, "result": fetched_result}
+
+        async def fetch_search_evidence(search_result: dict | None = None, *, finish: bool = False) -> None:
+            """Retain discovery candidates until tried; failures earn no evidence."""
             nonlocal research_calls
-            if search_result.get("status") != "ok" or not isinstance(search_result.get("result"), dict):
-                return
+            if search_result and search_result.get("status") == "ok" and isinstance(search_result.get("result"), dict):
+                for candidate in search_result["result"].get("results", []):
+                    if isinstance(candidate, dict) and (url := normalized_research_url(candidate.get("url"))):
+                        research_candidates.setdefault(url, {**candidate, "url": url})
             max_calls = int(profile["max_calls"])
             fetch_limit = {"quick": 0, "normal": 1, "deep": 2}.get(str(profile["mode"]), 0)
-            candidates = research_fetch_candidates(
-                search_result["result"],
-                attempted_research_urls,
-                successful_research_domains,
-                min(fetch_limit, max_calls - research_calls),
-            )
-            for url in candidates:
-                if research_calls >= max_calls:
+            useful_fetches = 0
+            while useful_fetches < (max_calls if finish else fetch_limit):
+                shape = research_evidence_shape(live_results)
+                reserve = max(0, int(profile["minimum_searches"]) - shape["successful_searches"]) if deep_news else 0
+                if research_calls >= max_calls - reserve or (finish and deep_research_ready(live_results, True)):
                     break
+                candidates = research_fetch_candidates(
+                    {"results": list(research_candidates.values())}, attempted_research_urls,
+                    successful_research_domains, 1,
+                )
+                if not candidates:
+                    break
+                url = candidates[0]
                 attempted_research_urls.add(url)
                 fetched = await invoke_tool(
                     "web_fetch",
@@ -5986,17 +6054,19 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     request_id,
                 )
                 research_calls += 1
-                live_results.append(fetched)
+                fetched = retain_search_date(fetched, url)
                 fetched_result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+                live_results.append(fetched)
                 messages.append({"role": "tool", "name": "web_fetch", "content": json.dumps(
                     compact_research_result("web_fetch", fetched_result, deep=profile["mode"] == "deep"),
                     separators=(",", ":"),
                 )})
                 if fetched.get("status") == "ok" and str(fetched_result.get("content") or "").strip():
-                    fetched_url = str(fetched_result.get("url") or url).strip()
-                    domain_match = re.match(r"^https?://([^/?#]+)", fetched_url, re.I)
-                    if domain_match:
-                        successful_research_domains.add(domain_match.group(1).casefold().removeprefix("www."))
+                    fetched_url = normalized_research_url(fetched_result.get("url") or url)
+                    if fetched_url:
+                        attempted_research_urls.add(fetched_url)
+                        successful_research_domains.add(research_publisher(fetched_url))
+                    useful_fetches += int(research_evidence_shape(live_results)["distinct_fetched_urls"] > shape["distinct_fetched_urls"])
 
         for _ in range(int(profile["iterations"])):
             discovery_audit({
@@ -6024,18 +6094,20 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 message = response.json().get("message", {})
             calls = message.get("tool_calls") or []
             if not calls:
-                completed_searches = sum(1 for item in live_results if item.get("tool") == "web_search")
-                minimum_searches = 2 if profile["mode"] == "normal" else 3 if profile["mode"] == "deep" else 1
-                if profile["mode"] in {"normal", "deep"} and completed_searches < minimum_searches and research_calls < int(profile["max_calls"]):
+                minimum_searches = 2 if profile["mode"] == "normal" else int(profile["minimum_searches"]) if deep_news else 0
+                while (research_evidence_shape(live_results)["successful_searches"] < minimum_searches
+                       and research_calls < int(profile["max_calls"])):
                     recovery_queries = web_recovery_queries(user_text)
-                    query = recovery_queries[min(completed_searches, len(recovery_queries) - 1)]
+                    search_attempts = sum(1 for item in live_results if item.get("tool") == "web_search")
+                    query = recovery_queries[min(search_attempts, len(recovery_queries) - 1)]
                     followup_recency = 1 if re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
                     followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": followup_recency, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
                     research_calls += 1
                     live_results.append(followup)
                     messages.append({"role": "tool", "name": "web_search", "content": json.dumps(compact_research_result("web_search", followup.get("result", {}) if isinstance(followup.get("result"), dict) else {}, deep=profile["mode"] == "deep"), separators=(",", ":"))})
                     await fetch_search_evidence(followup)
-                    continue
+                if deep_news and not deep_research_ready(live_results, bool(research_candidates)):
+                    await fetch_search_evidence(finish=True)
                 break
             # This is a dispatch record, not final-answer evidence. Retain
             # tool_calls for the chat protocol while dropping model prose that
@@ -6078,6 +6150,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                 arguments = enrich_research_arguments(name, arguments, profile, user_text)
                 result = await invoke_tool(name, arguments, client_id, request_id)
                 research_calls += 1
+                if name == "web_fetch":
+                    result = retain_search_date(result, str(arguments.get("url") or ""))
                 if name == "home_control":
                     conversation_context.setdefault(client_id, {})["latest_home_action"] = {
                         "name": name, "arguments": dict(arguments), "result": result.get("result"),
@@ -6096,7 +6170,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     await fetch_search_evidence(result)
             if research_calls >= int(profile["max_calls"]):
                 break
-        if profile["mode"] == "deep":
+        if deep_news:
             candidate_urls_exist = any(
                 item.get("tool") == "web_search"
                 and item.get("status") == "ok"
@@ -6182,7 +6256,7 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             # question) must never ground the answer, even though it was
             # legitimately invoked and logged.
             grounding_results = filter_relevant_tool_results(live_results, context)
-            if profile["mode"] == "deep":
+            if deep_news:
                 # Search snippets are discovery hints only. A deep-news final
                 # answer may use article text but must not treat a snippet as
                 # current evidence for office-holders or institutional facts.
@@ -6214,8 +6288,10 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
-        if profile["mode"] == "deep":
+        if deep_news:
             messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(live_results))})
+        elif profile["mode"] == "deep":
+            messages.append({"role": "system", "content": "The user explicitly requested depth, so the normal short-answer default does not apply. Give a detailed explanation with context and examples as appropriate to the subject."})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
         full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")

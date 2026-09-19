@@ -4,10 +4,15 @@ import ast
 import json
 import re
 import time
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
+
+import pytest
 
 tree = ast.parse(Path(__file__).with_name("voice-api-app.py").read_text())
 needed = {"SOURCE_NAMES", "ARTIST_ALIASES", "DOMAIN_ENTITIES", "artist_from_speech", "visual_question", "activity_question", "front_door_presence_question", "current_camera_presence_question", "grounded_recent_activity_answer", "historical_timing_question", "grounded_event_timing_answer", "dynamic_fact_question", "current_external_question", "explicit_web_search_request", "historical_camera_question", "historical_camera_window", "plex_query_from_speech", "investigation_query_from_speech", "deterministic_plan", "preflight_plan", "evidence_supported_answer", "grounded_camera_presence_answer", "direct_structured_answer", "media_plan_response", "routing_aliases", "contextual_entity_resolution", "is_repair_turn", "repair_route_text", "weather_location_from_text", "explicit_topic", "turn_context", "resolved_followup_text", "conversation_context", "explicit_domain", "social_acknowledgement", "social_acknowledgement_response", "plural_disambiguation_reply", "underspecified_read_request", "repeat_intent", "rephrase_intent", "repair_decimal_spacing", "round_weather_temperatures", "complete_speakable_sentence", "direct_file_request", "playback_request", "media_identity_signal", "media_acquisition_language", "media_goal_request", "media_status_question", "media_nouns_for_status", "media_title_status_signal", "retained_media_status_repair", "media_status_display_title", "is_confirmation", "store_provenance", "provenance_question", "ambiguous_container_status_followup", "all_live_results_failed", "discovery_question", "_tokens_for_discovery", "_DISCOVERY_QUESTION_PATTERNS", "_DISCOVERY_QUESTION_STOPWORDS", "_media_title_candidate_words", "_MEDIA_CATEGORY_WORDS", "_MEDIA_QUESTION_SCAFFOLDING", "plex_query_from_speech", "guess_media_title", "fresh_title_restatement", "media_intent", "media_library_query", "library_category_followup", "library_count_category", "referential_media_library_question", "referential_media_request", "retained_media_goal", "canonical_identity_matches", "enforce_retained_media_identity", "collective_library_query", "referential_web_query", "storage_state_followup", "operation_for_plan", "_descriptive_media_clue", "natural_weather_summary", "web_result_useful", "web_search_query_from_text", "_WEB_QUERY_LEADING_SCAFFOLDING", "_WEB_QUERY_TRAILING_FILLER", "_WEB_QUERY_NESTED_SCAFFOLDING", "web_recovery_queries", "collapse_repeated_sentences", "_timezone_from_text", "_TIMEZONE_CITY_MAP", "high_confidence_auto_dispatch", "CONTAINER_DISPLAY_NAMES", "_server_container_followup_target", "canonical_media_year_answer", "research_profile", "research_fetch_candidates", "research_evidence_shape", "deep_research_ready"}
+needed.update({"current_news_intent", "current_role_relationships", "research_article_freshness", "fetched_current_role_supported", "normalized_research_url", "research_publisher", "research_authoritative"})
 def is_needed_assignment(node):
     targets = getattr(node, "targets", [])
     if isinstance(node, ast.AnnAssign):
@@ -18,7 +23,7 @@ def is_needed_assignment(node):
 nodes = [node for node in tree.body if getattr(node, "name", None) in needed or is_needed_assignment(node)]
 from semantic_routing import has_referential_language
 
-namespace = {"json": json, "re": re, "time": time, "provenance": {}, "has_referential_language": has_referential_language}
+namespace = {"json": json, "re": re, "time": time, "datetime": datetime, "urlsplit": urlsplit, "provenance": {}, "has_referential_language": has_referential_language}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "voice-api-app.py", "exec"), namespace)
 SOURCE_NAMES = namespace["SOURCE_NAMES"]
 evidence_supported_answer = namespace["evidence_supported_answer"]
@@ -901,6 +906,107 @@ def test_deep_research_requires_successful_independent_fetches():
     assert not deep_research_ready(evidence, candidate_urls_exist=True)
     evidence.append({"tool": "web_fetch", "status": "ok", "result": {"url": "https://b.example/2", "content": "article two"}})
     assert deep_research_ready(evidence, candidate_urls_exist=True)
+
+
+@pytest.mark.parametrize("second_url,second_content", [
+    ("https://alias.publisher.example/news", "A different article."),
+    ("https://other.example/news", "The same syndicated article."),
+    ("https://other.example/news", "  THE SAME\n syndicated article.  "),
+])
+def test_deep_research_does_not_count_shared_publishers_or_repeated_coverage(second_url, second_content):
+    evidence = [{"tool": "web_search", "status": "ok", "result": {"results": []}} for _ in range(3)]
+    evidence += [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://publisher.example/news", "content": "The same syndicated article."}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": second_url, "content": second_content}},
+    ]
+    assert not deep_research_ready(evidence, candidate_urls_exist=True)
+    evidence.append({"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/news", "content": "Independent additional coverage."}})
+    assert deep_research_ready(evidence, candidate_urls_exist=True)
+
+
+def test_research_fetch_candidates_strip_fragments_and_group_publisher_subdomains():
+    result = {"results": [
+        {"url": "https://alias.publisher.example/article#section"},
+        {"url": "https://other.example/article#heading"},
+        {"url": "https://other.example/article#duplicate"},
+    ]}
+    assert research_fetch_candidates(result, set(), {"publisher.example"}, 2) == [
+        "https://other.example/article", "https://alias.publisher.example/article",
+    ]
+
+
+@pytest.mark.parametrize("answer,source,competing,accepted", [
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nBob Roe is the prime minister.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nThe prime minister is Bob Roe.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nAlice Doe is not the prime minister.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Government update:\nBob Roe is the prime minister following the election.", False),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Alice Doe is the prime minister according to a disproven report.", False),
+    ("The prime minister is Alice Doe.", "Alice Doe is the prime minister.", "Economic context.", True),
+    ("The prime minister is Alice Doe.", "Economic context.", "Other context.", False),
+    ("Alice Doe is the prime minister.", "The prime minister is Alice Doe.", "Economic context.", True),
+    ("Alice Doe is Foreign Minister.", "Alice Doe is the Foreign Minister.", "Economic context.", True),
+    ("Alice Doe is Foreign Minister.", "Economic context.", "Other context.", False),
+    ("Prime Minister Alice Doe announced a policy.", "Economic context.", "Other context.", False),
+    ("Prime Minister Alice Doe announced a policy.", "Alice Doe is the prime minister.", "Economic context.", True),
+    ("Regional Ombudsperson Alice Doe announced a policy.", "Economic context.", "Other context.", False),
+    ("Regional Ombudsperson Alice Doe announced a policy.", "Alice Doe is the regional ombudsperson.", "Economic context.", True),
+    ("Alice Doe is the prime minister.", "Alice Doe is the prime minister.", "Prime Minister Bob Roe announced a policy.", False),
+    ("Inflation is slowing.", "Economic context.", "Other context.", True),
+    ("The economy is growing.", "Economic context.", "Other context.", True),
+    ("The outlook remains uncertain.", "Economic context.", "Other context.", True),
+    ("Research funding is increasing.", "Economic context.", "Other context.", True),
+    ("Alice Doe is speaking today.", "Economic context.", "Other context.", True),
+    ("The United States announced new funding.", "Economic context.", "Other context.", True),
+    ("Alice Doe is the prime minister.", "A false report claimed:\nAlice Doe is the prime minister.", "Economic context.", False),
+])
+def test_deep_research_current_role_relationships(answer, source, competing, accepted):
+    results = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/news", "content": source}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/news", "content": competing}},
+    ]
+    result = evidence_supported_answer(answer, "Current news in depth", results, research_mode="deep")
+    assert result == (answer if accepted else "I can't safely verify that current office-holder from the fetched evidence.")
+
+
+@pytest.mark.parametrize("metadata", [{"published": "2015-10-19T00:00:00Z"}, {"date": "2015-10-19"}])
+def test_deep_research_historical_official_article_needs_current_corroboration(metadata):
+    answer = "Alice Doe is the prime minister."
+    evidence = [{"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://canada.gc.ca/announcement", "content": answer, **metadata,
+    }}]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") != answer
+    today = datetime.now().date().isoformat()
+    evidence.append({"tool": "web_fetch", "status": "ok", "result": {
+        "url": "https://independent.example/news", "content": answer + " A new policy accompanies the appointment.", "published": today,
+    }})
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
+
+
+def test_deep_research_historical_conflict_does_not_overrule_current_official_article():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/current", "content": answer, "published": datetime.now().date().isoformat()}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://independent.example/archive", "content": "Bob Roe is the prime minister.", "published": "2015-10-19"}},
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
+
+
+def test_deep_research_copied_articles_do_not_corroborate_current_roles():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": url, "content": answer}}
+        for url in ("https://one.example/news", "https://two.example/news")
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") != answer
+
+
+def test_deep_research_fresh_authority_is_not_lost_to_an_older_duplicate():
+    answer = "Alice Doe is the prime minister."
+    evidence = [
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/archive", "content": answer, "published": "2015-10-19"}},
+        {"tool": "web_fetch", "status": "ok", "result": {"url": "https://canada.gc.ca/current", "content": answer, "published": datetime.now().date().isoformat()}},
+    ]
+    assert evidence_supported_answer(answer, "Current news in depth", evidence, research_mode="deep") == answer
 
 
 def test_research_fetch_candidates_deduplicates_and_prioritizes_diverse_authoritative_sources():
