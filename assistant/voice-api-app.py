@@ -2385,6 +2385,16 @@ def media_acquisition_language(text: str) -> bool:
     )
 
 
+def informational_media_continuation(text: str) -> bool:
+    """Recognize an initial desire to learn about media, not acquire it."""
+    return bool(re.match(
+        r"\s*i\s+(?:want|need)\s+to\s+(?:know|find\s+out|remember|learn|"
+        r"figure\s+out|identify|understand|see|check)\b",
+        text,
+        re.I,
+    ))
+
+
 def media_goal_request(text: str) -> bool:
     """True only for library-goal language, never direct file delivery/playback.
 
@@ -2401,6 +2411,7 @@ def media_goal_request(text: str) -> bool:
     return (
         media_acquisition_language(text)
         and media_identity_signal(text)
+        and not informational_media_continuation(text)
         and not direct_file_request(text)
         and not playback_request(text)
         and not media_status_question(text)
@@ -2415,15 +2426,9 @@ def media_acquisition_request_frame(text: str) -> bool:
     explicit request frame. This narrower predicate is intentionally used
     only where a title-shaped subject is otherwise already present.
     """
-    # "I need to know/find out/remember which movie ..." asks for
-    # information, not acquisition. Keep these bounded informational
-    # continuations ahead of the descriptive `I want/need ... movie` frame.
-    if re.match(
-        r"\s*i\s+(?:want|need)\s+to\s+(?:know|find\s+out|remember|learn|"
-        r"figure\s+out|identify|understand|see|check)\b",
-        text,
-        re.I,
-    ):
+    # Keep these bounded informational continuations ahead of the
+    # descriptive `I want/need ... movie` frame.
+    if informational_media_continuation(text):
         return False
     return bool(
         re.match(
