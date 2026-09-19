@@ -3966,6 +3966,21 @@ def deep_research_ready(live_results: list[dict], candidate_urls_exist: bool) ->
     )
 
 
+def deep_research_synthesis_instruction(shape: dict[str, int]) -> str:
+    """Tell final synthesis how to use a ready deep-research evidence set."""
+    source_count = shape.get("distinct_fetched_domains", 0)
+    return (
+        "The user explicitly requested depth, so the normal short-answer default does not apply. "
+        "Organize several distinct supported developments with their context and significance. "
+        "A multi-paragraph answer is appropriate when the supported developments need it. "
+        f"Base the roundup on the {source_count} independently hosted fetched sources in the current evidence. "
+        "Current office-holder claims require fetched evidence. Use only fetched evidence for current "
+        "office-holders and institutional facts; search snippets do not establish those facts. "
+        "Omit conflicts that cannot be resolved from fetched sources. "
+        "Never mention internal tool names or the research process."
+    )
+
+
 def compact_research_result(name: str, result: dict, *, deep: bool = False) -> dict:
     """Keep staged research evidence useful without flooding Qwen's context."""
     copy = dict(result)
@@ -5982,6 +5997,22 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     await fetch_search_evidence(result)
             if research_calls >= int(profile["max_calls"]):
                 break
+        if profile["mode"] == "deep":
+            candidate_urls_exist = any(
+                item.get("tool") == "web_search"
+                and item.get("status") == "ok"
+                and isinstance(item.get("result"), dict)
+                and research_fetch_candidates(item["result"], set(), set(), 1)
+                for item in live_results
+            )
+            if not deep_research_ready(live_results, candidate_urls_exist):
+                full = "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+                store_provenance(client_id, live_results)
+                await ws.send_json({"type": "trace", "request_id": request_id, "tools": [{"tool": x.get("tool"), "status": x.get("status"), "sources_checked": x.get("result", {}).get("sources_checked", []) if isinstance(x.get("result"), dict) else []} for x in live_results]})
+                await emit_answer(ws, request_id, full, client_id=client_id, origin="deep_research_incomplete")
+                history.append({"role": "assistant", "content": full})
+                await ws.send_json({"type": "done", "request_id": request_id})
+                return
         if live_results:
             post_direct = direct_structured_answer(user_text, live_results)
             if post_direct:
@@ -6079,6 +6110,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if profile["mode"] == "deep":
+            messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(live_results))})
         messages.append({"role": "system", "content": INTERNAL_EVIDENCE_RULE + "\n" + FINAL_SYNTHESIS_RULE})
         full = await stream_final(ws, request_id, messages, guard_user_text=user_text, guard_results=grounding_results, guard_domain=context.get("domain"), research_mode=str(context.get("research_mode") or "quick"))
         record_assistant_response(client_id, full, request_id=request_id, origin="tool_synthesis" if live_results else "general")

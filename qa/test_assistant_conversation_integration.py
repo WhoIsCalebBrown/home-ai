@@ -233,6 +233,7 @@ class FakeToolsBackend:
         self.web_search_fixtures: list[list[dict]] = []
         self.web_fetch_failures: set[str] = set()
         self.web_fetch_final_urls: dict[str, str] = {}
+        self.web_fetch_contents: dict[str, str] = {}
         self.simulate_drift_for: str | None = None
         self.drift_candidate_title: str = ""
         self.drift_candidate_year: str | None = None
@@ -350,7 +351,7 @@ class FakeToolsBackend:
             final_url = self.web_fetch_final_urls.get(url, url)
             return {"tool": name, "status": "ok", "result": {
                 "url": final_url,
-                "content": f"Fixture article body for {final_url}.",
+                "content": self.web_fetch_contents.get(url, f"Fixture article body for {final_url}."),
             }}
         if name == "media_plan_goal":
             goal = str(arguments.get("goal", ""))
@@ -1937,6 +1938,94 @@ async def test_deep_news_model_calls_never_exceed_research_budget(session):
     )
 
     assert len(session.backend.call_log) <= session.app.research_profile(user_text)["max_calls"]
+
+
+@pytest.mark.asyncio
+async def test_deep_news_synthesis_prompt_allows_a_detailed_supported_roundup(session):
+    """Removing the deep synthesis contract must make this prompt check fail."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    session.backend.web_search_fixtures = [
+        [{"title": "Technology policy", "url": "https://policy.example/news", "snippet": "A policy development."}],
+        [{"title": "Research funding", "url": "https://research.example/news", "snippet": "A research development."}],
+        [{"title": "Industry", "url": "https://industry.example/news", "snippet": "An industry development."}],
+    ]
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="The supported developments include policy, research, and industry changes.",
+    )
+
+    assert reply == "The supported developments include policy, research, and industry changes."
+    assert session.last_stream_payload is not None
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "system"
+    )
+    assert "The user explicitly requested depth" in system_text
+    assert "several distinct supported developments" in system_text
+    assert "multi-paragraph" in system_text
+
+
+@pytest.mark.asyncio
+async def test_deep_news_office_holder_prompt_prefers_fetched_evidence_to_a_snippet(session):
+    """A stale snippet must not be eligible evidence for the current holder."""
+    user_text = "Please give me an in-depth review of current Canadian government news."
+    authoritative_url = "https://canada.ca/government/current-holder"
+    session.backend.web_search_fixtures = [
+        [{"title": "Government update", "url": authoritative_url, "snippet": "Snippet Holder is the current office-holder."}],
+        [{"title": "Policy update", "url": "https://parliament.example/policy", "snippet": "Parliamentary context."}],
+        [{"title": "Regional update", "url": "https://regional.example/news", "snippet": "Regional context."}],
+    ]
+    session.backend.web_fetch_contents[authoritative_url] = "Fetched Holder is the current office-holder."
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "current Canadian government news"}}},
+        ]}}],
+        final_text="Fetched Holder is the current office-holder.",
+    )
+
+    assert reply == "Fetched Holder is the current office-holder."
+    assert session.last_stream_payload is not None
+    prompt_text = json.dumps(session.last_stream_payload["messages"])
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "system"
+    )
+    assert "Snippet Holder" in prompt_text and "Fetched Holder" in prompt_text
+    assert "Current office-holder claims require fetched evidence" in system_text
+
+
+@pytest.mark.asyncio
+async def test_deep_news_incomplete_fetched_evidence_returns_limitation_without_synthesis(session):
+    """Removing the readiness gate must make this return the canned model answer."""
+    user_text = "Please give me an in-depth review of Canada's technology news today."
+    fetched_url = "https://policy.example/news"
+    failed_urls = {"https://research.example/news", "https://industry.example/news"}
+    session.backend.web_search_fixtures = [
+        [{"title": "Technology policy", "url": fetched_url, "snippet": "A policy development."}],
+        [{"title": "Research funding", "url": "https://research.example/news", "snippet": "A research development."}],
+        [{"title": "Industry", "url": "https://industry.example/news", "snippet": "An industry development."}],
+    ]
+    session.backend.web_fetch_failures.update(failed_urls)
+
+    reply = await session.turn(
+        user_text,
+        ollama_script=[{"message": {"content": "", "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "Canada technology news"}}},
+        ]}}],
+        final_text="This canned model roundup must not be used.",
+    )
+
+    assert reply == "I couldn't complete a reliable in-depth roundup because I wasn't able to fetch enough independent current sources."
+    assert session.last_stream_payload is None
+    assert len([name for name, _ in session.backend.call_log if name == "web_search"]) == 3
 
 
 # --- Real production transcript replay (UnresolvedSubject / relevance gate) -
