@@ -50,25 +50,31 @@ without leaking diagnostic text into synthesized speech.
 
 ### 1. Compatibility probe
 
-The first implementation step is a no-production-change compatibility probe
-against the pinned Open WebUI version. A small test provider will send
-non-content streaming metadata before a normal final answer. The probe will
-determine whether Open WebUI can render or preserve one of these transient
-status forms without inserting it into the saved assistant message:
+The first implementation step was a no-production-change compatibility probe
+against the pinned Open WebUI version. A small test provider sent non-content
+streaming metadata before a normal final answer. Open WebUI 0.11.3 ignored the
+status metadata and persisted only the final content.
 
-1. A normal OpenAI chat-completion chunk with a namespaced
-   `delta.home_ai_status` object and no `delta.content`.
-2. A provider-supported status or event field already recognized by the pinned
-   Open WebUI release.
+The user selected the maintenance-free fallback: keep the published Open WebUI
+container unchanged and stream an intentionally persistent compact progress log
+as ordinary `delta.content`. Synthetic tool calls, hidden HTML, an Open WebUI
+fork, and a custom frontend extension are excluded.
 
-Synthetic tool calls and hidden HTML are explicitly excluded. They would
-misrepresent backend authority or risk appearing as permanent raw markup.
+The persistent format is a bounded Markdown preamble:
 
-If the pinned release cannot display transient provider metadata, implementation
-will stop at this decision point. The alternatives—an intentionally persistent
-compact progress log or a minimal maintained Open WebUI extension—will be
-presented for approval. The assistant will not silently pollute conversation
-history with `Searching…` text.
+```text
+**Working**
+- Searching recent Canadian headlines…
+- Reading CBC News…
+
+---
+
+<final answer>
+```
+
+The preamble contains at most four distinct major stages. It is part of the
+saved graphical message by explicit user choice, but is removed completely from
+speech.
 
 ### 2. Real response streaming
 
@@ -80,7 +86,7 @@ The stream lifecycle will be:
 
 1. Send the normal assistant role chunk.
 2. Start the assistant turn in a supervised asynchronous task.
-3. Send transient progress events as tools begin and finish.
+3. Send at most four unique progress lines as ordinary content while tools run.
 4. Send the final user-facing answer as content.
 5. Send the normal stop chunk and `[DONE]`.
 
@@ -109,9 +115,11 @@ normalized public hostname or known display domain. Search terms, URL paths,
 query strings, request bodies, tool results, exception text, and credentials
 must never appear in progress events.
 
-Repeated low-value events will be coalesced. Deep research may show a small
-sequence such as `Searching…`, `Reading CBC News…`, and `Comparing 4 sources…`,
-not one line for every internal retry.
+Only started/major-stage events become persisted lines; routine finished events
+are not displayed. Repeated low-value events are coalesced. Deep research may
+show a small sequence such as `Searching…`, `Reading CBC News…`, and
+`Comparing 4 sources…`, not one line for every internal retry. The first line
+opens `**Working**`; the final answer is separated from the preamble by `---`.
 
 ### 4. Rich final trace
 
@@ -164,15 +172,16 @@ not duplicate household-sensitive queries or raw URLs already used internally.
 
 ### 6. Display and speech separation
 
-Progress events are display-only protocol events and never pass through answer
-or audio emitters. The plain spoken answer is captured before the rich trace is
-appended to the Open WebUI display response.
+Progress lines are display-only content and never pass through audio emitters.
+The plain spoken answer is captured separately before the persistent progress
+preamble and rich trace are assembled into the Open WebUI display response.
 
 The existing display-to-speech registry remains the primary way to map a full
-graphical response back to its spoken answer. The fallback sanitizer will use a
-stable server-generated trace marker and remove that marker and everything
-after it, including titles and links. A trace-only speech request returns HTTP
-204 and invokes no synthesizer.
+graphical response back to its spoken answer. The fallback sanitizer removes a
+leading `**Working**` block through its separator, then uses a stable
+server-generated trace marker to remove the final trace and everything after
+it, including titles and links. A progress-only or trace-only speech request
+returns HTTP 204 and invokes no synthesizer.
 
 ### 7. Quiet-news behavior
 
@@ -200,8 +209,8 @@ threshold for current officeholders or other time-sensitive factual claims.
   user-facing error and closes the stream correctly.
 - If a source URL fails display validation, its title/domain may be shown as
   plain text but it cannot become a link.
-- If the Open WebUI compatibility probe fails, no live-progress implementation
-  is shipped until the fallback is explicitly selected.
+- The compatibility probe failed and the user explicitly selected persistent
+  compact progress; no Open WebUI code or container customization is permitted.
 - Source projection is best-effort; absence of a rich trace does not change
   tool authorization or make unsupported claims acceptable.
 
@@ -209,12 +218,12 @@ threshold for current officeholders or other time-sensitive factual claims.
 
 ### Compatibility and streaming
 
-- Verify the pinned Open WebUI renders the chosen status event transiently and
-  does not persist it as assistant content.
+- Verify the pinned Open WebUI renders each compact progress line before the
+  final answer and persists the bounded preamble by design.
 - Block a fake tool and assert the client receives progress before that tool
   completes.
-- Assert progress chunks contain no answer content, raw arguments, or result
-  data.
+- Assert progress chunks contain only the fixed Markdown preamble and safe
+  labels, with no raw arguments or result data.
 - Verify one final answer, one stop chunk, and one `[DONE]` marker.
 - Verify disconnect, timeout, cancellation, and non-streaming behavior.
 

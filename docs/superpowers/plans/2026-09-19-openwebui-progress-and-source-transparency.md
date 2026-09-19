@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stream safe, transient tool progress to Open WebUI, replace opaque tool-name traces with useful verified source links, keep all diagnostics out of speech, and handle quiet Canadian-news periods honestly.
+**Goal:** Stream a safe, compact progress preamble to unchanged Open WebUI, replace opaque tool-name traces with useful verified source links, keep all diagnostics out of speech, and handle quiet Canadian-news periods honestly.
 
-**Architecture:** First prove which transient provider event the pinned Open WebUI release actually renders without persisting it. Then add two focused server-owned boundaries: a pure trace/source projector and a request-scoped progress emitter feeding a bounded SSE queue. The final answer remains ordinary assistant content; progress and rich source diagnostics are display-only, and TTS receives the plain answer captured before the trace is appended.
+**Architecture:** The completed compatibility probe proved Open WebUI 0.11.3 ignores non-content status metadata, so the user selected normal content streaming instead of maintaining an Open WebUI extension. Add two focused server-owned boundaries: a pure trace/source projector and a request-scoped progress emitter feeding a bounded SSE queue. The saved graphical response contains at most four safe progress lines, the final answer, and rich source diagnostics; TTS receives only the separately captured plain answer.
 
 **Tech Stack:** Python 3.12, FastAPI/Starlette, asyncio, httpx, OpenAI-compatible SSE, Open WebUI 0.11.3, pytest, vanilla browser JavaScript, Docker.
 
@@ -20,7 +20,8 @@
 - Limit projected trace output to three sources per search, twelve entries total, and bounded strings/bytes.
 - Non-streaming OpenAI-compatible responses retain their existing response shape.
 - A failed progress event must not fail the tool call or final answer.
-- If the pinned Open WebUI cannot render transient provider metadata without persisting it, stop after Task 1 and ask the user to choose between a minimal Open WebUI extension and permanent compact progress text.
+- Open WebUI remains unchanged: no fork, plugin, custom image, or frontend extension.
+- Progress is ordinary persisted content in a `**Working**` Markdown preamble, limited to four distinct major-stage lines and separated from the final answer by `---`.
 - Run tests through the production-shaped Docker image; host pytest is not available.
 - Do not merge, deploy, or alter Home Assistant/Open WebUI configuration within this plan.
 
@@ -29,7 +30,7 @@
 - A client disconnects while a tool is blocked: the responder is cancelled/drained and no background task or queue remains.
 - A fetched page returns a hostile title or redirect URL: the UI shows bounded text and never creates an unsafe link.
 - A search URL contains tokens, household terms, fragments, or tracking parameters: none appear in progress, trace, logs added by this feature, or speech.
-- Several retries and fetches occur quickly: progress is coalesced and bounded rather than flooding Open WebUI.
+- Several retries and fetches occur quickly: the persisted preamble contains no more than four distinct major-stage lines.
 - Open WebUI sends the rich footer alone to `/v1/audio/speech`: the endpoint returns HTTP 204 and invokes no synthesizer.
 
 ---
@@ -44,7 +45,7 @@
 
 **Interfaces:**
 - Consumes: Open WebUI 0.11.3's configured external OpenAI-provider path and standard `chat.completion.chunk` frames.
-- Produces: a recorded `PASS` contract naming the exact non-content event Open WebUI renders transiently, or a recorded `BLOCKED` result that halts this plan before product code changes.
+- Produces: a recorded `PASS` contract naming the exact non-content event Open WebUI renders transiently, or a recorded `BLOCKED` result that pauses this plan until the user selects a documented fallback. The completed probe recorded `BLOCKED`; the user then selected persisted ordinary content with no Open WebUI customization.
 
 - [ ] **Step 1: Add a deterministic mock SSE provider**
 
@@ -113,6 +114,11 @@ Record the exact request, emitted frames, pinned image digest, observed UI behav
 - Persist compact progress lines in assistant content and accept that they remain in conversation history.
 
 Do not choose automatically.
+
+Recorded decision after the completed probe: the user selected persisted compact
+progress text so the published Open WebUI container remains unchanged. Tasks 2+
+therefore use the revised persistent-preamble contract in Global Constraints and
+Task 4.
 
 - [ ] **Step 6: Commit the probe evidence**
 
@@ -345,7 +351,7 @@ git add assistant/voice-api-app.py assistant/voice-api-index.html \
 git commit -m "feat: show verified sources in tool traces"
 ```
 
-### Task 4: Stream bounded progress before tool completion
+### Task 4: Stream a bounded persistent progress preamble before tool completion
 
 **Files:**
 - Create: `assistant/progress_events.py`
@@ -355,8 +361,8 @@ git commit -m "feat: show verified sources in tool traces"
 - Test: `qa/test_assistant_conversation_integration.py`
 
 **Interfaces:**
-- Consumes: the exact transient status event proven by Task 1.
-- Produces: `progress_sink_context: ContextVar[Callable[[dict], Awaitable[None]] | None]`; `safe_progress_event(tool: str, arguments: dict, phase: str, result: dict | None = None) -> dict | None`; queue-backed OpenAI SSE.
+- Consumes: Task 1's verified result that Open WebUI renders only ordinary content deltas and the user's choice to leave its container unchanged.
+- Produces: `progress_sink_context: ContextVar[Callable[[dict], Awaitable[None]] | None]`; `safe_progress_event(tool: str, arguments: dict, phase: str, result: dict | None = None) -> dict | None`; queue-backed OpenAI SSE whose progress deltas form one `**Working**` preamble with at most four unique lines and a `---` separator before the answer.
 
 - [ ] **Step 1: Write failing progress-label privacy tests**
 
@@ -379,7 +385,7 @@ Add cases for internal URLs, failures, repeated identical events, long hostnames
 
 - [ ] **Step 2: Write a failing timing test for the OpenAI stream**
 
-Use a fake tool blocked on an `asyncio.Event`. Start the ASGI stream, read frames until the proven status event arrives, and assert the tool has not completed. Release the event, then assert exactly one final content answer, one stop, and one `[DONE]`.
+Use a fake tool blocked on an `asyncio.Event`. Start the ASGI stream, read ordinary content frames until `**Working**` and the first safe progress line arrive, and assert the tool has not completed. Release the event, then assert the persisted content is exactly one bounded progress preamble, `---`, one final answer, one stop, and one `[DONE]`.
 
 - [ ] **Step 3: Confirm RED**
 
@@ -396,7 +402,7 @@ Expected: no progress helper and the first chunk remains blocked behind `_openai
 
 - [ ] **Step 4: Implement safe progress mapping and coalescing**
 
-Build labels only from a fixed mapping plus normalized public hostname. Never include query text or raw results. Keep request-local coalescing state that suppresses identical adjacent labels and caps emitted events at 20.
+Build labels only from a fixed mapping plus normalized public hostname. Never include query text or raw results. Keep request-local coalescing state that suppresses duplicates and caps the persisted preamble at four distinct major-stage lines. Emit started/major-stage lines only; do not persist routine finished events.
 
 - [ ] **Step 5: Instrument the common tool boundary**
 
@@ -404,7 +410,7 @@ In `invoke_tool()`, emit a best-effort `started` event immediately before the HT
 
 - [ ] **Step 6: Replace capture-then-stream with a bounded queue**
 
-For `stream=true`, create `asyncio.Queue(maxsize=32)` before starting the responder. Run `_openai_chat_turn()` in a supervised task with the request's progress sink installed. The SSE generator yields the role frame immediately, then proven status frames from the queue, then the final content/stop/DONE frames. On disconnect or cancellation, cancel and await the responder task under `contextlib.suppress(asyncio.CancelledError)`.
+For `stream=true`, create `asyncio.Queue(maxsize=32)` before starting the responder. Run `_openai_chat_turn()` in a supervised task with the request's progress sink installed. On the first safe event, the SSE generator emits ordinary content `**Working**\n`; it then emits at most four `- <label>\n` content deltas. Before final content it emits `\n---\n\n`, followed by the answer/footer content, stop, and DONE frames. On disconnect or cancellation, cancel and await the responder task under `contextlib.suppress(asyncio.CancelledError)`.
 
 - [ ] **Step 7: Preserve the non-streaming path**
 
@@ -412,7 +418,7 @@ Keep `stream=false` using `_openai_chat_turn()` directly. Verify its JSON schema
 
 - [ ] **Step 8: Run timing, disconnect, flood, and existing gateway tests**
 
-Expected: progress arrives before the fake tool completes; disconnect leaves no tasks; 100 repeated tool events produce no more than 20 progress frames; existing session/housekeeping tests pass.
+Expected: progress arrives before the fake tool completes; disconnect leaves no tasks; 100 repeated tool events produce no more than four progress lines; the saved content contains the preamble and separator; existing session/housekeeping tests pass.
 
 - [ ] **Step 9: Commit live progress**
 
@@ -431,22 +437,24 @@ git commit -m "feat: stream safe tool progress to Open WebUI"
 - Test: `assistant/test_openai_gateway.py`
 
 **Interfaces:**
-- Consumes: stable trace marker/footer from Task 3 and transient progress from Task 4.
-- Produces: `remove_openai_tool_trace(text: str) -> str` that strips the marker and everything after it; trace-only TTS requests return 204.
+- Consumes: stable trace marker/footer from Task 3 and persistent `**Working**` preamble from Task 4.
+- Produces: `remove_openai_display_metadata(text: str) -> str` that strips the leading progress block and final trace; progress-only and trace-only TTS requests return 204.
 
 - [ ] **Step 1: Write failing rich-trace speech tests**
 
 ```python
-def test_rich_sources_and_progress_are_never_spoken():
+def test_rich_sources_and_persistent_progress_are_never_spoken():
     displayed = (
+        "**Working**\n- Searching recent Canadian headlines…\n"
+        "- Reading CBC News…\n\n---\n\n"
         "Here is the Canadian roundup.\n\n<!-- home-ai-display-trace -->\n"
         "Research activity\n- Opened CBC News\n"
         "Sources\n- [Canada update](https://cbc.ca/news/update)"
     )
-    assert app.remove_openai_tool_trace(displayed) == "Here is the Canadian roundup."
+    assert app.remove_openai_display_metadata(displayed) == "Here is the Canadian roundup."
 ```
 
-Add endpoint tests proving the registered full display response synthesizes only its plain answer, footer-only and source-only fragments return 204, and transient status events never call the audio emitter.
+Add endpoint tests proving the registered full display response synthesizes only its plain answer; progress-only, footer-only, and source-only fragments return 204; and the graphical preamble never reaches the audio emitter.
 
 - [ ] **Step 2: Confirm RED against the richer footer**
 
@@ -454,7 +462,7 @@ Run the TTS/gateway tests. Expected: the current flattened fallback sanitizer do
 
 - [ ] **Step 3: Implement marker-based fail-closed stripping**
 
-Use the exact generated marker as the primary fallback boundary and retain the legacy footer regex only for old saved messages. Keep the exact display-to-speech registry as the preferred path and retain its bounded lifetime/size behavior.
+Strip a leading `**Working**` block through its `---` separator, then use the exact generated trace marker as the final fallback boundary; retain the legacy footer regex for old saved messages. Keep the exact display-to-speech registry as the preferred path and retain its bounded lifetime/size behavior.
 
 - [ ] **Step 4: Run all TTS normalization and gateway tests**
 
@@ -535,11 +543,11 @@ git commit -m "feat: widen sparse Canadian news research honestly"
 
 - [ ] **Step 1: Extend live QA for streaming order and source safety**
 
-Add an authenticated QA case that records event timestamps and asserts a transient progress event precedes final content. Assert the persisted final message contains the answer and safe rich trace but no transient status, raw query, snippet, private URL, or tool exception.
+Add an authenticated QA case that records event timestamps and asserts the first ordinary progress content precedes final answer content. Assert the persisted final message contains at most four safe progress lines, the separator, answer, and rich trace, but no raw query, snippet, private URL, or tool exception.
 
 - [ ] **Step 2: Add graphical and voice acceptance cases**
 
-Against a disposable Open WebUI instance, verify visible progress while a fake source blocks, clickable fetched-source links after completion, safe handling of a hostile source title, clean page reload, and source-free TTS. Save exact commands and screenshots/observations in the acceptance document.
+Against a disposable unchanged Open WebUI instance, verify visible progress while a fake source blocks, the bounded preamble remains after reload, fetched-source links are clickable, hostile source titles remain safe text, and TTS speaks neither preamble nor sources. Save exact commands and screenshots/observations in the acceptance document.
 
 - [ ] **Step 3: Run focused suites once**
 
