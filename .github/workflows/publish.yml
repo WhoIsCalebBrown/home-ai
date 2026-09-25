@@ -20,17 +20,9 @@ permissions:
 
 jobs:
   images:
-    if: github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || matrix.name == inputs.publish_target
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        include:
-          - name: home-ai-assistant
-            file: assistant/Dockerfile
-          - name: home-ai-tools
-            file: tools/Dockerfile
-          - name: pocket-tts
-            file: pocket/Dockerfile
+      matrix: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.publish_target == 'home-ai-tools' && '[{"name":"home-ai-tools","file":"tools/Dockerfile"}]' || '[{"name":"home-ai-assistant","file":"assistant/Dockerfile"},{"name":"home-ai-tools","file":"tools/Dockerfile"},{"name":"pocket-tts","file":"pocket/Dockerfile"}]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
