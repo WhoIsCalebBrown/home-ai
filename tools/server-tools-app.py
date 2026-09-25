@@ -69,20 +69,11 @@ UNRAID_MCP_URL = os.getenv("UNRAID_MCP_URL", f"{TOWER}:8043/mcp").rstrip("/")
 UNRAID_MCP_TOKEN_FILE = os.getenv("UNRAID_MCP_TOKEN_FILE", "").strip()
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://SearXNG:8080").rstrip("/")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
-# cli_debrid is bound to localhost on the Unraid host.  Home-AI-Tools reaches
-# it through the private voiceai network, never through the host-published port.
-CLIDEBRID_BASE = os.getenv("CLIDEBRID_BASE", "http://cli_debrid:5000/webhook").rstrip("/")
-CLIDEBRID_BRIDGE_TOKEN = os.getenv("CLIDEBRID_BRIDGE_TOKEN", "")
-# Home-AI-Tools mounts the Unraid appdata root at /config; cli_debrid's
-# token lives below its mounted config directory.  Keep the path server-side
-# and fail closed if it is absent or unreadable.
-CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv(
-    "CLIDEBRID_BRIDGE_TOKEN_FILE",
-    "/config/cli_debrid/config/cli_debrid_bridge_token",
-)
-CLIDEBRID_DB_PATH = os.getenv(
-    "CLIDEBRID_DB_PATH",
-    "/config/cli_debrid/db_content/media_items.db",
+# Movie requests and exact-ID status both use the private VPS bridge. There is
+# deliberately no local cli_debrid or local SQLite fallback.
+VPS_CLIDEBRID_BRIDGE_URL = os.getenv("VPS_CLIDEBRID_BRIDGE_URL", "").rstrip("/")
+VPS_CLIDEBRID_BRIDGE_TOKEN_FILE = os.getenv(
+    "VPS_CLIDEBRID_BRIDGE_TOKEN_FILE", "/run/secrets/vps-cli-bridge-token"
 )
 STANDARD_MEDIA_WRITES_ENABLED = os.getenv("STANDARD_MEDIA_WRITES_ENABLED", "false").casefold() == "true"
 STANDARD_MOVIE_WRITES_ENABLED = os.getenv("STANDARD_MOVIE_WRITES_ENABLED", "false").casefold() == "true"
@@ -135,6 +126,7 @@ def validate_qa_configuration() -> None:
             raise RuntimeError("live_readonly cannot configure an executor or state root")
         if any(os.getenv(name, "").strip() for name in (
             "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+            "VPS_CLIDEBRID_BRIDGE_TOKEN_FILE", "VPS_CLIDEBRID_BRIDGE_URL",
             "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_TOKEN_FILE",
         )):
             raise RuntimeError("live_readonly refuses production mutation credentials")
@@ -148,7 +140,10 @@ def validate_qa_configuration() -> None:
         qa_root = Path(QA_STATE_ROOT)
         if not qa_root.is_absolute() or not qa_root.is_dir():
             raise RuntimeError("isolated_execution QA state root must be an existing absolute directory")
-        if any(os.getenv(name, "").strip() for name in ("CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE")):
+        if any(os.getenv(name, "").strip() for name in (
+            "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+            "VPS_CLIDEBRID_BRIDGE_TOKEN_FILE", "VPS_CLIDEBRID_BRIDGE_URL",
+        )):
             raise RuntimeError("isolated_execution refuses production cli_debrid credentials")
 
 
@@ -3314,6 +3309,12 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         canonical_state, storage_class = "NO_CANDIDATE", "unknown"
     elif any(token in state_text for token in ("fail", "error")):
         canonical_state, storage_class = "FAILED", "unknown"
+    elif evidence.get("vps_collected"):
+        replica_paths = evidence.get("replica_paths") or []
+        replicated = any(_vps_catalog_path_replicated(path) for path in replica_paths)
+        evidence["replicated_to_unraid"] = replicated
+        canonical_state = "REPLICATED_NOT_VISIBLE" if replicated else "COLLECTED_NOT_REPLICATED"
+        storage_class = "debrid"
     elif any(token in state_text for token in ("collect", "complete", "downloaded")):
         canonical_state, storage_class = "ACQUIRED_NOT_VISIBLE", "debrid"
     elif any(token in state_text for token in ("check", "verif")):
@@ -3326,6 +3327,8 @@ async def media_status(args: dict[str, Any]) -> dict[str, Any]:
         canonical_state, storage_class = "REQUESTED", "debrid"
     else:
         canonical_state, storage_class = row.get("current_state", "UNKNOWN"), row.get("storage_class", "unknown")
+    if canonical_state == "AVAILABLE" and storage_class == "debrid":
+        canonical_state = "VISIBLE_IN_PLEX_LOCAL"
     return {
         "found": True, "workflow_id": workflow_id, "canonical_identity": identity,
         "mode": row.get("mode", "standard"), "canonical_state": canonical_state,
@@ -3410,10 +3413,8 @@ def _build_cli_debrid_request(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _standard_bridge_secret() -> str:
-    if CLIDEBRID_BRIDGE_TOKEN:
-        return CLIDEBRID_BRIDGE_TOKEN
     try:
-        return Path(CLIDEBRID_BRIDGE_TOKEN_FILE).read_text(encoding="utf-8").strip()
+        return Path(VPS_CLIDEBRID_BRIDGE_TOKEN_FILE).read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError):
         return ""
 
@@ -3459,47 +3460,34 @@ def _build_cli_debrid_overseerr_webhook(args: dict[str, Any], workflow_id: str) 
 
 
 def _cli_debrid_exact_item_evidence(payload: dict[str, Any]) -> dict[str, Any]:
-    """Read-only acknowledgement check; title matching is never used."""
+    """Exact-ID VPS status. Transport/auth/contract errors are never absence."""
     media_id = int(payload["media"]["tmdbId"])
     media_type = str(payload["media"]["media_type"])
     result: dict[str, Any] = {"matched": False, "media_type": media_type, "tmdb_id": media_id, "rows": []}
+    if media_type != "movie":
+        result["error"] = "UNSUPPORTED_MEDIA_TYPE"
+        return result
+    token = _standard_bridge_secret()
+    if not VPS_CLIDEBRID_BRIDGE_URL or not token:
+        result["error"] = "BRIDGE_NOT_CONFIGURED"
+        return result
     try:
-        # The cli_debrid database is mounted read-only in Home-AI-Tools.
-        # SQLite's default connection may try to create a journal; immutable
-        # URI mode makes this an explicitly read-only acknowledgement check.
-        database_uri = f"file:{Path(CLIDEBRID_DB_PATH).as_posix()}?mode=ro&immutable=1"
-        connection = sqlite3.connect(database_uri, uri=True, timeout=1)
-        connection.row_factory = sqlite3.Row
-        if media_type == "movie":
-            type_clause = "type = ?"
-            type_args = ("movie",)
-        else:
-            # The live cli_debrid schema stores TV/anime lifecycle rows as
-            # individual episodes, not type='tv'.  requested_season is a
-            # boolean flag; season_number is the actual scope field.
-            type_clause = "type IN ('episode', 'tv')"
-            type_args = ()
-        rows = connection.execute(
-            "SELECT id, tmdb_id, title, year, state, type, season_number, episode_number, "
-            "requested_season, location_on_disk, plex_verified "
-            f"FROM media_items WHERE tmdb_id = ? AND {type_clause} ORDER BY id DESC LIMIT 200",
-            (media_id, *type_args),
-        ).fetchall()
-        connection.close()
-    except (OSError, sqlite3.Error) as exc:
+        response = httpx.get(
+            f"{VPS_CLIDEBRID_BRIDGE_URL}/v1/movies/{media_id}",
+            headers={"X-Home-AI-Bridge-Token": token, "Accept": "application/json"}, timeout=4.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or data.get("tmdb_id") != media_id or data.get("media_type") != "movie":
+            raise ValueError("bridge response identity mismatch")
+        if data.get("status") not in {"absent", "present"}:
+            raise ValueError("bridge response status invalid")
+        result.update({"matched": data["status"] == "present", "rows": data.get("rows", []),
+                       "vps_collected": bool(data.get("vps_collected")),
+                       "replica_paths": data.get("replica_paths", [])})
+    except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
         result["error"] = type(exc).__name__
         return result
-    result["rows"] = [dict(row) for row in rows]
-    requested_seasons = {int(value) for value in (payload["media"].get("requested_seasons") or [])}
-    if not requested_seasons:
-        result["matched"] = bool(rows)
-        return result
-    # A TV acknowledgement must retain the requested season scope.  The live
-    # schema's season_number is authoritative; do not confuse the separate
-    # requested_season boolean with a season index.
-    scoped_rows = [row for row in rows if row["season_number"] is not None and int(row["season_number"]) in requested_seasons]
-    result["matched"] = bool(scoped_rows)
-    result["scoped_rows"] = [dict(row) for row in scoped_rows]
     return result
 
 
@@ -3507,6 +3495,13 @@ def _cli_debrid_failure_reason(evidence: dict[str, Any]) -> str:
     if evidence.get("error"):
         return "INGESTION_ACK_UNAVAILABLE"
     return "CONTENT_SOURCE_NOT_MATCHED"
+
+
+def _vps_catalog_path_replicated(relative_path: Any) -> bool:
+    """Check only a bridge-approved relative symlink path in the Unraid replica."""
+    if not isinstance(relative_path, str) or not relative_path.startswith("/") or ".." in Path(relative_path).parts:
+        return False
+    return (Path("/mnt/user/data/symlinked") / relative_path.lstrip("/")).is_symlink()
 
 
 def _standard_binding_hash(args: dict[str, Any]) -> str:
@@ -3761,23 +3756,35 @@ async def _media_standard_request_locked(args: dict[str, Any]) -> dict[str, Any]
     response_body: dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=12, headers=headers) as client:
         try:
-            response = await client.post(f"{CLIDEBRID_BASE}/", json=webhook_payload)
+            if not VPS_CLIDEBRID_BRIDGE_URL:
+                raise RuntimeError("VPS cli_debrid bridge URL is not configured")
+            response = await client.post(f"{VPS_CLIDEBRID_BRIDGE_URL}/v1/requests", json=webhook_payload)
             response.raise_for_status()
             response_body = response.json() if response.content else {}
             transport_success = True
         except Exception as exc:
+            # A timeout after POST is ambiguous. Reconcile by exact TMDB ID;
+            # never blindly repeat a request that may have reached the VPS.
+            reconciled = _cli_debrid_exact_item_evidence(webhook_payload)
             _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
-            workflow.update({"canonical_state": "FAILED_INGESTION",
-                             "current_state": "FAILED_INGESTION", "failure_reason": "BRIDGE_UNAVAILABLE",
-                             "last_attempt": {"route": "cli_debrid_webhook", "transport_success": False,
-                                               "ingestion_confirmed": False, "error": type(exc).__name__,
+            outcome_state = "QUEUED" if reconciled.get("matched") else "REQUEST_OUTCOME_UNKNOWN"
+            workflow.update({"canonical_state": outcome_state,
+                             "current_state": outcome_state, "failure_reason": None if reconciled.get("matched") else "BRIDGE_UNAVAILABLE",
+                             "last_attempt": {"route": "vps_cli_debrid_bridge", "transport_success": False,
+                                               "ingestion_confirmed": bool(reconciled.get("matched")),
+                                               "reconciled": bool(reconciled.get("matched")),
+                                               "error": type(exc).__name__,
                                                "request_shape": payload, "attempted_at": now()}})
             _save_workflow_update(rows, workflow)
-            log_event_safe(workflow_id=workflow_id, event_type="FAILED", canonical_subject_id=_subject_key or None,
+            log_event_safe(workflow_id=workflow_id,
+                            event_type="REQUEST_RECONCILED" if reconciled.get("matched") else "REQUEST_OUTCOME_UNKNOWN",
+                            canonical_subject_id=_subject_key or None,
                             source_service="cli_debrid", event_detail="BRIDGE_UNAVAILABLE")
-            return {"status": "unavailable", "reason": "BRIDGE_UNAVAILABLE",
-                    "write_executed": False, "submission_transport_success": False,
-                    "ingestion_confirmed": False, "workflow_id": workflow_id,
+            return {"status": "submitted" if reconciled.get("matched") else "unavailable",
+                    "reason": "SUBMISSION_RECONCILED" if reconciled.get("matched") else "SUBMISSION_OUTCOME_UNKNOWN",
+                    "write_executed": bool(reconciled.get("matched")), "submission_transport_success": False,
+                    "ingestion_confirmed": bool(reconciled.get("matched")), "retry_safe": False,
+                    "workflow_id": workflow_id,
                     "error_type": type(exc).__name__, "request_shape": payload}
     # The supported webhook returns transport success, not ownership proof.
     # Confirm exact canonical persistence from cli_debrid's read-only database
@@ -3785,27 +3792,30 @@ async def _media_standard_request_locked(args: dict[str, Any]) -> dict[str, Any]
     evidence = _cli_debrid_exact_item_evidence(webhook_payload)
     if not evidence.get("matched"):
         _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
-        workflow.update({"current_state": "FAILED_INGESTION",
-                         "canonical_state": "FAILED_INGESTION", "storage_class": "unknown",
-                         "failure_reason": _cli_debrid_failure_reason(evidence),
+        # A successful webhook response is acceptance, not proof that its
+        # asynchronous worker has persisted the exact row yet. Do not expose
+        # that lag as failure or make the confirmation reusable.
+        workflow.update({"current_state": "REQUEST_ACCEPTED",
+                         "canonical_state": "REQUEST_ACCEPTED", "storage_class": "debrid",
+                         "failure_reason": None,
                          "standard_library": storage_policy["standard"]["library"],
                          "request_shape": payload, "request_response": response_body,
-                         "last_attempt": {"route": "cli_debrid_webhook", "transport_success": transport_success,
+                         "last_attempt": {"route": "vps_cli_debrid_bridge", "transport_success": transport_success,
                                            "ingestion_confirmed": False, "failure_reason": _cli_debrid_failure_reason(evidence),
                                            "evidence": evidence, "request_shape": payload, "attempted_at": now()}})
         _save_workflow_update(rows, workflow)
-        log_event_safe(workflow_id=workflow_id, event_type="FAILED", canonical_subject_id=_subject_key or None,
+        log_event_safe(workflow_id=workflow_id, event_type="REQUEST_ACCEPTED", canonical_subject_id=_subject_key or None,
                         source_service="cli_debrid", event_detail=_cli_debrid_failure_reason(evidence))
-        return {"status": "failed_ingestion", "write_executed": True,
+        return {"status": "accepted", "write_executed": True,
                 "submission_transport_success": transport_success, "ingestion_confirmed": False,
-                "reason": _cli_debrid_failure_reason(evidence), "workflow_id": workflow_id,
+                "reason": "UPSTREAM_ACCEPTED_STATUS_PENDING", "retry_safe": False, "workflow_id": workflow_id,
                 "request_shape": payload, "response": response_body}
     _set_workflow_confirmation_status(workflow, str(binding["confirmation_id"]), "CONSUMED")
-    workflow.update({"current_state": "REQUESTED", "canonical_state": "REQUESTED",
+    workflow.update({"current_state": "QUEUED", "canonical_state": "QUEUED",
                      "storage_class": "debrid", "standard_library": storage_policy["standard"]["library"],
                      "cli_debrid_state": "Wanted", "submitted_at": now(), "request_shape": payload,
                      "request_response": response_body,
-                     "last_attempt": {"route": "cli_debrid_webhook", "transport_success": transport_success,
+                     "last_attempt": {"route": "vps_cli_debrid_bridge", "transport_success": transport_success,
                                        "ingestion_confirmed": True, "evidence": evidence, "request_shape": payload,
                                        "attempted_at": now()}})
     _save_workflow_update(rows, workflow)

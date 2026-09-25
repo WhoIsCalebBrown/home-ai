@@ -2,6 +2,13 @@ name: Publish Home AI images
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_target:
+        description: Publish one image or all images
+        type: choice
+        options: [home-ai-tools, all]
+        default: home-ai-tools
+        required: true
   push:
     branches: [main]
     tags: ['v*.*.*']
@@ -13,6 +20,7 @@ permissions:
 
 jobs:
   images:
+    if: github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || matrix.name == inputs.publish_target
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -55,7 +63,7 @@ jobs:
         run: |
           python -m py_compile tools/server-tools-app.py
           python -m pip install --disable-pip-version-check pytest-asyncio==0.24.0
-          python -m pytest -q -o asyncio_mode=auto tools/test_capability_discovery.py tools/test_canonical_identity.py tools/test_workflow_events.py tools/test_media_workflow_integration.py tools/test_tools_boundary_contract.py qa --ignore=qa/test_assistant_conversation_integration.py
+          python -m pytest -q -o asyncio_mode=auto tools/test_capability_discovery.py tools/test_canonical_identity.py tools/test_workflow_events.py tools/test_media_workflow_integration.py tools/test_tools_boundary_contract.py tools/test_vps_cli_bridge.py qa --ignore=qa/test_assistant_conversation_integration.py
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:
