@@ -38,6 +38,7 @@ def _load_app(tmp_path):
     module.STANDARD_MEDIA_WRITES_ENABLED = True
     module.STANDARD_MOVIE_WRITES_ENABLED = True
     module.STANDARD_SEASON_WRITES_ENABLED = True
+    module.VPS_CLIDEBRID_BRIDGE_URL = "http://fake-vps-bridge"
     module._standard_bridge_secret = lambda: "fake-test-token"
 
     async def fake_radarr_search(args):

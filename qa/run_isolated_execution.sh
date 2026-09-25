@@ -32,7 +32,6 @@ docker run --rm --name home-ai-tools-isolated \
   -e MEDIA_WORKFLOWS_PATH=/qa-state/media-workflows.json \
   -e LISTS_PATH=/qa-state/home-ai-lists.json \
   -e USER_PROFILE_PATH=/qa-state/user-profile.json \
-  -e CLIDEBRID_BASE=http://127.0.0.1:9/forbidden \
-  -e CLIDEBRID_BRIDGE_TOKEN= \
-  -e CLIDEBRID_BRIDGE_TOKEN_FILE= \
+  -e VPS_CLIDEBRID_BRIDGE_URL= \
+  -e VPS_CLIDEBRID_BRIDGE_TOKEN_FILE= \
   "$HOME_AI_TOOLS_IMAGE"

@@ -400,46 +400,45 @@ def test_cli_debrid_season_webhook_preserves_exact_scope():
     assert payload["extra"] == [{"name": "Requested Seasons", "value": "2,2"}]
 
 
-def test_cli_debrid_ingestion_ack_uses_tmdb_not_title(monkeypatch, tmp_path):
-    import sqlite3
-    db = tmp_path / "media_items.db"
-    connection = sqlite3.connect(db)
-    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
-    connection.execute("insert into media_items values (1, 999, 'The Hobbit', 2012, 'Collected', 'movie', null, null, null, '/data/symlinked/Movies', 1)")
-    connection.commit(); connection.close()
-    monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
+def test_vps_bridge_exact_tmdb_absence_not_title_match(monkeypatch):
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"tmdb_id": 1362, "media_type": "movie", "status": "absent", "rows": []}
+    monkeypatch.setattr(module, "VPS_CLIDEBRID_BRIDGE_URL", "http://private-bridge")
+    monkeypatch.setattr(module, "_standard_bridge_secret", lambda: "unit-test-secret")
+    monkeypatch.setattr(module.httpx, "get", lambda *a, **k: Response())
     payload = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
     evidence = module._cli_debrid_exact_item_evidence(payload)
     assert evidence["matched"] is False
     assert module._cli_debrid_failure_reason(evidence) == "CONTENT_SOURCE_NOT_MATCHED"
 
 
-def test_cli_debrid_true_ingestion_ack_is_exact_tmdb(monkeypatch, tmp_path):
-    import sqlite3
-    db = tmp_path / "media_items.db"
-    connection = sqlite3.connect(db)
-    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
-    connection.execute("insert into media_items values (2, 1362, 'The Hobbit', 1977, 'Wanted', 'movie', null, null, null, null, 0)")
-    connection.commit(); connection.close()
-    monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
+def test_vps_bridge_exact_tmdb_in_progress_duplicate(monkeypatch):
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"tmdb_id": 1362, "media_type": "movie", "status": "present",
+                               "vps_collected": False, "rows": [{"state": "Wanted"}]}
+    monkeypatch.setattr(module, "VPS_CLIDEBRID_BRIDGE_URL", "http://private-bridge")
+    monkeypatch.setattr(module, "_standard_bridge_secret", lambda: "unit-test-secret")
+    monkeypatch.setattr(module.httpx, "get", lambda *a, **k: Response())
     payload = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
     assert module._cli_debrid_exact_item_evidence(payload)["matched"] is True
 
 
-def test_cli_debrid_true_season_ack_uses_live_episode_schema_and_scope(monkeypatch, tmp_path):
-    import sqlite3
-    db = tmp_path / "media_items.db"
-    connection = sqlite3.connect(db)
-    connection.execute("create table media_items (id integer, tmdb_id integer, title text, year integer, state text, type text, season_number integer, episode_number integer, requested_season integer, location_on_disk text, plex_verified integer)")
-    connection.execute("insert into media_items values (3, 95396, 'Severance', 2022, 'Wanted', 'episode', 2, 8, 0, null, 0)")
-    connection.commit(); connection.close()
-    monkeypatch.setattr(module, "CLIDEBRID_DB_PATH", str(db))
+def test_vps_bridge_network_and_auth_failures_are_unknown(monkeypatch):
+    class Response:
+        def raise_for_status(self): raise module.httpx.HTTPStatusError("denied", request=None, response=None)
+    monkeypatch.setattr(module, "VPS_CLIDEBRID_BRIDGE_URL", "http://private-bridge")
+    monkeypatch.setattr(module, "_standard_bridge_secret", lambda: "unit-test-secret")
+    monkeypatch.setattr(module.httpx, "get", lambda *a, **k: Response())
     payload = module._build_cli_debrid_overseerr_webhook(
         {"media_type": "tv", "canonical_external_id": 95396, "season_scope": [2]}, "wf-severance"
     )
     evidence = module._cli_debrid_exact_item_evidence(payload)
-    assert evidence["matched"] is True
-    assert evidence["scoped_rows"][0]["season_number"] == 2
+    assert evidence["matched"] is False and evidence["error"] == "UNSUPPORTED_MEDIA_TYPE"
+    movie = module._build_cli_debrid_overseerr_webhook({"media_type": "movie", "canonical_external_id": 1362}, "wf")
+    failed = module._cli_debrid_exact_item_evidence(movie)
+    assert failed["matched"] is False and failed["error"] == "HTTPStatusError"
 
 
 def test_media_status_uses_live_provider_state_and_does_not_trust_stale_workflow(monkeypatch, tmp_path):
@@ -536,7 +535,7 @@ def test_media_status_preserves_exact_plex_availability_when_provider_read_fails
     monkeypatch.setattr(module, "plex_match_canonical_media", plex)
     monkeypatch.setattr(module, "_cli_debrid_exact_item_evidence", lambda _: {"error": "database unavailable", "rows": []})
     result = asyncio.run(module.media_status({"workflow_id": "wf-visible"}))
-    assert result["canonical_state"] == "AVAILABLE"
+    assert result["canonical_state"] == "VISIBLE_IN_PLEX_LOCAL"
     assert result["storage_class"] == "debrid"
     assert result["status_reason"] == "CLI_DEBRID_READ_FAILED"
 

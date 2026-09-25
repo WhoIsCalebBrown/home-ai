@@ -141,6 +141,7 @@ def _qa_startup(tmp_path, **settings):
         "HOME_AI_QA_MODE", "HOME_AI_QA_EXECUTOR", "HOME_AI_QA_STATE_ROOT",
         "HOME_AI_CAMERA_READS_ENABLED",
         "CLIDEBRID_BRIDGE_TOKEN", "CLIDEBRID_BRIDGE_TOKEN_FILE",
+        "VPS_CLIDEBRID_BRIDGE_URL", "VPS_CLIDEBRID_BRIDGE_TOKEN_FILE",
         "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_TOKEN_FILE",
     ):
         env.pop(name, None)
@@ -173,6 +174,10 @@ def test_isolated_mode_startup_is_fail_closed(tmp_path):
          "HOME_AI_QA_STATE_ROOT": tmp_path / "missing"},
         {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_EXECUTOR": "fake",
          "HOME_AI_QA_STATE_ROOT": valid_root, "CLIDEBRID_BRIDGE_TOKEN": "must-refuse"},
+        {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_EXECUTOR": "fake",
+         "HOME_AI_QA_STATE_ROOT": valid_root, "VPS_CLIDEBRID_BRIDGE_TOKEN_FILE": "/run/secrets/production-bridge"},
+        {"HOME_AI_QA_MODE": "isolated_execution", "HOME_AI_QA_EXECUTOR": "fake",
+         "HOME_AI_QA_STATE_ROOT": valid_root, "VPS_CLIDEBRID_BRIDGE_URL": "http://production-bridge"},
     )
     for settings in cases:
         result = _qa_startup(tmp_path, **settings)
@@ -189,6 +194,8 @@ def test_live_readonly_mode_refuses_mutation_credentials(tmp_path):
     for settings in (
         {"CLIDEBRID_BRIDGE_TOKEN": "must-refuse"},
         {"CLIDEBRID_BRIDGE_TOKEN_FILE": "/run/secrets/production-bridge"},
+        {"VPS_CLIDEBRID_BRIDGE_TOKEN_FILE": "/run/secrets/production-bridge"},
+        {"VPS_CLIDEBRID_BRIDGE_URL": "http://production-bridge"},
         {"HOME_ASSISTANT_TOKEN": "must-refuse"},
         {"HOME_ASSISTANT_TOKEN_FILE": "/run/secrets/production-home"},
     ):

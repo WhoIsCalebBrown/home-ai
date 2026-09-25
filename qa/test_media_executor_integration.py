@@ -3,7 +3,7 @@
 These tests import the production Home-AI-Tools module and exercise its planner,
 confirmation binding, storage guard, idempotency check, and ingestion
 acknowledgement logic.  The only replaced boundary is the outbound cli_debrid
-HTTP call and the read-only provider/Plex observations.  No production network,
+HTTP call and the read-only provider/Plex observations. No production network,
 database, filesystem, or media service is reachable from the QA container.
 """
 
@@ -57,8 +57,7 @@ def _configure(module, tmp_path, evidence):
     module.STANDARD_MEDIA_WRITES_ENABLED = True
     module.STANDARD_MOVIE_WRITES_ENABLED = True
     module.STANDARD_SEASON_WRITES_ENABLED = True
-    module.CLIDEBRID_BASE = "http://fake-cli-debrid/webhook"
-    module.CLIDEBRID_BRIDGE_TOKEN = "qa-only-token"
+    module.VPS_CLIDEBRID_BRIDGE_URL = "http://fake-vps-bridge"
     module._standard_bridge_secret = lambda: "qa-only-token"
     module.httpx.AsyncClient = RecordingAsyncClient
     module._cli_debrid_exact_item_evidence = lambda payload: evidence.pop(0)
@@ -110,14 +109,14 @@ def test_real_executor_confirms_ingestion_and_is_idempotent(tmp_path, monkeypatc
     assert result["ingestion_confirmed"] is True
     assert len(RecordingAsyncClient.posts) == 1
     request = RecordingAsyncClient.posts[0]
-    assert request["url"] == "http://fake-cli-debrid/webhook/"
+    assert request["url"] == "http://fake-vps-bridge/v1/requests"
     assert request["json"]["media"]["media_type"] == "movie"
     assert request["json"]["media"]["tmdbId"] == 8467
     assert request["json"]["request"]["requestedBy_username"] == "Home-AI"
     assert "token" not in json.dumps(request["json"]).casefold()
 
     workflow = module._workflow_for_id(plan["workflow_id"])[1]
-    assert workflow["canonical_state"] == "REQUESTED"
+    assert workflow["canonical_state"] == "QUEUED"
     assert workflow["confirmation_status"] == "CONSUMED"
 
     # A consumed confirmation cannot be replayed into a second webhook.
@@ -127,7 +126,7 @@ def test_real_executor_confirms_ingestion_and_is_idempotent(tmp_path, monkeypatc
     assert len(RecordingAsyncClient.posts) == 1
 
 
-def test_http_success_without_exact_persistence_is_failed_ingestion(tmp_path):
+def test_http_success_without_exact_persistence_is_accepted_pending_status(tmp_path):
     module = _load_tools()
     evidence = [
         {"matched": False, "media_type": "movie", "tmdb_id": 8467, "rows": []},
@@ -138,31 +137,32 @@ def test_http_success_without_exact_persistence_is_failed_ingestion(tmp_path):
 
     result = asyncio.run(module.media_standard_request(args))
 
-    assert result["status"] == "failed_ingestion"
+    assert result["status"] == "accepted"
     assert result["submission_transport_success"] is True
     assert result["ingestion_confirmed"] is False
-    assert result["reason"] == "CONTENT_SOURCE_NOT_MATCHED"
+    assert result["reason"] == "UPSTREAM_ACCEPTED_STATUS_PENDING"
+    assert result["retry_safe"] is False
     assert len(RecordingAsyncClient.posts) == 1
     workflow = module._workflow_for_id(plan["workflow_id"])[1]
-    assert workflow["canonical_state"] == "FAILED_INGESTION"
+    assert workflow["canonical_state"] == "REQUEST_ACCEPTED"
     assert workflow["confirmation_status"] == "CONSUMED"
 
 
 def test_bridge_transport_failure_returns_structured_unavailable_and_consumes_approval(tmp_path):
     module = _load_tools()
-    _configure(module, tmp_path, [{"matched": False, "rows": []}])
+    _configure(module, tmp_path, [{"matched": False, "rows": []}, {"matched": False, "rows": []}])
     module.httpx.AsyncClient = FailingAsyncClient
     plan, record, args = _plan_and_bound_args(module)
 
     result = asyncio.run(module.media_standard_request(args))
 
     assert result["status"] == "unavailable"
-    assert result["reason"] == "BRIDGE_UNAVAILABLE"
+    assert result["reason"] == "SUBMISSION_OUTCOME_UNKNOWN"
     assert result["submission_transport_success"] is False
     assert result["ingestion_confirmed"] is False
     assert result["write_executed"] is False
     workflow = module._workflow_for_id(plan["workflow_id"])[1]
-    assert workflow["canonical_state"] == "FAILED_INGESTION"
+    assert workflow["canonical_state"] == "REQUEST_OUTCOME_UNKNOWN"
     assert workflow["failure_reason"] == "BRIDGE_UNAVAILABLE"
     assert workflow["confirmation_status"] == "CONSUMED"
 
