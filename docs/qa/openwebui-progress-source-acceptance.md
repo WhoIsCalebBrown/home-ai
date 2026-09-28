@@ -1,13 +1,14 @@
 # Open WebUI progress and source transparency acceptance
 
-Date: 2026-09-19
+Date: 2026-09-19<br>
+Last verified: 2026-09-28
 
-## Disposable, unchanged-client scope
+## Disposable, supported-filter scope
 
 The acceptance uses only a new Docker network and data directory. The client is
-the unchanged pinned image below. It does not attach to production Open WebUI,
-Home Assistant, voiceai, or a production provider, and it does not modify any
-deployment or configuration.
+the unchanged pinned image below plus the Home-AI outlet filter installed
+through Open WebUI's supported admin API. It does not attach to production Open
+WebUI, Home Assistant, voiceai, or a production provider.
 
 ~~~text
 ghcr.io/open-webui/open-webui@sha256:41daa0cf2561a5d4c8d1ff31ee2a98d93ab4d3ac2605cac69366ff6a3374a933
@@ -79,8 +80,9 @@ does not rely on deleted temporary-file hashes.
 The script fails unless all of these hold in the assistant DOM:
 
 - ordinary Working/progress is visible before the delayed final response;
-- the completed and reloaded messages retain one through four safe preamble
-  lines and a rendered separator;
+- the completed and reloaded messages contain no Working preamble or private
+  `home-ai-display-trace` marker;
+- the completed message retains the rendered separator before Research activity;
 - final answer precedes Research activity;
 - exactly one visible, enabled source anchor has href https://example.com/news;
 - the projected hostile title's `Unsafe title witness` prefix is visible as
@@ -105,11 +107,11 @@ The completed browser invocation returned:
   "fixture_delay_ms": 3000,
   "early_progress_visible": true,
   "early_final_visible": false,
-  "early_elapsed_ms": 487,
+  "early_elapsed_ms": 457,
   "live_speech_silent_count": 5,
-  "completed_progress_line_count": 2,
-  "final_elapsed_ms": 3413,
-  "reloaded_progress_line_count": 2,
+  "completed_progress_line_count": 0,
+  "final_elapsed_ms": 3366,
+  "reloaded_progress_line_count": 0,
   "speech": {
     "punctuation": {"silent": 13, "spoken": 1},
     "paragraphs": {"silent": 39, "spoken": 1},
@@ -138,9 +140,9 @@ before the disposable UI and its data were removed:
 
 | Screenshot | SHA-256 |
 | --- | --- |
-| progress-visible-before-source-completes.png | b57f2278a0071f280679b1296bda1f924ad447eda8695b82da84940fa7aa205d |
-| progress-source-final.png | be0c9234b6b2124efc2695be4417d29fedce580e3ab49235b44d1e9f2b5aa161 |
-| progress-source-reload.png | 14e04c5cde4164981207a254a669819606a24e52bb8c65f87c537b00771ca200 |
+| progress-visible-before-source-completes.png | 07ed887d4625a2ee65d15026550a6f01c8115c40b68fd1e38924c51df1a758c0 |
+| progress-source-final.png | 61a4ecd3323bfb0f376eaff4af248475be062287047a04883c0c4c2c532bc6bf |
+| progress-source-reload.png | 156eb6eeb68430d3d3b4b8e159ed2205512ea15b1e6e4c77fed27ae68d334537 |
 
 The fragment registry retains the existing 15-minute lifetime and 256-display
 capacity. An expired or pre-restart isolated plain source title has no

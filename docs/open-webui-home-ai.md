@@ -29,16 +29,15 @@ The model is `home-ai`; requests are translated into the existing
 backends, or Home-AI Tools directly.
 
 `stream=true` is supported as an OpenAI-compatible SSE response. Before a
-tool-backed final answer, the Assistant can emit an ordinary persisted Markdown
+tool-backed final answer, the Assistant emits an ordinary Markdown
 `**Working**` preamble with no more than four distinct safe major-stage lines.
 It then emits `---`, the answer, and the server-owned rich source trace. This
-is deliberately not token-level streaming. The preamble remains in the saved
-Open WebUI conversation by design. The bounded speech registry removes it and
-the source trace from current messages, including the pinned client's stripped
-and split Read Aloud inputs. Isolated plain fragments from history after the
-registry's 15-minute lifetime or a server restart lack that provenance; the
-[acceptance evidence](qa/openwebui-progress-source-acceptance.md) records this
-limit and the complete-footer fallback.
+is deliberately not token-level streaming. The supported Open WebUI filter in
+`deployment/open-webui/home_ai_transient_progress.py` leaves that preamble
+visible while the stream is active, removes it from the completed and persisted
+message, and prevents the private display/speech trace marker from rendering.
+The research trace remains visible. The bounded speech registry still removes
+all display-only metadata from speech as a defense-in-depth boundary.
 
 ## Transient-status compatibility gate (BLOCKED)
 
@@ -50,6 +49,11 @@ answer.` after reload, so this event shape is **not** a proven transient status
 contract. Do not ship live progress based on it. See
 `docs/qa/openwebui-status-probe.md` for the pinned digest, frames, and required
 approval alternatives.
+
+The blocked custom-delta event is not used by the current implementation.
+Open WebUI 0.11.3's supported active outlet-filter hook replaces the assembled
+message after streaming and emits `chat:outlet` so the browser and persisted
+chat converge on the cleaned content without patching the Open WebUI image.
 
 ## Session mapping
 
@@ -100,6 +104,8 @@ for example `esp32:kitchen`, unless an explicit continuation is requested.
 - Home-AI gateway key: `/mnt/cache/appdata/home-ai/secrets/openai-compat.key`
 - Open WebUI encryption key: `/mnt/cache/appdata/home-ai/open-webui/.webui-secret`
 - Template: `deployment/Open-WebUI.xml`
+- Active function: `home_ai_transient_progress` from
+  `deployment/open-webui/home_ai_transient_progress.py`
 
 The server-side Assistant key is read from a private mounted file. No key is
 logged or included in Qwen context. The Open WebUI container receives only the
