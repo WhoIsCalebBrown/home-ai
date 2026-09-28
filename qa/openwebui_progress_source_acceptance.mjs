@@ -19,6 +19,10 @@ const SAFE_URL = "https://example.com/news";
 const HOSTILE_TITLE_WITNESS = "Unsafe title witness";
 const PROMPT = "Show the QA fixture for household-private-query.";
 const SAFE_PROGRESS = ["Searching the web…", "Reading example.com…"];
+const TRANSIENT_PROGRESS_FILTER = fs.readFileSync(path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  "../deployment/open-webui/home_ai_transient_progress.py",
+), "utf8");
 const FORBIDDEN = [
   "household-private-query", "private-source.invalid", "raw fixture snippet",
   "fixture-token-9f1c", "tool exception fixture", "traceback", "127.0.0.1",
@@ -64,6 +68,27 @@ async function authenticate(page, baseUrl, email, password) {
   await page.locator("button[aria-label*=Selected]").waitFor();
 }
 
+async function installTransientProgressFilter(page) {
+  const result = await page.evaluate(async source => {
+    const headers = { "Content-Type": "application/json" };
+    const create = await fetch("/api/v1/functions/create", {
+      method: "POST", headers, body: JSON.stringify({
+        id: "home_ai_transient_progress",
+        name: "Home-AI Transient Progress",
+        content: source,
+        meta: { description: "Keep Home-AI progress transient and hide its private trace marker." },
+      }),
+    });
+    if (!create.ok) return { stage: "create", status: create.status, body: await create.text() };
+    const active = await fetch("/api/v1/functions/id/home_ai_transient_progress/toggle", { method: "POST" });
+    if (!active.ok) return { stage: "activate", status: active.status, body: await active.text() };
+    const global = await fetch("/api/v1/functions/id/home_ai_transient_progress/toggle/global", { method: "POST" });
+    if (!global.ok) return { stage: "global", status: global.status, body: await global.text() };
+    return { ok: true };
+  }, TRANSIENT_PROGRESS_FILTER);
+  assert(result.ok, `filter ${result.stage} failed (${result.status}): ${result.body}`);
+}
+
 async function completedAssistantDom(page) {
   return page.evaluate(({ finalAnswer, safeUrl }) => {
     const safeSelector = 'a[href="' + safeUrl + '"]';
@@ -88,6 +113,19 @@ async function completedAssistantDom(page) {
   }, { finalAnswer: FINAL_ANSWER, safeUrl: SAFE_URL });
 }
 
+async function waitForCompletedCleanup(page) {
+  await page.waitForFunction(({ finalAnswer, safeUrl }) => {
+    const candidates = [...document.querySelectorAll("div")]
+      .filter(node => node.innerText?.includes(finalAnswer)
+        && node.querySelector(`a[href="${safeUrl}"]`))
+      .sort((left, right) => left.innerText.length - right.innerText.length);
+    const text = candidates[0]?.innerText || "";
+    return text.includes(finalAnswer)
+      && !text.includes("Working")
+      && !text.includes("home-ai-display-trace");
+  }, { finalAnswer: FINAL_ANSWER, safeUrl: SAFE_URL }, { timeout: 10000 });
+}
+
 function checkCompletedDom(snapshot, phase) {
   assert(snapshot, phase + ": could not locate completed assistant message");
   const answerIndex = snapshot.text.indexOf(FINAL_ANSWER);
@@ -102,6 +140,8 @@ function checkCompletedDom(snapshot, phase) {
   assert(snapshot.injected_node_count === 0, phase + ": hostile title created injected node");
   assert(snapshot.text.includes(HOSTILE_TITLE_WITNESS),
     phase + ": sanitized hostile-title witness was not visible as inert text");
+  assert(!snapshot.text.includes("Working"), phase + ": completed progress remained visible");
+  assert(!snapshot.text.includes("home-ai-display-trace"), phase + ": private trace marker remained visible");
   assert(!FORBIDDEN.some(value => snapshot.text.includes(value)), phase + ": raw fixture data leaked");
 }
 
@@ -123,6 +163,7 @@ async function main() {
   const result = { base_url: baseUrl, fixture_delay_ms: 3000 };
   try {
     await authenticate(page, baseUrl, email, password);
+    await installTransientProgressFilter(page);
     const headers = { Authorization: "Bearer progress-source-fixture-key", "Content-Type": "application/json" };
     const sourceMap = await (await fetch(baseUrl + PINNED_UTILS_MAP)).json();
     const getMessageContentParts = pinnedSpeechProcessor(sourceMap);
@@ -152,11 +193,12 @@ async function main() {
     }
 
     await page.getByText(FINAL_ANSWER, { exact: true }).waitFor();
+    await waitForCompletedCleanup(page);
     const completed = await completedAssistantDom(page);
     checkCompletedDom(completed, "completed");
     result.completed_progress_line_count = progressLineCount(completed.text);
-    assert(result.completed_progress_line_count >= 1 && result.completed_progress_line_count <= 4,
-      "completed: persisted preamble must contain one through four safe lines");
+    assert(result.completed_progress_line_count === 0,
+      "completed: progress must disappear after the final answer arrives");
     result.final_elapsed_ms = Math.round(performance.now() - started);
     await page.screenshot({ path: path.join(artifactsDir, "progress-source-final.png"), fullPage: true });
 
@@ -165,8 +207,8 @@ async function main() {
     const reloaded = await completedAssistantDom(page);
     checkCompletedDom(reloaded, "reload");
     result.reloaded_progress_line_count = progressLineCount(reloaded.text);
-    assert(result.reloaded_progress_line_count >= 1 && result.reloaded_progress_line_count <= 4,
-      "reload: persisted preamble must contain one through four safe lines");
+    assert(result.reloaded_progress_line_count === 0,
+      "reload: progress must not be persisted in the completed message");
     await page.screenshot({ path: path.join(artifactsDir, "progress-source-reload.png"), fullPage: true });
     const evidence = await (await fetch(providerUrl + "/qa/evidence", { headers })).json();
     result.speech = {};
