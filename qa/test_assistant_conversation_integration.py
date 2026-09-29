@@ -1826,9 +1826,22 @@ async def test_yesterday_news_uses_dated_news_research_instead_of_general_homepa
     """Replay the production wording that returned only CBC/CNN/CTV roots."""
     first_url = "https://publisher-one.example/news/story-one"
     second_url = "https://publisher-two.example/world/story-two"
+    landing_urls = {
+        "https://ottawacitizen.com/category/news/",
+        "https://calgaryherald.com/category/news/",
+        "https://edmontonjournal.com/category/news/",
+    }
     session.backend.web_search_fixtures = [
-        [{"title": "First dated story", "url": first_url, "date": "2026-09-28",
-          "snippet": "First verified development."}],
+        [
+            {"title": "Breaking News, Headlines and Stories | Ottawa Citizen",
+             "url": "https://ottawacitizen.com/category/news/"},
+            {"title": "Breaking News, Headlines and Stories | Calgary Herald",
+             "url": "https://calgaryherald.com/category/news/"},
+            {"title": "Breaking News, Headlines and Stories | Edmonton Journal",
+             "url": "https://edmontonjournal.com/category/news/"},
+            {"title": "First dated story", "url": first_url, "date": "2026-09-28",
+             "snippet": "First verified development."},
+        ],
         [{"title": "Second dated story", "url": second_url, "date": "2026-09-28",
           "snippet": "Second verified development."}],
     ]
@@ -1854,7 +1867,12 @@ async def test_yesterday_news_uses_dated_news_research_instead_of_general_homepa
     }
     assert all(args["recency_days"] == 2 and args["search_type"] == "news" for args in searches)
     assert {args["url"] for args in fetches} == {first_url, second_url}
+    assert landing_urls.isdisjoint(args["url"] for args in fetches)
     assert session.last_stream_payload is not None
+    synthesis_rules = [message.get("content", "") for message in session.last_stream_payload["messages"]
+                       if message.get("role") == "system"]
+    assert any("does not ask you to decide whether a story is worthy" in rule
+               for rule in synthesis_rules)
     fetched_evidence = [
         json.loads(message["content"])
         for message in session.last_stream_payload["messages"]
