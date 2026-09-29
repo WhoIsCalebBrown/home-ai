@@ -946,11 +946,85 @@ def dynamic_fact_question(text: str) -> bool:
     return bool(re.search(r"\b(weather|today|currently|right now|status|state|downloading|downloads?|containers?|storage|space|server|lidarr|lidar|plex|camera|cameras|gpu|vram|health|online|offline|queue|missing|media pipeline|news|policy|policies|president|version|release|product)\b", text, re.I))
 
 
+def past_timeframe_recency_days(text: str) -> int | None:
+    """Map conversational past-time frames to a bounded search lookback.
+
+    The value is deliberately a retrieval window rather than an assertion
+    that every result in that window belongs in the answer.  In particular,
+    previous calendar periods need enough overlap to include their beginning;
+    fetched publication dates remain the evidence boundary.
+    """
+    lowered = " ".join(text.casefold().replace("’", "'").split())
+    fixed_windows = (
+        (r"\b(?:the\s+)?(?:week before last|second to last week)\b", 21),
+        (r"\b(?:the\s+)?(?:month before last|second to last month)\b", 93),
+        (r"\b(?:the\s+)?day before yesterday\b", 3),
+        (r"\b(?:yesterday|last night|the previous day|the prior day)\b", 2),
+        (r"\b(?:earlier today|this morning|this afternoon|this evening|today)\b", 1),
+        (r"\b(?:earlier|so far) this week\b", 7),
+        (r"\b(?:earlier|so far) this month\b", 31),
+        (r"\b(?:earlier|so far) this (?:quarter|season)\b", 93),
+        (r"\b(?:earlier|so far) this year\b", 365),
+        (r"\b(?:over|during) the weekend\b", 9),
+        (r"\b(?:last|previous|prior) weekend\b", 9),
+        (r"\b(?:last|previous|prior|past|recent) (?:minute|hour)\b", 1),
+        (r"\b(?:last|previous|prior|past|recent) day\b", 2),
+        (r"\b(?:last|previous|prior) week\b", 14),
+        (r"\b(?:last|previous|prior) month\b", 62),
+        (r"\b(?:last|previous|prior) quarter\b", 186),
+        (r"\b(?:last|previous|prior) year\b", 365),
+        (r"\b(?:last|previous|prior) (?:spring|summer|autumn|fall|winter|season)\b", 365),
+        (r"\b(?:this|the past|the recent) week\b", 7),
+        (r"\b(?:this|the past|the recent) month\b", 31),
+        (r"\b(?:this|the past|the recent) quarter\b", 93),
+        (r"\b(?:this|the past|the recent) year\b", 365),
+        (r"\b(?:recent days|these past few days)\b", 14),
+        (r"\b(?:recent weeks|these past few weeks)\b", 31),
+        (r"\b(?:recent months|these past few months)\b", 93),
+        (r"\b(?:a fortnight|one fortnight|fortnight)\s+(?:ago|back)\b", 15),
+        (r"\b(?:recent|recently|just recently|lately|as of late|in recent days|not long ago|earlier|earlier on|the other day)\b", 14),
+        (r"\b(?:previously|in the recent past|in recent memory|a while ago|a while back|some time ago)\b", 31),
+        (r"\b(?:last|this past)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", 14),
+    )
+    for pattern, days in fixed_windows:
+        if re.search(pattern, lowered, re.I):
+            return days
+
+    number_words = {
+        "a": 1, "an": 1, "one": 1, "couple": 2, "two": 2, "three": 3,
+        "few": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+        "eight": 8, "nine": 9, "ten": 10, "several": 7, "dozen": 12,
+    }
+    amount = r"(?P<count>\d{1,4}|a|an|one|couple|two|three|few|four|five|six|seven|eight|nine|ten|several|dozen)"
+    unit = r"(?P<unit>minutes?|hours?|days?|weeks?|months?|quarters?|years?)"
+    patterns = (
+        rf"\b{amount}\s+(?:of\s+)?{unit}\s+(?:ago|back|before)\b",
+        rf"\b(?:over|during|within|across|throughout|in|from|since)\s+(?:the\s+)?(?:past|last|previous|prior|preceding|recent)\s+{amount}\s+(?:of\s+)?{unit}\b",
+        rf"\b(?:the\s+)?(?:past|last|previous|prior|preceding|recent)\s+{amount}\s+(?:of\s+)?{unit}\b",
+    )
+    multipliers = {"day": 1, "week": 7, "month": 31, "quarter": 93, "year": 365}
+    for pattern in patterns:
+        match = re.search(pattern, lowered, re.I)
+        if not match:
+            continue
+        raw_count = match.group("count")
+        count = int(raw_count) if raw_count.isdigit() else number_words[raw_count]
+        normalized_unit = match.group("unit").rstrip("s")
+        days = max(1, (count + 1439) // 1440) if normalized_unit == "minute" else (
+            max(1, (count + 23) // 24) if normalized_unit == "hour" else count * multipliers[normalized_unit]
+        )
+        if re.search(r"\s(?:ago|back|before)$", match.group(0)):
+            days += 1
+        return min(days, 365)
+    return None
+
+
 def current_external_question(text: str) -> bool:
-    fresh = r"\b(new|newest|latest|current|currently|today|right now|ongoing|recent|this morning|this week|breaking|updated|update|release|version|yesterday|last night)\b"
+    fresh = r"\b(new|newest|latest|current|currently|right now|ongoing|breaking|updated|update|release|version)\b"
     subject = r"\b(president|presidential|trump|trade war|trade dispute|administration|politics?|political|government|congress|election|policy|policies|news|headline|technology|tech|ai|artificial intelligence|canada|canadian|ollama|software|release|product|documentation|rules|bug|issue|markets?|economy|sports?|world|event|events?|company|companies|business|stock|stocks?|nvidia|openai|microsoft|apple|google|tesla)\b"
     external_story = r"\b(heard|flying|helicopter|blackhawk|incident|happened|going on|look into|search for|reports?|story|event)\b"
-    return (bool(re.search(fresh, text, re.I) and re.search(subject, text, re.I))
+    time_bounded = past_timeframe_recency_days(text) is not None
+    return (bool((re.search(fresh, text, re.I) or time_bounded) and re.search(subject, text, re.I))
             # Voice may drop the explicit topic while retaining an unmistakable
             # request for fresh online information. Keep this bounded to
             # "online + latest/current + development/update" language so it
@@ -975,7 +1049,18 @@ _WEB_QUERY_LEADING_SCAFFOLDING = re.compile(
     r"(?:on|of|about|regarding|for)?\s*",
     re.I,
 )
-_WEB_QUERY_TRAILING_FILLER = re.compile(r"\b(?:for\s+)?(?:today|right\s+now|currently|now)\b\s*[?.!]*\s*$", re.I)
+_WEB_QUERY_TRAILING_FILLER = re.compile(
+    r"\b(?:for\s+)?(?:today|right\s+now|currently|now|yesterday|last\s+night|"
+    r"recently|lately|this\s+(?:morning|afternoon|evening|week|month|year)|"
+    r"(?:last|previous|prior|past|recent)\s+(?:week|month|quarter|year|weekend)|"
+    r"(?:(?:over|during|within|across|throughout|in|from|since)\s+)?(?:the\s+)?"
+    r"(?:past|last|previous|prior|preceding|recent)\s+"
+    r"(?:\d{1,4}|a|an|one|couple|two|three|few|four|five|six|seven|eight|nine|ten|several|dozen)\s+"
+    r"(?:minutes?|hours?|days?|weeks?|months?|quarters?|years?)|"
+    r"(?:\d{1,4}|a|an|one|couple|two|three|few|four|five|six|seven|eight|nine|ten|several|dozen)\s+"
+    r"(?:of\s+)?(?:minutes?|hours?|days?|weeks?|months?|quarters?|years?)\s+(?:ago|back|before))\b\s*[?.!]*\s*$",
+    re.I,
+)
 # A second layer of conversational filler often sits UNDERNEATH the request-
 # verb scaffolding above: "can you give me an in depth review of what's gone
 # on in the canadian news today" strips down to "what's gone on in the
@@ -1000,7 +1085,13 @@ def web_search_query_from_text(text: str) -> str:
     stripped = text.strip()
     cleaned = _WEB_QUERY_LEADING_SCAFFOLDING.sub("", stripped, count=1)
     cleaned = _WEB_QUERY_NESTED_SCAFFOLDING.sub("", cleaned, count=1)
+    cleaned = re.sub(
+        r"\s+(?:that\s+)?(?:i|we)\s+(?:should|need to|ought to)\s+(?:be\s+)?(?:aware|know)(?:\s+(?:of|about))?\s*[?.!]*$",
+        "", cleaned, flags=re.I,
+    )
+    cleaned = re.sub(r"^\s*any\s+", "", cleaned, flags=re.I)
     cleaned = _WEB_QUERY_TRAILING_FILLER.sub("", cleaned).strip(" ?.!")
+    cleaned = re.sub(r"\s+(?:from|over|during|in|for)\s*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^\s*the\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or stripped
@@ -4143,7 +4234,8 @@ def research_profile(text: str) -> dict[str, int | str | bool]:
     if re.search(r"\b(in[- ]depth|deep dive|deeply|comprehensive|thorough|full picture|detailed review|properly research|research this)\b", lowered):
         news = current_news_intent(text)
         return {"mode": "deep", "current_news": news, "iterations": 8, "max_calls": 16, "num_predict": 720, "minimum_searches": 3 if news else 0, "minimum_fetches": 2 if news else 0}
-    if re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered):
+    if (re.search(r"\b(what's happening|what is happening|today's news|news today|headlines|current events|this week)\b", lowered)
+            or (current_news_intent(text) and past_timeframe_recency_days(text) is not None)):
         return {"mode": "normal", "iterations": 5, "max_calls": 8, "num_predict": 360, "minimum_searches": 1, "minimum_fetches": 1}
     return {"mode": "quick", "iterations": 4, "max_calls": 4, "num_predict": 180, "minimum_searches": 1, "minimum_fetches": 0}
 
@@ -4391,14 +4483,16 @@ def enrich_research_arguments(name: str, arguments: dict, profile: dict[str, int
     """Apply depth defaults while preserving any explicit model choices."""
     if name == "web_search":
         enriched = dict(arguments)
+        raw_query = str(enriched.get("query") or user_text)
+        if past_timeframe_recency_days(user_text) is not None:
+            enriched["query"] = web_search_query_from_text(raw_query)
         enriched.setdefault("max_results", {"quick": 5, "normal": 12, "deep": 20}.get(profile["mode"], 5))
-        if re.search(r"\b(today|tonight|latest|currently|this morning|breaking)\b", user_text, re.I):
+        recency_days = past_timeframe_recency_days(user_text)
+        if re.search(r"\b(tonight|latest|currently|breaking)\b", user_text, re.I):
             enriched.setdefault("recency_days", 1)
-        elif re.search(r"\b(yesterday|last night)\b", user_text, re.I):
-            enriched.setdefault("recency_days", 2)
-        elif re.search(r"\bthis week\b", user_text, re.I):
-            enriched.setdefault("recency_days", 7)
-        if re.search(r"\b(news|headlines|current events)\b", user_text, re.I):
+        elif recency_days is not None:
+            enriched.setdefault("recency_days", recency_days)
+        if current_news_intent(user_text):
             enriched.setdefault("search_type", "news")
         return enriched
     if name == "web_fetch":
@@ -6063,7 +6157,15 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
             if isinstance(candidate_identity, dict):
                 retained_identity = dict(candidate_identity)
         for name, planned_args in planned:
-            args = planned_args
+            # Deterministic quick research used to bypass the same query,
+            # recency, and news-category enrichment applied in the model tool
+            # loop.  That sent conversational requests such as "any news from
+            # yesterday I should be aware about?" to an unrestricted general
+            # search and returned undated publisher homepages.
+            args = (enrich_research_arguments(name, planned_args, profile, user_text)
+                    if name == "web_search" and (past_timeframe_recency_days(user_text) is not None
+                                                  or current_news_intent(user_text))
+                    else planned_args)
             if name == "media_plan_goal" and isinstance(args, dict):
                 args = {**args, "session_id": client_id}
             if name == "plex_search" and not args:
@@ -6410,7 +6512,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
                     recovery_queries = web_recovery_queries(user_text)
                     search_attempts = sum(1 for item in live_results if item.get("tool") == "web_search")
                     query = recovery_queries[min(search_attempts, len(recovery_queries) - 1)]
-                    followup_recency = 1 if same_day_canada or re.search(r"\b(today|latest|currently|breaking)\b", user_text, re.I) else 2 if re.search(r"\b(yesterday|last night)\b", user_text, re.I) else 7
+                    followup_recency = (1 if same_day_canada or re.search(r"\b(latest|currently|breaking)\b", user_text, re.I)
+                                          else past_timeframe_recency_days(user_text) or 7)
                     followup = await invoke_tool("web_search", {"query": query, "max_results": 12 if profile["mode"] == "normal" else 20, "recency_days": followup_recency, "search_type": "news" if re.search(r"\b(news|headlines|current events)\b", user_text, re.I) else "general"}, client_id, request_id)
                     research_calls += 1
                     live_results.append(followup)

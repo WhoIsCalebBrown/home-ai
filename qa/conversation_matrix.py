@@ -17,7 +17,7 @@ def load_router():
         "informational_media_continuation",
         "media_title_status_signal", "visual_question",
         "direct_file_request", "playback_request", "preflight_plan", "deterministic_plan",
-        "explicit_domain", "explicit_web_search_request", "current_external_question",
+        "explicit_domain", "explicit_web_search_request", "current_external_question", "past_timeframe_recency_days",
         "historical_camera_question", "historical_camera_window", "front_door_presence_question",
         "activity_question", "routing_aliases", "is_confirmation", "conversation_context",
         "turn_context", "resolved_followup_text", "is_repair_turn", "repair_route_text",

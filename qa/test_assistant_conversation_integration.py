@@ -1821,6 +1821,47 @@ async def test_active_camera_context_survives_an_interleaved_media_question(sess
 # domains so a first-search-only fetch block cannot accidentally satisfy the
 # deep-research readiness contract.
 
+@pytest.mark.asyncio
+async def test_yesterday_news_uses_dated_news_research_instead_of_general_homepages(session):
+    """Replay the production wording that returned only CBC/CNN/CTV roots."""
+    first_url = "https://publisher-one.example/news/story-one"
+    second_url = "https://publisher-two.example/world/story-two"
+    session.backend.web_search_fixtures = [
+        [{"title": "First dated story", "url": first_url, "date": "2026-09-28",
+          "snippet": "First verified development."}],
+        [{"title": "Second dated story", "url": second_url, "date": "2026-09-28",
+          "snippet": "Second verified development."}],
+    ]
+
+    reply = await session.turn(
+        "any news from yesterday i should be aware about?",
+        ollama_script=[
+            {"message": {"content": "", "tool_calls": [
+                {"function": {"name": "web_search", "arguments": {
+                    "query": "any news from yesterday i should be aware about?",
+                }}},
+            ]}},
+            {"message": {"content": "", "tool_calls": []}},
+        ],
+        final_text="Two dated developments stood out yesterday.",
+    )
+
+    searches = [args for name, args in session.backend.call_log if name == "web_search"]
+    fetches = [args for name, args in session.backend.call_log if name == "web_fetch"]
+    assert reply == "Two dated developments stood out yesterday."
+    assert searches[0] == {
+        "query": "news", "max_results": 12, "recency_days": 2, "search_type": "news",
+    }
+    assert all(args["recency_days"] == 2 and args["search_type"] == "news" for args in searches)
+    assert {args["url"] for args in fetches} == {first_url, second_url}
+    assert session.last_stream_payload is not None
+    fetched_evidence = [
+        json.loads(message["content"])
+        for message in session.last_stream_payload["messages"]
+        if message.get("role") == "tool" and message.get("name") == "web_fetch"
+    ]
+    assert {item.get("date") for item in fetched_evidence} == {"2026-09-28"}
+
 def _quiet_news_fixtures(session, monkeypatch, *, day=18, strong=False, still_sparse=False, corroborated=None):
     """Synthetic network responses; real respond/gates/synthesis stay enabled."""
     now = datetime(2026, 9, day, 12, tzinfo=ZoneInfo("America/Toronto")).timestamp()
