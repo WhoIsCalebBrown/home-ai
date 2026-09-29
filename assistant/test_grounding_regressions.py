@@ -1183,6 +1183,7 @@ def test_yesterday_is_recognized_as_a_fresh_research_question_not_a_media_goal()
     ("last night", 2),
     ("earlier today", 1),
     ("recently", 14),
+    ("recenly", 14),
     ("lately", 14),
     ("the other day", 14),
     ("last week", 14),
@@ -1211,6 +1212,7 @@ def test_past_timeframe_language_maps_to_bounded_search_windows(phrase, expected
     ("any news from yesterday i should be aware about?", "news", 2),
     ("Technology news last week?", "Technology news", 14),
     ("Give me the Canadian headlines recently.", "Canadian headlines", 14),
+    ("Give me the Canadian headlines recenly.", "Canadian headlines", 14),
     ("What is happening in AI over the past three months?", "AI", 93),
 ])
 def test_past_news_queries_are_clean_and_get_news_recency(text, query, days):
