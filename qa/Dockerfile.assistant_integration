@@ -25,6 +25,10 @@ RUN pip install --no-cache-dir -r /repo/assistant/requirements.txt \
 COPY assistant /repo/assistant
 COPY tools /repo/tools
 COPY qa /repo/qa
+# The integration command runs the complete repository test collection.
+# Some QA modules load owned deployment helpers directly by repository path,
+# so the production-shaped image must carry that source tree as well.
+COPY deployment /repo/deployment
 # test_tts_normalization.py hardcodes /app/voice-api-app.py (the real
 # assistant/Dockerfile's WORKDIR) -- mirror that exact runtime path instead
 # of changing the test, so this image proves the same path production uses.
