@@ -4274,6 +4274,33 @@ def research_authoritative(url: str) -> bool:
                for suffix in ("gov", "gc.ca", "gov.uk", "gov.au", "gov.nz"))
 
 
+def research_landing_page(item: dict, url: str) -> bool:
+    """Reject obvious news indexes that cannot ground a specific story.
+
+    Search engines often rank a publisher's generic ``/category/news`` page
+    above the articles listed on it. Fetching that page gives synthesis a pile
+    of rotating headlines instead of one dated development, which is exactly
+    how a useful news search degraded into an empty "nothing important"
+    answer in production.
+    """
+    parsed = urlsplit(url)
+    segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
+    title = str(item.get("title") or "").casefold()
+    if not segments:
+        return True
+    if any(segment in {"category", "categories", "section", "sections", "tag", "tags", "topic", "topics"}
+           for segment in segments):
+        return True
+    generic_path = len(segments) == 1 and segments[0] in {
+        "news", "headlines", "latest", "breaking-news", "canada", "world",
+    }
+    generic_title = bool(re.search(
+        r"\b(?:breaking news|latest news|news headlines|headlines and stories|news and headlines)\b",
+        title,
+    ))
+    return generic_path and generic_title
+
+
 def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: set[str], limit: int) -> list[str]:
     """Choose normalized fetch URLs, favoring primary sources and coverage diversity."""
     normalized_seen_urls = {
@@ -4284,6 +4311,8 @@ def research_fetch_candidates(result: dict, seen_urls: set[str], seen_domains: s
     for index, item in enumerate(result.get("results", []) if isinstance(result, dict) else []):
         url = normalized_research_url(item.get("url") if isinstance(item, dict) else None)
         if not url or url in normalized_seen_urls:
+            continue
+        if research_landing_page(item, url):
             continue
         domain = research_publisher(url)
         if any(existing[1] == url for existing in options):
@@ -4480,6 +4509,21 @@ def research_tool_instruction(profile: dict[str, int | str]) -> str:
     return ("Perform deep, iterative web research before answering. Start with discovery, then issue targeted follow-up searches based on themes you actually find, "
             "fetch primary or reputable sources for central claims, cross-check important or controversial facts, deduplicate syndicated coverage, and stop when coverage is sufficient. "
             "Use the supplied bounded research tools; do not answer from search snippets alone.")
+
+
+def news_synthesis_instruction(user_text: str) -> str:
+    """Keep colloquial news wording from becoming a subjective veto."""
+    instruction = (
+        "For a news request, summarize the strongest relevant developments supported by the current evidence. "
+        "Do not invent an importance threshold or suppress usable stories merely because they are not breaking news. "
+    )
+    if re.search(r"\b(?:should|need to|ought to)\s+(?:be\s+)?(?:know|aware)\b", user_text, re.I):
+        instruction += (
+            "Wording such as 'I should know' or 'I should be aware of' asks for a useful roundup; "
+            "it does not ask you to decide whether a story is worthy of the user. "
+            "Never answer that nothing is important enough when usable story evidence is present."
+        )
+    return instruction.strip()
 
 
 def enrich_research_arguments(name: str, arguments: dict, profile: dict[str, int | str], user_text: str) -> dict:
@@ -6751,6 +6795,8 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
         # Re-emit the contract after execution so final synthesis sees the same
         # canonical interpretation plus the exact tools/results for this turn.
         messages.append(resolved_request_message(resolved_request_record(client_id, user_text, route_text, context, [tool.get("name") for tool in tools], planned, live_results)))
+        if current_news_intent(user_text):
+            messages.append({"role": "system", "content": news_synthesis_instruction(user_text)})
         if deep_news:
             messages.append({"role": "system", "content": deep_research_synthesis_instruction(research_evidence_shape(news_evidence()))})
             if same_day_canada:
