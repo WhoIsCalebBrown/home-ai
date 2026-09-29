@@ -982,7 +982,10 @@ def past_timeframe_recency_days(text: str) -> int | None:
         (r"\b(?:recent weeks|these past few weeks)\b", 31),
         (r"\b(?:recent months|these past few months)\b", 93),
         (r"\b(?:a fortnight|one fortnight|fortnight)\s+(?:ago|back)\b", 15),
-        (r"\b(?:recent|recently|just recently|lately|as of late|in recent days|not long ago|earlier|earlier on|the other day)\b", 14),
+        # ``recenly`` is a common typed/ASR omission of the first ``t`` in
+        # ``recently``. Treat it as the same bounded relative-time cue rather
+        # than leaking the misspelling into the search query.
+        (r"\b(?:recent|recen(?:t)?ly|just recen(?:t)?ly|lately|as of late|in recent days|not long ago|earlier|earlier on|the other day)\b", 14),
         (r"\b(?:previously|in the recent past|in recent memory|a while ago|a while back|some time ago)\b", 31),
         (r"\b(?:last|this past)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", 14),
     )
@@ -1051,7 +1054,7 @@ _WEB_QUERY_LEADING_SCAFFOLDING = re.compile(
 )
 _WEB_QUERY_TRAILING_FILLER = re.compile(
     r"\b(?:for\s+)?(?:today|right\s+now|currently|now|yesterday|last\s+night|"
-    r"recently|lately|this\s+(?:morning|afternoon|evening|week|month|year)|"
+    r"recen(?:t)?ly|lately|this\s+(?:morning|afternoon|evening|week|month|year)|"
     r"(?:last|previous|prior|past|recent)\s+(?:week|month|quarter|year|weekend)|"
     r"(?:(?:over|during|within|across|throughout|in|from|since)\s+)?(?:the\s+)?"
     r"(?:past|last|previous|prior|preceding|recent)\s+"
