@@ -2881,8 +2881,13 @@ async def test_storage_topic_switch_and_return_to_media_subject(session):
     context_after_correction = session.app.conversation_context.get(session.client_id, {})
     assert "room" in (context_after_correction.get("latest_resolved_referent") or "").casefold()
 
-    # Turn 3: explicit new storage question -- must get a real storage
-    # answer, never "Room is ready in Plex" or any media-grounded response.
+    # Turn 3: explicit new storage question -- must get a storage answer,
+    # never "Room is ready in Plex" or any media-grounded response. No tool
+    # can say what is using the space, so the honest capability gap is the
+    # storage answer; previously this scripted a capacity tool call plus a
+    # model-written "mostly used by the downloads share", which is exactly
+    # the made-up breakdown storage_breakdown_question() now prevents.
+    calls_before = len(session.backend.call_log)
     reply3 = await session.turn(
         "What's using up most of the space in the cache?",
         ollama_script=[{"message": {"content": "", "tool_calls": [
@@ -2893,8 +2898,8 @@ async def test_storage_topic_switch_and_return_to_media_subject(session):
     assert "room" not in reply3.casefold() and "plex" not in reply3.casefold(), (
         "an explicit new storage question must never be answered with stale media context"
     )
-    storage_calls = [args for name, args in session.backend.call_log if name == "get_storage_status"]
-    assert storage_calls, "the explicit storage question must actually invoke get_storage_status"
+    assert "breakdown by app or folder" in reply3
+    assert session.backend.call_log[calls_before:] == []
 
     # Turn 4: return to media -- explicit intent must recover the subject,
     # not get hijacked by the just-established storage domain, and an
@@ -4172,6 +4177,42 @@ async def test_cache_state_followup_reuses_cache_not_container_without_argument(
     assert calls == [("unraid_storage_status", {"target": "cache"})]
     assert reply == "Cache status is ONLINE."
     assert not any(name == "unraid_container_status" for name, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_cache_breakdown_followup_is_answered_honestly_without_a_tool_or_model(session):
+    # Real production bug, reproduced live on 2026-10-08: "How full is the
+    # cache?" -> "What's using most of it?" offered Qwen five candidate
+    # tools, none of which can measure disk usage by app or folder. Qwen
+    # picked unraid_container_metrics (CPU/RAM) and answered "The cache is
+    # mostly used by your Unraid containers", a claim that data cannot
+    # support. No tool can answer a storage breakdown, so the turn must be
+    # answered deterministically with the honest capability gap, before
+    # discovery or the model ever see it.
+    await session.turn("How full is the cache?")
+    calls_before = len(session.backend.call_log)
+    production_failure = [{"message": {"content": "", "tool_calls": [
+        {"function": {"name": "unraid_container_metrics", "arguments": {}}},
+    ]}}]
+    reply = await session.turn("What's using most of it?", ollama_script=production_failure)
+    calls = session.backend.call_log[calls_before:]
+    assert reply == (
+        "I can't see what's using the space on the cache yet. I can tell you how full it is, "
+        "but I don't have a breakdown by app or folder."
+    )
+    assert calls == []
+    assert len(production_failure) == 1  # the model was never asked
+
+    # The storage topic is still live, so the documented continuation works.
+    followup = await session.turn("What about Plex?")
+    assert followup == "Plex is running, CPU 2.5%, memory 512 MB."
+
+
+@pytest.mark.asyncio
+async def test_memory_question_after_cache_is_not_mistaken_for_a_storage_breakdown(session):
+    await session.turn("How full is the cache?")
+    reply = await session.turn("What's using the most RAM?", final_text="Plex is using the most memory.")
+    assert "breakdown by app or folder" not in reply
 
 
 @pytest.mark.asyncio

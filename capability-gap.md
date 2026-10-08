@@ -136,6 +136,26 @@ turn_context units, and a full multi-turn end-to-end integration test).
 Live-verified against the real production deployment after re-running the
 exact continuity scenario that found the gap.
 
+### Follow-up (2026-10-08): the down-weighting fix was not enough
+
+Re-running the same continuity question live ("How full is the cache?" ->
+"What's using most of it?") showed `unraid_container_metrics` still being
+called. The `requires_keyword` gate only lowered its score (fourth of five
+candidates), and since none of the five candidates can measure storage by
+app or folder, Qwen still picked it and answered "The cache is mostly used
+by your Unraid containers", a claim the CPU/RAM data cannot support.
+
+Because no tool can answer a storage breakdown, the fix is now upstream of
+discovery: `storage_breakdown_question()` recognizes the question (explicit
+storage wording, or a bare "what's using most of it?" right after a
+storage-capacity answer, never CPU/RAM wording) and `respond()` answers the
+capability gap directly: "I can't see what's using the space on the cache
+yet. I can tell you how full it is, but I don't have a breakdown by app or
+folder." No tool call and no model call. The retained storage topic is left
+in place, so a following "What about Plex?" still continues it. The
+per-directory breakdown itself remains the deferred capability described
+above.
+
 ## New Home-AI Tools Added This Round
 
 | Tool | User Question Enabled | Backend MCP Tool(s) | Read/Write |

@@ -2888,6 +2888,53 @@ def storage_state_followup(text: str, context: dict | None = None) -> bool:
     return bool(re.fullmatch(r"\s*is\s+(?:it|that|this)\s+(?:running|up|online|mounted)\s*[?!.,]*\s*", text, re.I))
 
 
+_STORAGE_BREAKDOWN_COMPUTE = r"\b(?:ram|cpu|cpus|memory|processor|unhealthy|bandwidth|network|gpu|vram)\b"
+_STORAGE_BREAKDOWN_USAGE = r"\b(?:what(?:'s|\s+is)|which\s+\w+\s+is|who(?:'s|\s+is))\s+(?:using|taking(?:\s+up)?|eating(?:\s+up)?|filling(?:\s+up)?|hogging)\b"
+_STORAGE_BREAKDOWN_WORDS = r"\b(?:cache|array|disks?|drives?|storage|space|pool|shares?|appdata)\b"
+_STORAGE_BREAKDOWN_INSIDE = r"\bwhat(?:'s|\s+is)\s+(?:in|inside)\s+(?:my\s+|the\s+)?(?:appdata|cache|array|pool)\b"
+
+
+def storage_breakdown_question(text: str, context: dict | None = None) -> bool:
+    """A question about WHAT is using storage space, which no tool can answer.
+
+    Real production bug (capability-gap.md, reproduced live 2026-10-08):
+    "How full is the cache?" -> "What's using most of it?" offered Qwen five
+    candidates, none able to measure disk usage by app or folder, and Qwen
+    picked unraid_container_metrics and presented CPU/RAM data as a storage
+    answer. Down-weighting that tool in discovery (requires_keyword) still
+    left it on the shortlist. The honest answer is the capability gap, so
+    this question is recognized before discovery and never reaches a model.
+
+    Explicit storage wording qualifies on its own; a bare "what's using most
+    of it?" qualifies only right after a storage-capacity answer. CPU/RAM
+    wording always belongs to unraid_container_metrics instead.
+    """
+    context = context or {}
+    t = text.replace("\u2019", "'")
+    if re.search(_STORAGE_BREAKDOWN_COMPUTE, t, re.I):
+        return False
+    if re.search(_STORAGE_BREAKDOWN_INSIDE, t, re.I):
+        return True
+    storage = re.search(_STORAGE_BREAKDOWN_WORDS, t, re.I)
+    if storage and re.search(r"\bbreakdown\b", t, re.I):
+        return True
+    usage = re.search(_STORAGE_BREAKDOWN_USAGE, t, re.I)
+    if usage and storage:
+        return True
+    return bool(usage) and context.get("latest_operation") == "STORAGE_CAPACITY"
+
+
+def storage_breakdown_answer(context: dict | None = None) -> str:
+    """State the storage-breakdown capability gap plainly, naming the retained target."""
+    target = str(((context or {}).get("operation_scope") or {}).get("target") or "").strip()
+    if target:
+        where = f"the {target}" if target.casefold() in {"cache", "array", "pool"} else target
+        return (f"I can't see what's using the space on {where} yet. I can tell you how full it is, "
+                "but I don't have a breakdown by app or folder.")
+    return ("I can't see what's using the space on your storage yet. I can tell you how full the cache "
+            "and array are, but I don't have a breakdown by app or folder.")
+
+
 def operation_for_plan(text: str, context: dict, planned: list[tuple[str, dict]]) -> tuple[str | None, dict]:
     """Attach a small, current-turn operation record to an existing plan.
 
@@ -5649,6 +5696,16 @@ async def respond(ws: WebSocket, client_id: str, request_id: str, user_text: str
     if storage_state_followup(user_text, conversation_context.get(client_id, {})) and not (conversation_context.get(client_id, {}).get("operation_scope") or {}).get("target"):
         full = "Do you mean the cache pool's state, or a particular container or service?"
         await emit_answer(ws, request_id, full, client_id=client_id, origin="ambiguous_storage_status")
+        history.append({"role": "assistant", "content": full})
+        await ws.send_json({"type": "done", "request_id": request_id})
+        return
+    # No tool can measure storage use by app or folder, so a breakdown
+    # question gets the honest capability gap instead of a shortlist the
+    # model could misuse. The retained storage topic is left untouched so a
+    # following "What about Plex?" still continues it.
+    if storage_breakdown_question(user_text, conversation_context.get(client_id, {})):
+        full = storage_breakdown_answer(conversation_context.get(client_id, {}))
+        await emit_answer(ws, request_id, full, client_id=client_id, origin="storage_breakdown_unavailable")
         history.append({"role": "assistant", "content": full})
         await ws.send_json({"type": "done", "request_id": request_id})
         return
