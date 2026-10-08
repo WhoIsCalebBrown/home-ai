@@ -2897,11 +2897,13 @@ _STORAGE_BREAKDOWN_INSIDE = r"\bwhat(?:'s|\s+is)\s+(?:in|inside)\s+(?:my\s+|the\
 def storage_breakdown_question(text: str, context: dict | None = None) -> bool:
     """A question about WHAT is using storage space, which no tool can answer.
 
-    Real production bug (capability-gap.md, reproduced live 2026-10-08):
-    "How full is the cache?" -> "What's using most of it?" offered Qwen five
-    candidates, none able to measure disk usage by app or folder, and Qwen
-    picked unraid_container_metrics and presented CPU/RAM data as a storage
-    answer. Down-weighting that tool in discovery (requires_keyword) still
+    Real production bug (capability-gap.md): "How full is the cache?" ->
+    "What's using most of it?" offered Qwen candidates, none able to measure
+    disk usage by app or folder. Qwen picked unraid_container_metrics
+    (CPU/memory only) and answered with a storage breakdown it had no data
+    for: on 2026-09-17 it recycled the cache's free space from the previous
+    answer as "Docker is taking up about 212 gigabytes"; on 2026-10-08 it
+    said "The cache is mostly used by your Unraid containers". Down-weighting that tool in discovery (requires_keyword) still
     left it on the shortlist. The honest answer is the capability gap, so
     this question is recognized before discovery and never reaches a model.
 

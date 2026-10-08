@@ -88,14 +88,23 @@ explicitly authorized going further than the original deferred-and-
 documented plan ("fuck it dude go for it").
 
 1. **"What's using most of it?"** (a pure referential follow-up, no
-   "cache"/"array"/"ram"/"cpu" keyword of its own) was answered using
-   `unraid_container_metrics` data (per-container CPU/RAM) presented as
-   if it were disk-space consumption ("Docker is taking up 212GB,
-   followed by Unraid itself at 150GB") -- a plausible-sounding but
-   **fabricated mapping of the wrong tool's numbers onto the wrong
-   question**, because no domain narrowing applies to a bare referential
-   turn and `unraid_container_metrics` scored highest via alias/gram
-   overlap on the generic word "using" alone.
+   "cache"/"array"/"ram"/"cpu" keyword of its own) called
+   `unraid_container_metrics` (per-container CPU/memory only), because no
+   domain narrowing applies to a bare referential turn and that tool
+   scored highest via alias/gram overlap on the generic word "using"
+   alone. Qwen then answered "The containers using the most cache space
+   are Docker, which is taking up about two hundred and twelve
+   gigabytes, followed by Unraid itself at roughly one hundred and fifty
+   gigabytes." -- a **fabricated storage breakdown**.
+
+   *Corrected 2026-10-08 from `discovery-debug.jsonl` (2026-09-17 02:17).*
+   This section originally said these were the tool's CPU/RAM numbers;
+   they can't be (the host has ~62.7 GB of RAM). The 212 GB is the cache's
+   **free space** from the assistant's own previous answer ("...about
+   fifty-seven percent full out of five hundred gigabytes, with roughly
+   two hundred and twelve gigabytes still available"), recycled as
+   Docker's usage. No source was found for the 150 GB; the log does not
+   keep tool result values.
 
    **Fix (commit e63fcb4):** added a generic `requires_keyword` discovery-
    scoring gate (mirrors the existing `requires_referent` gate) that
@@ -108,7 +117,8 @@ documented plan ("fuck it dude go for it").
    using the most space" instead of fabricating a number. This is not the
    ideal answer (an explicit "I don't have a space breakdown for that yet"
    would be better), but it is no longer misleading -- no fabricated
-   figures are presented as fact.
+   figures are presented as fact. (This did not hold: see "Follow-up
+   (2026-10-08)" below.)
 2. **"What about Plex?"** (continuing the same storage topic) was
    reclassified out of the "server" domain into "media" purely because
    `explicit_domain()`'s bare "plex" keyword check outranks the inherited
