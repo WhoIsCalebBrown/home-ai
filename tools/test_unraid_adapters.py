@@ -229,8 +229,9 @@ def test_container_metrics_does_not_win_discovery_for_a_generic_storage_followup
     # explicit domain and no ram/cpu/memory keyword of its own) scored
     # unraid_container_metrics as the top discovery candidate purely via
     # alias/gram overlap on the generic word "using" -- Qwen then answered
-    # with its CPU/RAM numbers presented as if they were disk-space
-    # consumption, a real question/answer mismatch. unraid_container_metrics
+    # with a made-up disk breakdown (it recycled the cache's free space
+    # from the previous answer as Docker's usage), a real question/answer
+    # mismatch. unraid_container_metrics
     # only ever legitimately answers a RAM/CPU/unhealthy-container question,
     # so it must not win when none of those words are present, even though
     # its aliases happen to share the word "using" with unrelated questions.
